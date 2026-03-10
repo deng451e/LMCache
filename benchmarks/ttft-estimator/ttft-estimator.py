@@ -34,7 +34,7 @@ tokenizer = None
 hi_multiplier = None
 context_length_ttfts = []
 
-client = OpenAI(api_key="dummy-key", base_url="http://localhost:8000/v1")
+client = OpenAI(api_key="dummy-key", base_url="http://localhost:8008/v1")
 
 
 def query_and_measure_ttft(prompt):

@@ -11,8 +11,8 @@ if [[ $# -lt 1 ]]; then
 fi
 
 if [[ $# -eq 1 ]]; then
-    echo "Using default model: meta-llama/Llama-3.1-8B-Instruct"
-    MODEL="meta-llama/Llama-3.1-8B-Instruct"
+    echo "Using default model: facebook/opt-350m"
+    MODEL="facebook/opt-350m"
 else
     echo "Using model: $2"
     MODEL=$2
@@ -23,11 +23,11 @@ if [[ $1 == "prefiller" ]]; then
     # Prefiller listens on port 7100
     prefill_config_file=$SCRIPT_DIR/configs/lmcache-prefiller-config.yaml
 
-    UCX_TLS=cuda_ipc,cuda_copy,tcp \
+    UCX_TLS=rc \
         LMCACHE_CONFIG_FILE=$prefill_config_file \
         VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        CUDA_VISIBLE_DEVICES=${PREFILLER_DEVICE_ID:-0} \
+        CUDA_VISIBLE_DEVICES=${PREFILLER_DEVICE_ID:-6} \
         vllm serve $MODEL \
         --port 7100 \
         --disable-log-requests \
@@ -43,11 +43,11 @@ elif [[ $1 == "decoder" ]]; then
     # Decoder listens on port 7200
     decode_config_file=$SCRIPT_DIR/configs/lmcache-decoder-config.yaml
 
-    UCX_TLS=cuda_ipc,cuda_copy,tcp \
+    UCX_TLS=rc \
         LMCACHE_CONFIG_FILE=$decode_config_file \
         VLLM_ENABLE_V1_MULTIPROCESSING=1 \
         VLLM_WORKER_MULTIPROC_METHOD=spawn \
-        CUDA_VISIBLE_DEVICES=${DECODER_DEVICE_ID:-1} \
+        CUDA_VISIBLE_DEVICES=${DECODER_DEVICE_ID:-7} \
         vllm serve $MODEL \
         --port 7200 \
         --disable-log-requests \

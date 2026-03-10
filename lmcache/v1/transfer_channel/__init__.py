@@ -38,18 +38,17 @@ def CreateTransferChannel(
     :return: An instance of the specified transfer channel.
     """
 
-    assert channel_type in ["nixl", "mock_memory"], (
+    assert channel_type in ["nixl", "mock_memory", "uccl"], (
         f"Unsupported channel type: {channel_type}"
     )
-
-    if channel_type == "nixl":
+    if channel_type == "uccl":
         # First Party
-        from lmcache.v1.transfer_channel.nixl_channel import NixlChannel
+        from lmcache.v1.transfer_channel.uccl_channel import UcclChannel
 
         assert "backends" in kwargs, (
             "`backends` must be provided to create nixl transfer channel."
         )
-        transfer_channel = NixlChannel(
+        return UcclChannel(
             async_mode=async_mode,
             role=role,
             buffer_ptr=buffer_ptr,
@@ -60,7 +59,25 @@ def CreateTransferChannel(
             device=device,
             **kwargs,
         )
-        return transfer_channel
+
+    if channel_type == "nixl":
+        # First Party
+        from lmcache.v1.transfer_channel.nixl_channel import NixlChannel
+
+        assert "backends" in kwargs, (
+            "`backends` must be provided to create nixl transfer channel."
+        )
+        return NixlChannel(
+            async_mode=async_mode,
+            role=role,
+            buffer_ptr=buffer_ptr,
+            buffer_size=buffer_size,
+            align_bytes=align_bytes,
+            tp_rank=tp_rank,
+            peer_init_url=peer_init_url,
+            device=device,
+            **kwargs,
+        )
 
     if channel_type == "mock_memory":
         # First Party
