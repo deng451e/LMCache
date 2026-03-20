@@ -1,0 +1,31 @@
+# Compatibility matrix test — validates vLLM/LMCache version pairs and generates matrix output.
+
+steps:
+  - label: ":twisted_rightwards_arrows: Compatibility"
+    command: .buildkite/k3_tests/compatible/run.sh
+    timeout_in_minutes: 120
+    agents: { queue: "k8s" }
+    plugins:
+      - kubernetes:
+          podSpec:
+            containers:
+              - name: container-0
+                image: lmcache/ci-base:latest
+                imagePullPolicy: Never
+                resources:
+                  limits:
+                    nvidia.com/gpu: "1"
+                env:
+                  - name: AUTO_SUBMIT_PR
+                    value: "true"
+                  - name: PR_BASE_BRANCH
+                    value: "dev"
+                  - name: GITHUB_TOKEN
+                    valueFrom:
+                      secretKeyRef:
+                        name: buildkite-git-creds
+                        key: GITHUB_TOKEN
+                volumeMounts:
+                  - { name: hf-cache, mountPath: /root/.cache/huggingface }
+            volumes:
+              - { name: hf-cache, hostPath: { path: /data/huggingface, type: DirectoryOrCreate } }
