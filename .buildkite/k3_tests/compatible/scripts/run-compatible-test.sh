@@ -1,40 +1,53 @@
 #!/usr/bin/env bash
+#
+# vLLM × LMCache compatibility matrix (CI).
+#
+# Flow: resolve version lists → filter by cutoffs → per vLLM install_vllm → per (vLLM, LMCache)
+# test_pair → write compat_matrix.rst (Sphinx .. csv-table::) to OUT_FILE.
+#
+# Env: VLLM_VERSIONS, LMCACHE_VERSIONS (comma-separated); MIN_FREE_MEM_MB for pick-free-gpu.sh.
+#
 set -euo pipefail
 
-# --- Configuration & Defaults ---
+# =============================================================================
+# Configuration & constants
+# =============================================================================
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LMCACHE_DIR="${LMCACHE_DIR:-$(cd "${SCRIPT_DIR}/../../../.." && pwd)}"
 WORKDIR="${WORKDIR:-/tmp/lmcache_compat_runs}"
 OUT_FILE="${OUT_FILE:-${SCRIPT_DIR}/../compat_matrix.rst}"
 MODEL_ID="${MODEL_ID:-facebook/opt-125m}"
 PORT_BASE=18000
-# VLLM_VERSIONS, LMCACHE_VERSIONS: comma-separated (e.g. VLLM_VERSIONS="0.11.0,0.10.2")
-# MIN_FREE_MEM_MB: min free GPU memory in MiB for pick-free-gpu.sh (default: 10000)
 
-# Icons
 OK="✅"
 BAD="❌"
 CANDLE="🕯️"
 
-declare -A VLLM_LABELS=(
-    ["0.11.0"]="vLLM 0.11.x (Oct 2)"
-    ["0.10.2"]="vLLM 0.10.2.x (Sep 13)"
-    ["0.10.1"]="vLLM 0.10.1.x (Aug 19)"
-    ["0.10.0"]="vLLM 0.10.0.x (Jul 24)"
-)
-declare -A LMCACHE_LABELS=(
-    ["0.3.9"]="LMCache 0.3.9 (Oct 22)"
-    ["0.3.8"]="LMCache 0.3.8 (Oct 16)"
-    ["0.3.7"]="LMCache 0.3.7 (Sep 22)"
-)
-
-# --- Helper Functions ---
-
+# =============================================================================
+# Logging & exit
+# =============================================================================
 log() { echo -e "\033[1;34m[INFO]\033[0m $*" >&2; }
 log_fail() { echo -e "\033[1;31m[FAIL]\033[0m $*" >&2; }
 die() { echo -e "\033[1;31m[ERROR]\033[0m $*" >&2; exit 1; }
 
-# Kill process and all descendants.
+# report_vllm_install_failure: $1 ver, $2 log path; tail log on install_vllm failure.
+report_vllm_install_failure() {
+    local ver="$1"
+    local install_log="$2"
+    echo -e "\033[1;31m[ERROR]\033[0m Failed to install vLLM ${ver}" >&2
+    echo "Full log: ${install_log}" >&2
+    if [[ -f "${install_log}" ]]; then
+        echo "----- last 80 lines of ${install_log} -----" >&2
+        tail -n 80 "${install_log}" >&2
+    else
+        echo "(log file missing)" >&2
+    fi
+}
+
+# =============================================================================
+# Process tree
+# =============================================================================
+# kill_tree: SIGKILL PID $1 and descendants.
 kill_tree() {
     local p="$1"
     [[ -z "$p" ]] && return
@@ -44,20 +57,26 @@ kill_tree() {
     kill -9 "$p" 2>/dev/null || true
 }
 
-# Normalize versions for indexing (e.g., 0.11.x -> 0.11.0).
+# =============================================================================
+# Version strings (matrix keys)
+# =============================================================================
+# norm: version string -> RESULTS key (e.g. 0.11.x -> 0.11.0).
 norm() {
     local v="${1%.x}"
     [[ "$v" =~ ^[0-9]+\.[0-9]+$ ]] && echo "${v}.0" || echo "$v"
 }
 
-# Return 0 when version $1 is strictly greater than version $2.
+# version_gt: true if $1 > $2 (sort -V).
 version_gt() {
     local lhs="$1"
     local rhs="$2"
     [[ "$lhs" != "$rhs" ]] && [[ "$(printf '%s\n%s\n' "$lhs" "$rhs" | sort -V | tail -n1)" == "$lhs" ]]
 }
 
-# Ensure venv and environment variables.
+# =============================================================================
+# Python venv (LMCache repo)
+# =============================================================================
+# setup_env: create/activate .venv, safe Python env.
 setup_env() {
     [[ -d "$LMCACHE_DIR/.venv" ]] || uv venv "$LMCACHE_DIR/.venv"
     # shellcheck disable=SC1091
@@ -68,7 +87,10 @@ setup_env() {
     export HF_TOKEN="${HF_TOKEN:-}"
 }
 
-# Get min transformers and torch versions required by vllm from PyPI metadata.
+# =============================================================================
+# PyPI & CUDA (for install_vllm)
+# =============================================================================
+# get_deps_for_vllm: $1=x.y.z; PyPI min deps on stdout for install_vllm.
 get_deps_for_vllm() {
     local v_ver="$1"
     python - <<PY
@@ -115,7 +137,7 @@ print(f"transformers>={min_tf}" if min_tf else "transformers:unspecified")
 PY
 }
 
-# Get PyTorch CUDA suffix from local nvcc (e.g. 12.1 -> cu121).
+# get_cuda_suffix_from_nvcc: nvcc -> cu121; rc 1 if missing.
 get_cuda_suffix_from_nvcc() {
     local nvcc_ver
     nvcc_ver=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' | head -1)
@@ -123,7 +145,10 @@ get_cuda_suffix_from_nvcc() {
     echo "cu${nvcc_ver//./}"
 }
 
-# Install vLLM with pinned transformers and matching CUDA torch wheels.
+# =============================================================================
+# Package installs (active venv)
+# =============================================================================
+# install_vllm: $1 train; pinned deps + vllm; log WORKDIR/vllm_install_*.log; rc!=0 on uv fail.
 install_vllm() {
     local ver="$1"
     local base="${ver//[xX]/0}"
@@ -131,32 +156,64 @@ install_vllm() {
     major_minor_patch=$(echo "$base" | sed -n 's/^\([0-9]\+\.[0-9]\+\.[0-9]\+\).*$/\1/p')
     local next_patch="${major_minor_patch%.*}.$((${major_minor_patch##*.} + 1))"
     local deps min_tf min_torch min_torchaudio min_torchvision cuda_suffix
+    local safe_ver="${ver//[^a-zA-Z0-9._-]/_}"
+    local install_log="${WORKDIR}/vllm_install_${safe_ver}.log"
 
-    deps="$(get_deps_for_vllm "$base" 2>/dev/null)" || deps=""
+    mkdir -p "${WORKDIR}"
+    {
+        echo "=== vLLM install ${ver} ==="
+        echo "date: $(date -Is 2>/dev/null || date)"
+        echo "base=${base} major_minor_patch=${major_minor_patch} next_patch=${next_patch}"
+        echo "WORKDIR=${WORKDIR}"
+        echo "=========="
+    } >"${install_log}"
+
+    deps="$(get_deps_for_vllm "$base" 2>>"${install_log}")" || {
+        echo "[WARN] get_deps_for_vllm failed for base=${base}; continuing with empty deps" >>"${install_log}"
+        deps=""
+    }
     min_tf=$(echo "$deps" | sed -n 's/^transformers[>=:]*//p')
     min_torch=$(echo "$deps" | sed -n 's/^torch==//p')
     min_torchaudio=$(echo "$deps" | sed -n 's/^torchaudio==//p')
     min_torchvision=$(echo "$deps" | sed -n 's/^torchvision==//p')
-    cuda_suffix="$(get_cuda_suffix_from_nvcc 2>/dev/null)" || cuda_suffix=""
+    cuda_suffix="$(get_cuda_suffix_from_nvcc 2>>"${install_log}")" || cuda_suffix=""
+
+    {
+        echo "resolved deps: transformers=${min_tf} torch=${min_torch} torchaudio=${min_torchaudio} torchvision=${min_torchvision}"
+        echo "cuda_suffix(nvcc)=${cuda_suffix:-<none>}"
+    } >>"${install_log}"
 
     log "Installing vLLM $ver deps (transformers=$min_tf, torch=$min_torch+$cuda_suffix, cuda=$cuda_suffix)..."
+    log "vLLM install log: ${install_log}"
 
     if [[ -n "$min_tf" && "$min_tf" != "unspecified" ]]; then
-        uv pip install "transformers==${min_tf}" >/dev/null 2>&1
+        echo "---- uv pip install transformers==${min_tf} ----" >>"${install_log}"
+        if ! uv pip install "transformers==${min_tf}" >>"${install_log}" 2>&1; then
+            report_vllm_install_failure "$ver" "${install_log}"
+            return 1
+        fi
     fi
 
     if [[ -n "$cuda_suffix" && -n "$min_torch" && "$min_torch" != "unspecified" ]]; then
         local torch_spec="torch==${min_torch}+${cuda_suffix}"
         local torchaudio_spec="torchaudio==${min_torchaudio:-$min_torch}+${cuda_suffix}"
         local torchvision_spec="torchvision==${min_torchvision:-0.23.0}+${cuda_suffix}"
-        uv pip install "$torch_spec" "$torchaudio_spec" "$torchvision_spec" \
-            --index-url "https://download.pytorch.org/whl/${cuda_suffix}" >/dev/null 2>&1
+        echo "---- uv pip install torch stack (${cuda_suffix}) ----" >>"${install_log}"
+        if ! uv pip install "$torch_spec" "$torchaudio_spec" "$torchvision_spec" \
+            --index-url "https://download.pytorch.org/whl/${cuda_suffix}" >>"${install_log}" 2>&1; then
+            report_vllm_install_failure "$ver" "${install_log}"
+            return 1
+        fi
     fi
 
-    uv pip install "vllm>=${base},<${next_patch}" >/dev/null 2>&1
+    echo "---- uv pip install vllm>=${base},<${next_patch} ----" >>"${install_log}"
+    if ! uv pip install "vllm>=${base},<${next_patch}" >>"${install_log}" 2>&1; then
+        report_vllm_install_failure "$ver" "${install_log}"
+        return 1
+    fi
 }
 
-# Install LMCache (from PyPI or from source).
+# install_lmcache: $1 ver, $2 isolation, $3 run_dir; install + c_ops check.
 install_lmcache() {
     local ver="$1" use_isolation="${2:-true}" run_dir="${3:-}"
     local install_log="${run_dir:-$WORKDIR}/lmcache_install.log"
@@ -199,8 +256,10 @@ install_lmcache() {
     return $ret
 }
 
-# --- Core Logic ---
-
+# =============================================================================
+# One (vLLM, LMCache) pair: LMCache install, vllm serve, health + completion probe
+# =============================================================================
+# test_pair: $1 vLLM, $2 LMCache; prints OK / CANDLE / BAD.
 test_pair() {
     local v_ver="$1" l_ver="$2"
     local port=$((PORT_BASE + RANDOM % 1000))
@@ -273,77 +332,108 @@ test_pair() {
     echo "$status"
 }
 
-# --- Main Matrix Loop ---
+# =============================================================================
+# main: orchestration
+# =============================================================================
+main() {
+    local -a vllm_versions=()
+    local -a lmcache_versions=("0.4.2")
+    local docs_matrix_file
+    local -a filtered_vllm_versions=()
+    local -a filtered_lmcache_versions=()
+    local -A RESULTS
+    local rv cv key res
 
-# Defaults; override via VLLM_VERSIONS and LMCACHE_VERSIONS (comma-separated).
-# If VLLM_VERSIONS is not provided, read versions from docs compatibility table.
-vllm_versions=("0.17.0.x")
-lmcache_versions=("0.4.2")
-if [[ -n "${VLLM_VERSIONS:-}" ]]; then
-    IFS=',' read -r -a vllm_versions <<< "${VLLM_VERSIONS}"
-else
-    docs_matrix_file="${LMCACHE_DIR}/docs/source/getting_started/installation.rst"
-    if [[ ! -f "$docs_matrix_file" ]]; then
-        die "Compatibility matrix file not found: $docs_matrix_file"
+    # --- Resolve vLLM / LMCache version lists (env or docs CSV) ---
+    if [[ -n "${VLLM_VERSIONS:-}" ]]; then
+        IFS=',' read -r -a vllm_versions <<< "${VLLM_VERSIONS}"
+    else
+        docs_matrix_file="${LMCACHE_DIR}/docs/source/getting_started/installation_compatibility.csv"
+        if [[ ! -f "$docs_matrix_file" ]]; then
+            die "Compatibility matrix file not found: $docs_matrix_file"
+        fi
+        mapfile -t vllm_versions < <(
+            python3 - "$docs_matrix_file" <<'PY'
+import csv
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8", newline="") as f:
+    rows = list(csv.reader(f))
+# e.g. "vLLM 0.11.x" -> "0.11.x"; "vLLM 0.10.2.x" -> "0.10.2.x"
+pat = re.compile(r"vLLM\s+((?:\d+\.)+\d+)\.x")
+for row in rows[1:]:
+    if not row:
+        continue
+    m = pat.search(row[0])
+    if m:
+        print(f"{m.group(1)}.x")
+PY
+        )
+        [[ ${#vllm_versions[@]} -gt 0 ]] || die "No vLLM versions found in $docs_matrix_file"
     fi
-    mapfile -t vllm_versions < <(sed -n 's/^[[:space:]]*"vLLM \([0-9][0-9.]*\.x\) (.*/\1/p' "$docs_matrix_file")
-    [[ ${#vllm_versions[@]} -gt 0 ]] || die "No vLLM versions found in $docs_matrix_file"
-fi
-[[ -n "${LMCACHE_VERSIONS:-}" ]] && IFS=',' read -r -a lmcache_versions <<< "${LMCACHE_VERSIONS}"
+    [[ -n "${LMCACHE_VERSIONS:-}" ]] && IFS=',' read -r -a lmcache_versions <<< "${LMCACHE_VERSIONS}"
 
-# Only test versions newer than the supported cutoffs.
-filtered_vllm_versions=()
-for rv in "${vllm_versions[@]}"; do
-    if version_gt "$(norm "$rv")" "0.11.0"; then
-        filtered_vllm_versions+=("$rv")
-    fi
-done
-vllm_versions=("${filtered_vllm_versions[@]}")
-
-filtered_lmcache_versions=()
-for cv in "${lmcache_versions[@]}"; do
-    if version_gt "$(norm "$cv")" "0.3.9"; then
-        filtered_lmcache_versions+=("$cv")
-    fi
-done
-lmcache_versions=("${filtered_lmcache_versions[@]}")
-
-[[ ${#vllm_versions[@]} -gt 0 ]] || die "No vLLM versions to test after 0.11.x"
-[[ ${#lmcache_versions[@]} -gt 0 ]] || die "No LMCache versions to test after 0.3.9"
-
-echo "vllm_versions: ${vllm_versions[*]}"
-echo "lmcache_versions: ${lmcache_versions[*]}"
-declare -A RESULTS
-
-for rv in "${vllm_versions[@]}"; do
-    setup_env
-    install_vllm "$rv" || die "Failed to install vLLM $rv"
-    for cv in "${lmcache_versions[@]}"; do
-        key="$(norm "$rv")|$(norm "$cv")"
-        log "Testing vLLM $rv + LMCache $cv..."
-        res=$(test_pair "$rv" "$cv") || res="$BAD"
-        RESULTS["$key"]="$res"
-        log "Result for vLLM $rv + LMCache $cv: $res"
-        echo "Cleaning uv cache..."
-        uv cache clean
-    done
-done
-
-# --- Generate RST Output ---
-{
-    echo ".. csv-table::"
-    printf "   :header: \"\""
-    for cv in "${lmcache_versions[@]}"; do
-        printf ", \"%s\"" "${LMCACHE_LABELS[$(norm "$cv")]:-LMCache $cv}"
-    done
-    echo -e "\n   :widths: 20$(printf ', 15%.0s' "${lmcache_versions[@]}")\n"
-
+    # --- Filter by minimum supported versions ---
+    filtered_vllm_versions=()
     for rv in "${vllm_versions[@]}"; do
-        printf "   \"%s\"" "${VLLM_LABELS[$(norm "$rv")]:-vLLM $rv}"
-        for cv in "${lmcache_versions[@]}"; do
-            printf ", \"%s\"" "${RESULTS["$(norm "$rv")|$(norm "$cv")"]:-$BAD}"
-        done
-        echo
+        if version_gt "$(norm "$rv")" "0.8.5"; then
+            filtered_vllm_versions+=("$rv")
+        fi
     done
-} | tee "$OUT_FILE"
+    vllm_versions=("${filtered_vllm_versions[@]}")
+
+    filtered_lmcache_versions=()
+    for cv in "${lmcache_versions[@]}"; do
+        if version_gt "$(norm "$cv")" "0.3.2"; then
+            filtered_lmcache_versions+=("$cv")
+        fi
+    done
+    lmcache_versions=("${filtered_lmcache_versions[@]}")
+
+    [[ ${#vllm_versions[@]} -gt 0 ]] || die "No vLLM versions to test after 0.8.5.x"
+    [[ ${#lmcache_versions[@]} -gt 0 ]] || die "No LMCache versions to test after 0.3.2"
+
+    echo "vllm_versions: ${vllm_versions[*]}"
+    echo "lmcache_versions: ${lmcache_versions[*]}"
+
+    # --- Matrix: install vLLM once per row, then each LMCache column ---
+    for rv in "${vllm_versions[@]}"; do
+        setup_env
+        install_vllm "$rv" || exit 1
+        for cv in "${lmcache_versions[@]}"; do
+            key="$(norm "$rv")|$(norm "$cv")"
+            log "Testing vLLM $rv + LMCache $cv..."
+            res=$(test_pair "$rv" "$cv") || res="$BAD"
+            RESULTS["$key"]="$res"
+            log "Result for vLLM $rv + LMCache $cv: $res"
+            echo "Cleaning uv cache..."
+            uv cache clean
+        done
+    done
+
+    # --- Write Sphinx csv-table fragment for check-and-update merge ---
+    {
+        echo ".. csv-table::"
+        printf "   :header: \"\""
+        for cv in "${lmcache_versions[@]}"; do
+            printf ", \"%s\"" "LMCache $cv"
+        done
+        echo -e "\n   :widths: 20$(printf ', 15%.0s' "${lmcache_versions[@]}")\n"
+
+        for rv in "${vllm_versions[@]}"; do
+            printf "   \"%s\"" "vLLM $rv"
+            for cv in "${lmcache_versions[@]}"; do
+                printf ", \"%s\"" "${RESULTS["$(norm "$rv")|$(norm "$cv")"]:-$BAD}"
+            done
+            echo
+        done
+    } | tee "$OUT_FILE"
+}
+
+# Run when executed; omit when sourced (definitions only).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
 

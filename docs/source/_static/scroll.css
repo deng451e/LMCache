@@ -3,15 +3,26 @@ div.highlight pre {
     white-space: pre;
 }
 
-/* Wide CSV / docutils tables: horizontal scroll in HTML */
+/* Wide CSV / docutils tables: horizontal scroll in HTML.
+   Grid/flex children default to min-width: auto, which clips overflow and can hide
+   columns; min-width: 0 lets the scroll container shrink and show a scrollbar. */
 .compat-table-scroll {
     overflow-x: auto;
+    overflow-y: visible;
     max-width: 100%;
+    min-width: 0;
+    width: 100%;
     -webkit-overflow-scrolling: touch;
 }
 
-.compat-table-scroll table {
-    width: max-content;
+.compat-table-scroll table.docutils {
+    width: max-content !important;
     min-width: 100%;
     max-width: none;
+    table-layout: auto;
+}
+
+.compat-table-scroll table.docutils th,
+.compat-table-scroll table.docutils td {
+    white-space: nowrap;
 }

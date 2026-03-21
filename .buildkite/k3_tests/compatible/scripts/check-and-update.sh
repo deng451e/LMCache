@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
+#
+# Compatibility matrix maintenance: compare docs CSV vs PyPI, run tests, merge RST into CSV,
+# optional auto-PR. Subcommands: check_and_update_and_submit | update_matrix | check_matrix.
+#
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../../../" && pwd)"
 
+# =============================================================================
+# Paths & generated artifacts
+# =============================================================================
+# default_out_file: compat_matrix.rst path (OUT_FILE or default).
 default_out_file() {
     echo "${OUT_FILE:-${SCRIPT_DIR}/../compat_matrix.rst}"
 }
 
-default_installation_file() {
-    echo "${INSTALLATION_FILE:-${SCRIPT_DIR}/../../../../docs/source/getting_started/installation.rst}"
+# default_compatibility_csv: docs CSV path (COMPATIBILITY_CSV or default).
+default_compatibility_csv() {
+    echo "${COMPATIBILITY_CSV:-${SCRIPT_DIR}/../../../../docs/source/getting_started/installation_compatibility.csv}"
 }
 
+# cleanup_generated_matrix: rm compat_matrix.rst if present.
 cleanup_generated_matrix() {
     local out_file
     out_file="$(default_out_file)"
@@ -21,6 +31,10 @@ cleanup_generated_matrix() {
     fi
 }
 
+# =============================================================================
+# GitHub (optional PR after merge)
+# =============================================================================
+# repo_slug_from_origin_url: $1 remote URL -> owner/repo for GitHub API.
 repo_slug_from_origin_url() {
     local url="${1%.git}"
 
@@ -37,6 +51,7 @@ repo_slug_from_origin_url() {
     echo "$url"
 }
 
+# maybe_auto_submit_pr: if AUTO_SUBMIT_PR, branch/commit/push CSV and open PR (else no-op).
 maybe_auto_submit_pr() {
     # Only runs in CI when explicitly enabled.
     if [[ "${AUTO_SUBMIT_PR:-false}" != "true" ]]; then
@@ -61,16 +76,16 @@ maybe_auto_submit_pr() {
     }
 
     # Preserve generated matrix output across branch checkouts.
-    local out_file installation_file
+    local out_file compatibility_csv
     out_file="$(default_out_file)"
-    installation_file="$(default_installation_file)"
+    compatibility_csv="$(default_compatibility_csv)"
 
     [[ -f "${out_file}" ]] || {
         echo "[ERROR] Compatibility matrix file not found: ${out_file}" >&2
         exit 1
     }
-    [[ -f "${installation_file}" ]] || {
-        echo "[ERROR] Installation doc not found: ${installation_file}" >&2
+    [[ -f "${compatibility_csv}" ]] || {
+        echo "[ERROR] Compatibility CSV not found: ${compatibility_csv}" >&2
         exit 1
     }
 
@@ -98,9 +113,9 @@ maybe_auto_submit_pr() {
     # Generate docs changes on the new branch.
     update_matrix
 
-    local installation_file_rel="${installation_file#${REPO_ROOT}/}"
-    if git diff --quiet -- "${installation_file_rel}"; then
-        echo "[INFO] installation.rst unchanged after update_matrix; no PR created."
+    local compatibility_csv_rel="${compatibility_csv#${REPO_ROOT}/}"
+    if git diff --quiet -- "${compatibility_csv_rel}"; then
+        echo "[INFO] installation_compatibility.csv unchanged after update_matrix; no PR created."
         return 0
     fi
 
@@ -111,7 +126,7 @@ maybe_auto_submit_pr() {
     git config user.name "${PR_BOT_NAME:-lmcache-ci-bot}"
     git config user.email "${PR_BOT_EMAIL:-lmcache-ci@example.com}"
 
-    git add "${installation_file_rel}"
+    git add "${compatibility_csv_rel}"
     git commit -m "${commit_msg}"
 
     local origin_url repo_slug owner encoded_token push_url
@@ -193,20 +208,25 @@ PY
     echo "[INFO] Opened PR: ${pr_url}"
 }
 
+# =============================================================================
+# PyPI vs CSV: which versions to test
+# =============================================================================
+# compute_version_sets: CSV vs PyPI -> set VLLM_* / LMCACHE_*_CSV vars; exit if empty.
 compute_version_sets() {
-    local installation_file
-    installation_file="$(default_installation_file)"
+    local compatibility_csv
+    compatibility_csv="$(default_compatibility_csv)"
 
-    [[ -f "${installation_file}" ]] || {
-        echo "[ERROR] Installation doc not found: ${installation_file}" >&2
+    [[ -f "${compatibility_csv}" ]] || {
+        echo "[ERROR] Compatibility CSV not found: ${compatibility_csv}" >&2
         exit 1
     }
 
     local parsed_output line key value
-    parsed_output="$(python3 - "${installation_file}" <<'PY'
+    parsed_output="$(python3 - "${compatibility_csv}" <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
+import csv
 import json
 import re
 import sys
@@ -214,10 +234,12 @@ import urllib.request
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
+    """x.y.z -> int tuple for sorting."""
     return tuple(int(part) for part in version.split("."))
 
 
 def _released_versions(package: str) -> list[str]:
+    """Sorted x.y.z releases from PyPI for package."""
     url = f"https://pypi.org/pypi/{package}/json"
     with urllib.request.urlopen(url, timeout=30) as response:
         payload = json.load(response)
@@ -231,29 +253,41 @@ def _released_versions(package: str) -> list[str]:
 
 
 def _is_later_than_0_11_x(version: str) -> bool:
+    """vLLM version after 0.11.x line."""
     major, minor, _ = _version_key(version)
     return (major, minor) > (0, 11)
 
 
 def _is_later_than_0_3_9(version: str) -> bool:
+    """LMCache version > 0.3.9 (cutoff)."""
     return _version_key(version) > (0, 3, 9)
 
 
-installation_file = Path(sys.argv[1])
-installation_text = installation_file.read_text(encoding="utf-8")
+compatibility_csv = Path(sys.argv[1])
 
-existing_vllm = {
-    (match.group(1) + ".0" if len(match.group(1).split(".")) == 2 else match.group(1))
-    for match in re.finditer(r"vLLM\s+(\d+\.\d+(?:\.\d+)?)(?:\.x)?", installation_text)
-    if _is_later_than_0_11_x(
-        match.group(1) + ".0" if len(match.group(1).split(".")) == 2 else match.group(1)
-    )
-}
-existing_lmcache = {
-    match.group(1)
-    for match in re.finditer(r"LMCache\s+(\d+\.\d+\.\d+)", installation_text)
-    if _is_later_than_0_3_9(match.group(1))
-}
+with compatibility_csv.open(encoding="utf-8", newline="") as f:
+    rows = list(csv.reader(f))
+
+existing_vllm: set[str] = set()
+existing_lmcache: set[str] = set()
+v_key_re = re.compile(r"vLLM\s+(\d+\.\d+(?:\.\d+)?)\.x")
+
+if rows:
+    header = rows[0]
+    for cell in header[1:]:
+        m = re.search(r"LMCache\s+(\d+\.\d+\.\d+)", cell)
+        if m and _is_later_than_0_3_9(m.group(1)):
+            existing_lmcache.add(m.group(1))
+    for row in rows[1:]:
+        if not row:
+            continue
+        vm = v_key_re.search(row[0])
+        if not vm:
+            continue
+        base = vm.group(1)
+        norm = base + ".0" if len(base.split(".")) == 2 else base
+        if _is_later_than_0_11_x(norm):
+            existing_vllm.add(norm)
 
 released_vllm = _released_versions("vllm")
 released_lmcache = _released_versions("lmcache")
@@ -314,6 +348,10 @@ PY
     fi
 }
 
+# =============================================================================
+# Full pipeline (CI entry)
+# =============================================================================
+# check_and_update_and_submit: test missing versions, merge CSV, optional PR, cleanup.
 check_and_update_and_submit() {
     compute_version_sets
 
@@ -327,9 +365,7 @@ check_and_update_and_submit() {
     echo "[INFO] Missing LMCache versions (PyPI releases): ${LMCACHE_MISSING_CSV:-<none>}"
 
     # We only run tests for versions that are missing, but `update_matrix`
-    # merges the results back into the full table in `installation.rst`.
-    local installation_file
-    installation_file="$(default_installation_file)"
+    # merges the results back into `installation_compatibility.csv`.
     env VLLM_VERSIONS="${VLLM_TO_TEST_CSV}" \
         LMCACHE_VERSIONS="${LMCACHE_TO_TEST_CSV}" \
         bash "${SCRIPT_DIR}/run-compatible-test.sh"
@@ -339,11 +375,14 @@ check_and_update_and_submit() {
     cleanup_generated_matrix
 }
 
+# =============================================================================
+# Merge generated RST fragment into docs CSV
+# =============================================================================
+# update_matrix: merge compat_matrix.rst into installation_compatibility.csv (sorted rows/cols).
 update_matrix() {
-    local script_dir out_file installation_file
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    out_file="${OUT_FILE:-${script_dir}/../compat_matrix.rst}"
-    installation_file="${INSTALLATION_FILE:-${script_dir}/../../../../docs/source/getting_started/installation.rst}"
+    local out_file compatibility_csv
+    out_file="${OUT_FILE:-${SCRIPT_DIR}/../compat_matrix.rst}"
+    compatibility_csv="${COMPATIBILITY_CSV:-${SCRIPT_DIR}/../../../../docs/source/getting_started/installation_compatibility.csv}"
 
     [[ -f "${out_file}" ]] || {
         echo "[ERROR] Compatibility matrix file not found: ${out_file}" >&2
@@ -351,12 +390,12 @@ update_matrix() {
         exit 1
     }
 
-    [[ -f "${installation_file}" ]] || {
-        echo "[ERROR] Installation doc not found: ${installation_file}" >&2
+    [[ -f "${compatibility_csv}" ]] || {
+        echo "[ERROR] Compatibility CSV not found: ${compatibility_csv}" >&2
         exit 1
     }
 
-    python3 - "${out_file}" "${installation_file}" <<'PY'
+    python3 - "${out_file}" "${compatibility_csv}" <<'PY'
 from __future__ import annotations
 
 from pathlib import Path
@@ -368,24 +407,74 @@ from typing import Any
 
 
 out_file = Path(sys.argv[1])
-installation_file = Path(sys.argv[2])
+compatibility_csv = Path(sys.argv[2])
 
 
 def norm_vllm_base(base: str) -> str:
+    """vLLM label token -> merge key (0.11 -> 0.11.0)."""
     parts = base.split(".")
     return f"{base}.0" if len(parts) == 2 else base
 
 
+def parse_compatibility_csv(path: Path) -> dict[str, Any]:
+    """Parse CSV: row/col keys and cell icons."""
+    with path.open(encoding="utf-8", newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        raise SystemExit(f"[ERROR] Empty CSV: {path}")
+
+    header = rows[0]
+    lm_labels_in_order: list[str] = []
+    lm_keys_in_order: list[str] = []
+    lm_label_by_key: dict[str, str] = {}
+    for tok in header[1:]:
+        m = re.search(r"LMCache\s+(\d+\.\d+(?:\.\d+)?)", tok)
+        if not m:
+            continue
+        lm_key = m.group(1)
+        lm_labels_in_order.append(tok)
+        lm_keys_in_order.append(lm_key)
+        lm_label_by_key[lm_key] = tok
+
+    lm_count = len(lm_keys_in_order)
+    if lm_count == 0:
+        raise SystemExit("[ERROR] Could not parse LMCache columns from CSV header.")
+
+    v_label_by_key: dict[str, str] = {}
+    icons_by_pair: dict[tuple[str, str], str] = {}
+    v_keys_in_order: list[str] = []
+    v_key_re = re.compile(r"vLLM\s+(\d+\.\d+(?:\.\d+)?)\.x")
+
+    for row in rows[1:]:
+        if len(row) < 1 + lm_count:
+            continue
+        row_label = row[0]
+        vm = v_key_re.search(row_label)
+        if not vm:
+            continue
+        v_key = norm_vllm_base(vm.group(1))
+        if v_key not in v_label_by_key:
+            v_label_by_key[v_key] = row_label
+            v_keys_in_order.append(v_key)
+        icons = row[1 : 1 + lm_count]
+        for lm_key, icon in zip(lm_keys_in_order, icons):
+            icons_by_pair[(v_key, lm_key)] = icon
+
+    return {
+        "v_keys_in_order": v_keys_in_order,
+        "lm_keys_in_order": lm_keys_in_order,
+        "v_label_by_key": v_label_by_key,
+        "lm_label_by_key": lm_label_by_key,
+        "icons_by_pair": icons_by_pair,
+    }
+
+
 def parse_csv_table(lines: list[str]) -> dict[str, Any]:
-    # Locate header
+    """Parse compat_matrix.rst csv-table (same structure as parse_compatibility_csv)."""
     header_line = next((l for l in lines if l.strip().startswith(":header:")), None)
     if not header_line:
         raise SystemExit("[ERROR] Could not locate :header: in csv-table.")
 
-    widths_line = next((l for l in lines if l.strip().startswith(":widths:")), "")
-    widths = [int(x) for x in re.findall(r"\d+", widths_line)] if widths_line else []
-
-    # Header tokens include: first empty header (""), then LMCache column labels.
     quoted = re.findall(r'"([^"]*)"', header_line)
     lm_labels_in_order: list[str] = []
     lm_keys_in_order: list[str] = []
@@ -437,31 +526,10 @@ def parse_csv_table(lines: list[str]) -> dict[str, Any]:
         "v_label_by_key": v_label_by_key,
         "lm_label_by_key": lm_label_by_key,
         "icons_by_pair": icons_by_pair,
-        "widths": widths,
     }
 
 
-installation_lines = installation_file.read_text(encoding="utf-8").splitlines()
-try:
-    start_existing = next(
-        i for i, line in enumerate(installation_lines) if line.strip() == ".. csv-table::"
-    )
-except StopIteration as exc:
-    raise SystemExit("[ERROR] Could not locate csv-table block in installation.rst.") from exc
-
-try:
-    end_existing = next(
-        i
-        for i in range(start_existing + 1, len(installation_lines))
-        if installation_lines[i].strip() == ".. raw:: html"
-    )
-except StopIteration as exc:
-    raise SystemExit(
-        "[ERROR] Could not locate end of compatibility matrix block in installation.rst."
-    ) from exc
-
-existing_block = installation_lines[start_existing:end_existing]
-existing_parsed = parse_csv_table(existing_block)
+existing_parsed = parse_compatibility_csv(compatibility_csv)
 
 gen_lines = out_file.read_text(encoding="utf-8").splitlines()
 start_gen = next((i for i, l in enumerate(gen_lines) if l.strip() == ".. csv-table::"), None)
@@ -471,7 +539,6 @@ if start_gen is None:
 gen_block = gen_lines[start_gen:]
 gen_parsed = parse_csv_table(gen_block)
 
-# Merge: keep existing order, append new versions discovered in generated output.
 merged_v_order = existing_parsed["v_keys_in_order"] + [
     k for k in gen_parsed["v_keys_in_order"] if k not in existing_parsed["v_keys_in_order"]
 ]
@@ -488,62 +555,59 @@ merged_v_labels.update(gen_parsed["v_label_by_key"])
 merged_lm_labels = dict(existing_parsed["lm_label_by_key"])
 merged_lm_labels.update(gen_parsed["lm_label_by_key"])
 
-# Preserve widths when possible; expand when new LMCache columns appear.
-existing_widths: list[int] = existing_parsed.get("widths") or []
-first_w = existing_widths[0] if len(existing_widths) >= 1 else 25
-other_w = existing_widths[1] if len(existing_widths) >= 2 else 15
-merged_widths = [first_w] + [other_w] * len(merged_lm_order)
 
-merged_lines: list[str] = []
-merged_lines.append(".. csv-table::")
-merged_header = '   :header: ""' + "".join([f', "{merged_lm_labels[k]}"' for k in merged_lm_order])
-merged_lines.append(merged_header)
-merged_lines.append(
-    f'   :widths: {", ".join(str(x) for x in merged_widths)}'
-)
-# Required by reStructuredText: separate csv-table options from body rows.
-merged_lines.append("")
+def _version_sort_key(version: str) -> tuple[int, ...]:
+    """Semver tuple sort key; newest = largest."""
+    return tuple(int(p) for p in version.split("."))
 
-for v_key in merged_v_order:
-    v_label = merged_v_labels.get(v_key, f"vLLM {v_key}.x")
-    row_icons = [merged_icons.get((v_key, lm_key), "❌") for lm_key in merged_lm_order]
-    merged_lines.append(
-        '   "' + v_label + '"' + "".join([f', "{icon}"' for icon in row_icons])
-    )
 
-updated_lines = (
-    installation_lines[:start_existing] + merged_lines + [""] + installation_lines[end_existing:]
-)
-installation_file.write_text("\n".join(updated_lines) + "\n", encoding="utf-8")
+# Newest vLLM top; newest LMCache left.
+merged_v_order = sorted(merged_v_order, key=_version_sort_key, reverse=True)
+merged_lm_order = sorted(merged_lm_order, key=_version_sort_key, reverse=True)
 
-print(f"[INFO] Merged {out_file} into {installation_file}")
+with compatibility_csv.open("w", encoding="utf-8", newline="") as f:
+    w = csv.writer(f)
+    w.writerow([""] + [merged_lm_labels[k] for k in merged_lm_order])
+    for v_key in merged_v_order:
+        v_label = merged_v_labels.get(v_key, f"vLLM {v_key}.x")
+        w.writerow(
+            [v_label]
+            + [merged_icons.get((v_key, lm_key), "❌") for lm_key in merged_lm_order]
+        )
+
+print(f"[INFO] Merged {out_file} into {compatibility_csv}")
 PY
 }
 
+# =============================================================================
+# Debug: list PyPI releases missing from CSV
+# =============================================================================
+# check_matrix: print PyPI-minus-CSV missing versions (debug).
 check_matrix() {
-    local script_dir installation_file
-    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    installation_file="${INSTALLATION_FILE:-${script_dir}/../../../../docs/source/getting_started/installation.rst}"
+    local compatibility_csv
+    compatibility_csv="${COMPATIBILITY_CSV:-${SCRIPT_DIR}/../../../../docs/source/getting_started/installation_compatibility.csv}"
 
-    [[ -f "${installation_file}" ]] || {
-        echo "[ERROR] Installation doc not found: ${installation_file}" >&2
+    [[ -f "${compatibility_csv}" ]] || {
+        echo "[ERROR] Compatibility CSV not found: ${compatibility_csv}" >&2
         exit 1
     }
 
     local parsed_output line key value
-    parsed_output="$(python3 - "${installation_file}" <<'PY'
+    parsed_output="$(python3 - "${compatibility_csv}" <<'PY'
 from pathlib import Path
-import json
+import csv
 import re
 import sys
 import urllib.request
 
 
 def _version_key(version: str) -> tuple[int, int, int]:
+    """x.y.z -> int tuple for sorting."""
     return tuple(int(part) for part in version.split("."))
 
 
 def _released_versions(package: str) -> list[str]:
+    """Sorted x.y.z releases from PyPI for package."""
     url = f"https://pypi.org/pypi/{package}/json"
     with urllib.request.urlopen(url, timeout=30) as response:
         payload = json.load(response)
@@ -557,24 +621,40 @@ def _released_versions(package: str) -> list[str]:
 
 
 def _is_later_than_0_11_x(version: str) -> bool:
+    """vLLM version after 0.11.x line."""
     major, minor, _ = _version_key(version)
     return (major, minor) > (0, 11)
 
 
 def _is_later_than_0_3_9(version: str) -> bool:
+    """LMCache version > 0.3.9 (cutoff)."""
     return _version_key(version) > (0, 3, 9)
 
 
-installation_file = Path(sys.argv[1])
-installation_text = installation_file.read_text(encoding="utf-8")
+compatibility_csv = Path(sys.argv[1])
 
-existing_vllm = {
-    (match.group(1) + ".0" if len(match.group(1).split(".")) == 2 else match.group(1))
-    for match in re.finditer(r"vLLM\s+(\d+\.\d+(?:\.\d+)?)(?:\.x)?", installation_text)
-}
-existing_lmcache = {
-    match.group(1) for match in re.finditer(r"LMCache\s+(\d+\.\d+\.\d+)", installation_text)
-}
+with compatibility_csv.open(encoding="utf-8", newline="") as f:
+    rows = list(csv.reader(f))
+
+existing_vllm: set[str] = set()
+existing_lmcache: set[str] = set()
+v_row_re = re.compile(r"vLLM\s+(\d+\.\d+(?:\.\d+)?)(?:\.x)?")
+
+if rows:
+    header = rows[0]
+    for cell in header[1:]:
+        m = re.search(r"LMCache\s+(\d+\.\d+\.\d+)", cell)
+        if m:
+            existing_lmcache.add(m.group(1))
+    for row in rows[1:]:
+        if not row:
+            continue
+        vm = v_row_re.search(row[0])
+        if not vm:
+            continue
+        base = vm.group(1)
+        norm = base + ".0" if len(base.split(".")) == 2 else base
+        existing_vllm.add(norm)
 
 missing_vllm = [
     f"{version}.x"
@@ -608,6 +688,10 @@ PY
     echo "lmcache_versions: ${lmcache_versions[*]}"
 }
 
+# =============================================================================
+# CLI
+# =============================================================================
+# main: dispatch subcommand (default update_matrix).
 main() {
     case "${1:-update_matrix}" in
     check_and_update_and_submit|check_and_update)
