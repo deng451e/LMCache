@@ -297,6 +297,7 @@ test_pair() {
 
     # 3. Start Server.
     LMCACHE_CHUNK_SIZE=8 vllm serve "$MODEL_ID" --port "$port" --load-format dummy \
+        --gpu-memory-utilization 0.1 \
         --kv-transfer-config '{"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"}' \
         >> "$run_dir/server.log" 2>&1 &
     local server_pid=$!
@@ -337,7 +338,7 @@ test_pair() {
 # =============================================================================
 main() {
     local -a vllm_versions=()
-    local -a lmcache_versions=("0.4.2")
+    local -a lmcache_versions=()
     local docs_matrix_file
     local -a filtered_vllm_versions=()
     local -a filtered_lmcache_versions=()

@@ -252,15 +252,14 @@ def _released_versions(package: str) -> list[str]:
     return sorted(versions, key=_version_key)
 
 
-def _is_later_than_0_11_x(version: str) -> bool:
-    """vLLM version after 0.11.x line."""
-    major, minor, _ = _version_key(version)
-    return (major, minor) > (0, 11)
+def _is_later_than_0_8_5(version: str) -> bool:
+    """vLLM version > 0.8.5 (cutoff)."""
+    return _version_key(version) > (0, 17, 0)
 
 
-def _is_later_than_0_3_9(version: str) -> bool:
-    """LMCache version > 0.3.9 (cutoff)."""
-    return _version_key(version) > (0, 3, 9)
+def _is_later_than_0_3_2(version: str) -> bool:
+    """LMCache version > 0.3.2 (cutoff)."""
+    return _version_key(version) > (0, 4, 2)
 
 
 compatibility_csv = Path(sys.argv[1])
@@ -276,7 +275,7 @@ if rows:
     header = rows[0]
     for cell in header[1:]:
         m = re.search(r"LMCache\s+(\d+\.\d+\.\d+)", cell)
-        if m and _is_later_than_0_3_9(m.group(1)):
+        if m and _is_later_than_0_3_2(m.group(1)):
             existing_lmcache.add(m.group(1))
     for row in rows[1:]:
         if not row:
@@ -286,7 +285,7 @@ if rows:
             continue
         base = vm.group(1)
         norm = base + ".0" if len(base.split(".")) == 2 else base
-        if _is_later_than_0_11_x(norm):
+        if _is_later_than_0_8_5(norm):
             existing_vllm.add(norm)
 
 released_vllm = _released_versions("vllm")
@@ -295,12 +294,12 @@ released_lmcache = _released_versions("lmcache")
 missing_vllm_bases = [
     version
     for version in released_vllm
-    if _is_later_than_0_11_x(version) and version not in existing_vllm
+    if _is_later_than_0_8_5(version) and version not in existing_vllm
 ]
 missing_lmcache = [
     version
     for version in released_lmcache
-    if _is_later_than_0_3_9(version) and version not in existing_lmcache
+    if _is_later_than_0_3_2(version) and version not in existing_lmcache
 ]
 
 vllm_bases_to_test = (
@@ -620,15 +619,14 @@ def _released_versions(package: str) -> list[str]:
     return sorted(versions, key=_version_key)
 
 
-def _is_later_than_0_11_x(version: str) -> bool:
-    """vLLM version after 0.11.x line."""
-    major, minor, _ = _version_key(version)
-    return (major, minor) > (0, 11)
+def _is_later_than_0_8_5(version: str) -> bool:
+    """vLLM version > 0.8.5 (cutoff)."""
+    return _version_key(version) > (0, 8, 5)
 
 
-def _is_later_than_0_3_9(version: str) -> bool:
-    """LMCache version > 0.3.9 (cutoff)."""
-    return _version_key(version) > (0, 3, 9)
+def _is_later_than_0_3_2(version: str) -> bool:
+    """LMCache version > 0.3.2 (cutoff)."""
+    return _version_key(version) > (0, 3, 2)
 
 
 compatibility_csv = Path(sys.argv[1])
@@ -659,12 +657,12 @@ if rows:
 missing_vllm = [
     f"{version}.x"
     for version in _released_versions("vllm")
-    if _is_later_than_0_11_x(version) and version not in existing_vllm
+    if _is_later_than_0_8_5(version) and version not in existing_vllm
 ]
 missing_lmcache = [
     version
     for version in _released_versions("lmcache")
-    if _is_later_than_0_3_9(version) and version not in existing_lmcache
+    if _is_later_than_0_3_2(version) and version not in existing_lmcache
 ]
 
 print("VLLM_MISSING=" + ",".join(missing_vllm))
