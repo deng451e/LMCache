@@ -254,12 +254,12 @@ def _released_versions(package: str) -> list[str]:
 
 def _is_later_than_0_8_5(version: str) -> bool:
     """vLLM version > 0.8.5 (cutoff)."""
-    return _version_key(version) > (0, 17, 0)
+    return _version_key(version) > (0, 17, 1)
 
 
 def _is_later_than_0_3_2(version: str) -> bool:
     """LMCache version > 0.3.2 (cutoff)."""
-    return _version_key(version) > (0, 4, 2)
+    return _version_key(version) > (0, 4, 1)
 
 
 compatibility_csv = Path(sys.argv[1])
@@ -339,10 +339,11 @@ PY
         LMCACHE_TO_TEST) LMCACHE_TO_TEST_CSV="$value" ;;
         esac
     done <<< "${parsed_output}"
-
+  
     # Basic sanity checks to avoid generating an empty matrix.
     if [[ -z "${VLLM_TO_TEST_CSV}" || -z "${LMCACHE_TO_TEST_CSV}" ]]; then
-        echo "[ERROR] Computed empty version sets (VLLM_TO_TEST/ LMCACHE_TO_TEST)." >&2
+        echo "[INFO] Computed empty version sets (VLLM_TO_TEST/ LMCACHE_TO_TEST)." >&2
+        echo "[INFO] Exiting without running tests." >&2
         exit 1
     fi
 }
