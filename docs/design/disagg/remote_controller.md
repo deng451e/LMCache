@@ -36,7 +36,7 @@ graph LR
         RLA["RemoteL2Adapter\n(L2AdapterInterface)"]
         RC["RemoteController"]
         L1["L1Manager"]
-        RTA["RemoteTransferAdapter"]
+        RIA["RemoteIOAdapter"]
     end
 
     subgraph PEER["Peer Host"]
@@ -51,40 +51,36 @@ graph LR
     PC -. "L2AdapterInterface" .-> RLA
     SC -- "KV ready (PD only)" --> PRX
     RC -- "reserve_read / finish_read" --> L1
-    RLA -- "lookup / unlock" --> RC
-    RLA -- "read / poll" --> RTA
-    RC -. "connect_peer (init only)" .-> RTA
-    RC -- "ZMQ: Lookup / Unpin" --> RCP
+    RLA -- "lookup + fetch" --> RIA
+    RC -. "connect_peer (init only)" .-> RIA
+    RIA -- "ZMQ: Lookup / Unpin" --> RCP
+    RIA -- "RDMA READ" --> L1P
     RCP -- "reserve_read / finish_read" --> L1P
-    RTA -- "RDMA READ" --> L1P
 ```
 
-**`RemoteL2Adapter`** — implements `L2AdapterInterface`; the single point of contact
-between `PrefetchController` and the remote path. `PrefetchController` treats it as an
-ordinary L2 adapter. Internally owns `RemoteController` and `RemoteTransferAdapter`:
-- Runs `rc.lookup()` in a thread pool (non-blocking to the controller); caches per-key
-  `RemoteKeyInfo` between the lookup and load phases.
-- Drives RDMA transfers via `rta.read/poll` in a background polling thread; signals the
-  load eventfd on completion.
-- Routes `submit_unlock` to `rc.unlock()`, mapping each key to its originating `request_id`.
-- Read-only: `submit_store_task` is a no-op. `RemoteL2Adapter` must not be added to the
-  `StoreController`'s adapter list (see §6).
+**`RemoteL2Adapter`** — thin `L2AdapterInterface` wrapper; the single point of
+contact between `PrefetchController` and the remote path. Delegates all I/O to
+`RemoteIOAdapter`. No internal state beyond `rc` and `rio` references.
+Read-only: `submit_store_task` is a no-op. Must not be added to the
+`StoreController`'s adapter list (see §6).
 
-**`RemoteController`** — control-plane coordinator, internal to `RemoteL2Adapter`:
-- Peer registry: ZMQ channels per peer, remote memory handles, connection lifecycle
-- Metadata exchange: `InitRequest / MemRegRequest` handshake at startup
-- Lookup: sends `LookupRequest` to peers, applies lookup policy, manages dedup cache
-- Server side: handles incoming `LookupRequest / UnpinRequest`, calls `L1Manager.reserve_read / finish_read`
+**`RemoteIOAdapter`** — client-side I/O, internal to `RemoteL2Adapter`:
+- Owns both the **lookup protocol** (ZMQ `LookupRequest / UnpinRequest` fan-out,
+  Lazy Pirate resilience, lookup policy) and **RDMA data transfer** (NIXL/UCX).
+- Caches per-key remote handles between lookup and fetch phases.
+- `NixlIOAdapter` is the concrete implementation.
 
-**`RemoteTransferAdapter`** — data-plane transport, internal to `RemoteL2Adapter`, no protocol knowledge:
-- `NixlTransferBackend` — RDMA READ/WRITE over UCX (InfiniBand / RoCE)
-- Interface: `read/write(local_handle, local_pages, remote_handle, remote_pages)`
+**`RemoteController`** — server side + peer connection management, internal to `RemoteL2Adapter`:
+- ZMQ REP server: handles `LookupRequest / UnpinRequest`, calls `L1Manager.reserve_read / finish_read`
+- `register_peer()`: runs Init/MemReg handshake and calls `RemoteIOAdapter.connect_peer()`
+- Reconnect thread: polls `rio.get_disconnected_peers()` and retries `register_peer()`
+- No client-side lookup fan-out
 
 | Mode | Required | Optional |
 |------|----------|---------|
-| P2P (both hosts) | `RemoteController` + `RemoteTransferAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
+| P2P (both hosts) | `RemoteController` + `RemoteIOAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
 | PD prefill | `RemoteController` + `StoreController` | — |
-| PD decode | `RemoteController` + `RemoteTransferAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
+| PD decode | `RemoteController` + `RemoteIOAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
 
 ---
 
@@ -137,45 +133,44 @@ sequenceDiagram
     participant PC  as PrefetchCtl (b)
     participant L1B as L1Mgr (b)
     participant RLA as RemoteL2Adapter (b)
-    participant RCB as RemoteController (b)
+    participant RIA as RemoteIOAdapter (b)
     participant RCA as RemoteController (a)
     participant L1A as L1Mgr (a)
-    participant RTA as RemoteTransferAdapter (b)
 
     PC ->> RLA: submit_lookup_and_lock_task(keys)
-    activate RLA
-    Note over RLA: thread-pool task: rc.lookup()
-    RLA ->> RCB: lookup(request_id, keys)
-    activate RCB
-    par fan-out LookupRequest to all N peers
-        RCB ->> RCA: LookupRequest(request_id, keys)
-        Note over RCA: reserve_read(keys) on L1A
-        RCA ->> RCB: LookupResponse(found_bitmap, pages)
+    RLA ->> RIA: submit_lookup_task(keys)
+    activate RIA
+    par fan-out ZMQ LookupRequest to all N peers
+        RIA ->> RCA: LookupRequest(request_id, keys)
+        RCA ->> L1A: reserve_read(keys)
+        L1A -->> RCA: found_keys + pages
+        RCA -->> RIA: LookupResponse(found_bitmap, pages)
     end
-    RCB ->> RLA: LookupResult(found_keys, key_info)
-    deactivate RCB
-    Note over RLA: cache key_info; build Bitmap; signal lookup_event_fd
-    deactivate RLA
+    Note over RIA: apply lookup_policy; cache handles; build Bitmap; signal lookup_event_fd
+    deactivate RIA
 
     PC ->> RLA: query_lookup_and_lock_result(task_id)
+    RLA ->> RIA: query_lookup_result(task_id)
+    RIA -->> RLA: Bitmap
     RLA -->> PC: Bitmap (found keys)
 
     PC ->> L1B: reserve_write(found_keys, is_temporary, layout, mode=new)
     L1B -->> PC: write_bitmap + local_objs
 
     PC ->> RLA: submit_load_task(found_keys, local_objs)
-    activate RLA
-    Note over RLA: look up cached key_info; issue RDMA READs
+    RLA ->> RIA: submit_fetch_task(found_keys, local_objs)
+    activate RIA
+    Note over RIA: use cached handles; issue RDMA READs
     par RDMA READ per key
-        RLA ->> RTA: read(local_handle, local_pages, remote_handle, remote_pages)
-        RTA ->> L1A: RDMA READ
-        L1A -->> RTA: RDMA DONE
-        RTA -->> RLA: TransferHandle (DONE)
+        RIA ->> L1A: RDMA READ
+        L1A -->> RIA: RDMA DONE
     end
-    Note over RLA: build result Bitmap; signal load_event_fd
-    deactivate RLA
+    Note over RIA: build result Bitmap; signal fetch_event_fd
+    deactivate RIA
 
     PC ->> RLA: query_load_result(task_id)
+    RLA ->> RIA: query_fetch_result(task_id)
+    RIA -->> RLA: Bitmap
     RLA -->> PC: Bitmap (loaded keys)
 
     alt loaded_keys
@@ -186,13 +181,11 @@ sequenceDiagram
     end
 
     PC ->> RLA: submit_unlock(found_keys)
-    activate RLA
-    RLA ->> RCB: unlock(request_id, found_keys)
-    par UnpinRequest per peer
-        RCB ->> RCA: UnpinRequest(request_id, peer_found_keys)
-        RCA ->> RCB: UnpinResponse
+    RLA ->> RIA: submit_unlock(found_keys)
+    par ZMQ UnpinRequest per peer
+        RIA ->> RCA: UnpinRequest(request_id, peer_found_keys)
+        Note over RCA: finish_read; evict dedup entry
     end
-    deactivate RLA
 ```
 
 ### 4.2 PD Pull (decode pulls from prefill via RemoteTransferAdapter)
@@ -215,8 +208,7 @@ sequenceDiagram
     participant ENG as Engine (decode)
     participant PC  as PrefetchCtl (decode)
     participant RLA as RemoteL2Adapter (decode)
-    participant RCD as RemoteController (decode)
-    participant RTA as RemoteTransferAdapter (decode)
+    participant RIA as RemoteIOAdapter (decode)
     participant L1D as L1Mgr (decode)
 
     PRX ->> SCP: dispatch prefill request
@@ -231,34 +223,29 @@ sequenceDiagram
 
     activate PC
     PC ->> RLA: submit_lookup_and_lock_task(keys)
-    activate RLA
-    RLA ->> RCD: lookup(request_id, keys)
-    activate RCD
-    RCD ->> RCP: LookupRequest(request_id, keys)
+    RLA ->> RIA: submit_lookup_task(keys)
+    activate RIA
+    RIA ->> RCP: ZMQ LookupRequest(request_id, keys)
     activate RCP
     RCP ->> L1P: reserve_read(keys)
     L1P -->> RCP: found_keys + pages
     RCP ->> RCP: dedup cache: store request_id
-    RCP ->> RCD: LookupResponse(found_bitmap, pages_per_found)
+    RCP -->> RIA: LookupResponse(found_bitmap, pages_per_found)
     deactivate RCP
-    RCD -->> RLA: LookupResult(found_keys, key_info)
-    deactivate RCD
-    Note over RLA: cache key_info; build Bitmap; signal lookup_event_fd
-    deactivate RLA
+    Note over RIA: cache handles; build Bitmap; signal lookup_event_fd
+    deactivate RIA
 
     PC ->> L1D: reserve_write(found_keys, is_temporary=False, layout, mode=new)
     L1D -->> PC: write_bitmap + local_objs
 
     PC ->> RLA: submit_load_task(found_keys, local_objs)
-    activate RLA
-    RLA ->> RTA: read(local_handle, local_pages, remote_handle, remote_pages)
-    activate RTA
-    RTA ->> L1P: RDMA READ
-    L1P -->> RTA: RDMA DONE
-    RTA -->> RLA: TransferHandle (DONE)
-    deactivate RTA
-    Note over RLA: build result Bitmap; signal load_event_fd
-    deactivate RLA
+    RLA ->> RIA: submit_fetch_task(found_keys, local_objs)
+    activate RIA
+    Note over RIA: use cached handles; issue RDMA READs
+    RIA ->> L1P: RDMA READ
+    L1P -->> RIA: RDMA DONE
+    Note over RIA: build result Bitmap; signal fetch_event_fd
+    deactivate RIA
 
     alt loaded_keys
         PC ->> L1D: finish_write_and_reserve_read(loaded_keys)
@@ -273,15 +260,12 @@ sequenceDiagram
     ENG ->> L1D: read_prefetched_results(loaded_keys)
 
     PC ->> RLA: submit_unlock(found_keys)
-    activate RLA
-    RLA ->> RCD: unlock(request_id, found_keys)
-    RCD ->> RCP: UnpinRequest(request_id, found_keys)
+    RLA ->> RIA: submit_unlock(found_keys)
+    RIA ->> RCP: ZMQ UnpinRequest(request_id, found_keys)
     activate RCP
     RCP ->> L1P: finish_read(found_keys)
     RCP ->> RCP: dedup cache: evict request_id
-    RCP ->> RCD: UnpinResponse
     deactivate RCP
-    deactivate RLA
 
     ENG ->> L1D: finish_read(loaded_keys)
 ```

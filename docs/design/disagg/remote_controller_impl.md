@@ -1,4 +1,4 @@
-# Implementation Plan: RemoteController & RemoteTransferAdapter
+# Implementation Plan: RemoteController & RemoteIOAdapter
 
 **Status**: Draft  
 **Author**: weishu@tensormesh.ai  
@@ -6,9 +6,9 @@
 
 Companion to [remote_controller.md](remote_controller.md),
 [remote_controller_interface.md](remote_controller_interface.md), and
-[remote_transfer_adapter_interface.md](remote_transfer_adapter_interface.md).
+[remote_io_adapter_interface.md](remote_io_adapter_interface.md).
 
-Covers `ZMQRemoteController` internals, `NixlTransferBackend`, peer registration
+Covers `ZMQRemoteController` internals, `NixlIOAdapter`, peer registration
 protocol, lookup idempotency, config schema, StorageManager integration, and
 file structure.
 
@@ -23,68 +23,32 @@ The concrete implementation is `ZMQRemoteController(RemoteController)`.
 ```python
 class PeerStatus(Enum):
     CONNECTED    = "connected"
-    DISCONNECTED = "disconnected"  # ZMQ retries exhausted; excluded from lookup fan-out
+    DISCONNECTED = "disconnected"  # reported by RIO; excluded from reconnect until resolved
 
 @dataclass
 class PeerState:
-    config:        PeerConfig
-    zmq_channel:   ZMQControlChannel   # one REQ socket per peer
-    remote_handle: RemoteMemHandle     # NIXL memory descriptors for this peer
-    in_flight:     int        = 0      # active lookup/unlock ops (for drain on unregister)
-    status:        PeerStatus = PeerStatus.CONNECTED
+    config:      PeerConfig
+    zmq_channel: ZMQControlChannel   # one REQ socket per peer (for Init/MemReg + reconnect)
+    in_flight:   int        = 0      # active register/unregister ops (for drain on unregister)
+    status:      PeerStatus = PeerStatus.CONNECTED
+    # remote_handle removed — now owned by RemoteIOAdapter
 
 class ZMQRemoteController:
-    _l1_manager:  L1Manager
-    _transfer:    RemoteTransferAdapter
-    _peers:       dict[str, PeerState]
-    _peers_lock:  RWLock              # read for lookup; write for register/unregister
-    _dedup:       dict[str, LookupResponse]
-    _dedup_lock:  threading.Lock
+    _l1_manager: L1Manager
+    _io:         RemoteIOAdapter
+    _peers:      dict[str, PeerState]
+    _peers_lock: RWLock              # write for register/unregister; read for reconnect scan
+    _dedup:      dict[str, LookupResponse]
+    _dedup_lock: threading.Lock
 ```
 
-`_transfer` is referenced only during `register_peer()` to call `connect_peer()`.
-At lookup runtime the caller drives `RemoteTransferAdapter` directly using the
-`RemoteMemHandle` stored in `LookupResult.key_info`.
-
-### 1.3 Peer Disconnect Detection and Reconnect
-
-When `ZMQControlChannel.send_request()` exhausts all retries (§3.1), it raises
-`TimeoutError`. The `lookup()` fan-out catches this and marks the peer as
-`DISCONNECTED` before skipping it:
-
-```python
-try:
-    responses[peer_id] = fut.result(timeout=...)
-except TimeoutError:
-    with _peers_lock.write():
-        _peers[peer_id].status = PeerStatus.DISCONNECTED
-    # peer excluded from this and all future lookup fan-outs until reconnected
-```
-
-`lookup()` skips any peer whose `status == DISCONNECTED` before building the
-fan-out futures — so a stale `RemoteMemHandle` is never placed into
-`LookupResult.key_info` and never reaches `RTA.read()`.
-
-A background reconnect thread polls disconnected peers on a fixed interval
-(default 30 s):
-
-```python
-for peer_id, state in _peers.items():
-    if state.status == PeerStatus.DISCONNECTED:
-        try:
-            register_peer(state.config)   # full Init/MemReg handshake + connect_peer
-        except ConnectionError:
-            pass   # retry next interval
-```
-
-`register_peer()` on success replaces the `PeerState` entry (fresh `zmq_channel`
-and `remote_handle`) and sets `status = CONNECTED` under the write lock.
+`_io` is called during `register_peer()` to exchange peer descriptors. At
+server runtime `_io` is not involved — handlers call `_l1_manager` directly.
 
 ### 1.2 ZMQ Server Thread
 
 A single background thread runs the ZMQ REP socket event loop. Incoming `bytes`
-are decoded with `msgspec` and dispatched by message type tag. Handlers call
-`_l1_manager` directly — no cross-thread queuing.
+are decoded with `msgspec` and dispatched by message type tag.
 
 ```python
 while running:
@@ -96,10 +60,32 @@ while running:
 
 | Message | Server handler |
 |---|---|
-| `InitRequest` | Return `_transfer.get_local_metadata()` |
-| `MemRegRequest` | Return `_transfer.get_local_xfer_descs()` |
+| `InitRequest` | Return `_io.get_local_metadata()` |
+| `MemRegRequest` | Return `_io.get_local_xfer_descs()` |
 | `LookupRequest` | Dedup check → `_l1_manager.reserve_read(keys)` → cache → `LookupResponse` |
 | `UnpinRequest` | `_l1_manager.finish_read(found_keys)` → evict dedup entry → `UnpinResponse` |
+
+### 1.3 Peer Disconnect Detection and Reconnect
+
+Disconnect detection is owned by `RemoteIOAdapter`, which detects ZMQ timeout
+during its lookup fan-out. RIO marks the peer as disconnected internally and
+exposes it via `get_disconnected_peers() → list[str]`.
+
+`ZMQRemoteController`'s reconnect thread polls on a fixed interval (default 30 s):
+
+```python
+for peer_id in _io.get_disconnected_peers():
+    state = _peers.get(peer_id)
+    if state is None:
+        continue
+    try:
+        register_peer(state.config)   # full Init/MemReg handshake + _io.connect_peer()
+    except ConnectionError:
+        pass   # retry next interval
+```
+
+`register_peer()` on success calls `_io.connect_peer()` which resets the peer
+to `CONNECTED` in RIO's internal state.
 
 ---
 
@@ -113,79 +99,31 @@ lock; the lock is acquired only for the final `_peers` insert.
 register_peer() caller                        Remote ZMQ server (already running)
 ──────────────────────────────────────────    ────────────────────────────────────
 channel = ZMQControlChannel(host, port)
-send InitRequest(local_agent_metadata)   ──→  handler: return local_agent_metadata
-peer_metadata = InitResponse.metadata    ←──
-send MemRegRequest(local_xfer_descs)     ──→  handler: return local_xfer_descs
-peer_xfer_descs = MemRegResponse.descs   ←──
-remote_handle = _transfer.connect_peer(peer_metadata, peer_xfer_descs)
+send InitRequest(_io.get_local_metadata()) ──→  handler: return local metadata
+peer_metadata = InitResponse.metadata      ←──
+send MemRegRequest(_io.get_local_xfer_descs()) ──→  handler: return local xfer_descs
+peer_xfer_descs = MemRegResponse.descs     ←──
+_io.connect_peer(peer_id, endpoint, peer_metadata, peer_xfer_descs)
 with _peers_lock.write():
-    _peers[peer_id] = PeerState(config, channel, remote_handle)
+    _peers[peer_id] = PeerState(config, channel)
+    # no remote_handle — now owned by _io
 ```
 
-`unregister_peer(peer_id)` acquires the write lock, marks the peer as draining,
-waits for `in_flight == 0`, then removes the entry and closes the ZMQ channel.
+`unregister_peer(peer_id)` acquires the write lock, waits for `in_flight == 0`,
+calls `_io.disconnect_peer(peer_id)`, then removes the entry and closes the ZMQ
+channel.
 
 ---
 
-## 3. Lookup Fan-out
+## 3. Lookup Fan-out (moved to NixlIOAdapter)
 
-`lookup(request_id, keys)` fans out `LookupRequest` to all registered peers
-concurrently using a thread pool, then aggregates results by `lookup_policy`.
+The lookup fan-out, ZMQ channel resilience (Lazy Pirate), and lookup policy
+(`first_found` / `round_robin`) are implemented in `NixlIOAdapter` — the
+concrete `RemoteIOAdapter`. See
+[remote_io_adapter_interface.md](remote_io_adapter_interface.md) for the full
+interface and §6.2 below for `NixlIOAdapter` internals.
 
-```python
-def lookup(self, request_id: str, keys: list[ObjectKey]) -> LookupResult:
-    with self._peers_lock.read():
-        peers = list(self._peers.values())
-
-    futures = {
-        p.config.peer_id: executor.submit(_send_lookup, p, request_id, keys)
-        for p in peers
-    }
-
-    responses: dict[str, LookupResponse] = {}
-    for peer_id, fut in futures.items():
-        try:
-            responses[peer_id] = fut.result(timeout=zmq_timeout_ms / 1000)
-        except TimeoutError:
-            pass   # peer treated as not-found for this request
-
-    return _apply_lookup_policy(responses, keys)
-```
-
-`_apply_lookup_policy`:
-
-- `first_found` — first peer (in registration order) that has a key wins.
-- `round_robin` — cycles through peers across successive lookups using a
-  per-key modulo on a request counter. Spreads read load evenly.
-
-### 3.1 ZMQ Channel Resilience (Lazy Pirate)
-
-ZMQ REQ sockets are strictly alternating: `send` must be followed by `recv`
-before the next `send`. If `RCVTIMEO` fires, the socket enters a broken state —
-the next `send` blocks indefinitely.
-
-`ZMQControlChannel.send_request()` recovers by closing and recreating the socket
-on each timeout:
-
-```python
-def send_request(self, msg: bytes, retries: int = 3) -> bytes:
-    for attempt in range(retries):
-        self._socket.send(msg)
-        if self._socket.poll(self._timeout_ms):
-            return self._socket.recv()
-        # Timeout: REQ state machine is broken — recreate the socket
-        self._socket.close()
-        self._socket = self._ctx.socket(zmq.REQ)
-        self._socket.setsockopt(zmq.RCVTIMEO, self._timeout_ms)
-        self._socket.connect(self._endpoint)
-    raise TimeoutError(f"all {retries} attempts to {self._endpoint} timed out")
-```
-
-Key properties:
-- No state leaks: old socket is closed before the new one connects.
-- Transparent to `lookup()`: `_send_lookup` only sees `TimeoutError` on exhaustion.
-- Safe to retry: the server dedup cache ensures a late-arriving `LookupRequest`
-  retried with the same `request_id` does not double-pin.
+`ZMQRemoteController` has no `lookup()` or `unlock()` methods.
 
 ---
 
@@ -193,10 +131,10 @@ Key properties:
 
 ### Problem
 
-`LookupRequest` calls `_l1_manager.reserve_read(keys)` on the server, incrementing
-a read-lock counter per key. A ZMQ timeout followed by retry would double-pin the
-key; a single `UnpinRequest` would then leave a ghost read-lock until
-`remote_pin_ttl_s` expires.
+`LookupRequest` calls `_l1_manager.reserve_read(keys)` on the server,
+incrementing a read-lock counter per key. A ZMQ timeout followed by retry would
+double-pin the key; a single `UnpinRequest` would then leave a ghost read-lock
+until `remote_pin_ttl_s` expires.
 
 ### Server-side dedup cache
 
@@ -223,16 +161,13 @@ _l1_manager.finish_read(found_keys)
 _dedup.pop(request_id, None)           # eager eviction
 ```
 
-TTL-based expiry ensures cleanup even if `UnpinRequest` is lost. After
-`remote_pin_ttl_s + 10 s` the read lock itself has also expired, so a belated
-retry returns an empty `found_bitmap` rather than a stale cache hit.
+TTL-based expiry ensures cleanup even if `UnpinRequest` is lost.
 
-`request_id` is generated once per caller operation and never regenerated on
-retry. The same `request_id` is sent to all peers in the fan-out, so per-peer
-retries are also safe.
+`request_id` is generated once per `NixlIOAdapter` task and never regenerated on
+retry, so per-peer retries are safe.
 
 `UnpinRequest` is idempotent: `finish_read` on an already-released key logs a
-warning but does not corrupt state. The `_dedup.pop` is a no-op on a missing key.
+warning but does not corrupt state.
 
 ---
 
@@ -256,34 +191,31 @@ class RemoteControllerConfig:
     peers: list[PeerConfig]      = field(default_factory=list)
     # Pre-configured peers. register_peer() can add more at runtime.
 
-    lookup_policy:    str = "first_found"  # "first_found" | "round_robin"
     zmq_timeout_ms:   int = 5000
     remote_pin_ttl_s: int = 60
+    # lookup_policy moved to RemoteIOAdapterConfig
 ```
 
 Components active per mode:
 
 ```
-mode          ZMQ server   peer registry    RemoteTransferAdapter
+mode          ZMQ server   peer registry    RemoteIOAdapter
 ──────────────────────────────────────────────────────────────────
-p2p           yes          yes (≥1 peer)    yes (RDMA READ)
+p2p           yes          yes (≥1 peer)    yes (lookup + RDMA READ)
 pd_prefill    yes          no               no
-pd_decode     yes          yes (prefiller)  yes (RDMA READ)
+pd_decode     yes          yes (prefiller)  yes (lookup + RDMA READ)
 ```
 
-`pd_prefill` runs only the ZMQ REP server — it does not initiate lookups.  
-`pd_decode` connects to the prefill host as a peer and issues lookup/pull
-using the same protocol as P2P.
+`pd_prefill` runs only the ZMQ REP server — it does not initiate lookups.
 
 ---
 
 ## 6. StorageManager Integration
 
 `RemoteL2Adapter` is wired in via `StorageManagerConfig` and added to the
-**prefetch-only** adapter list. It must not be in the `StoreController`'s list —
-remote peers are read sources, not write destinations.
+**prefetch-only** adapter list. It must not be in the `StoreController`'s list.
 
-`StorageManager` therefore maintains two separate adapter lists:
+`StorageManager` maintains two separate adapter lists:
 
 ```python
 @dataclass
@@ -292,112 +224,110 @@ class StorageManagerConfig:
     remote_controller_config: RemoteControllerConfig | None = None
 ```
 
-`StorageManager.__init__` builds and starts the adapter:
+`StorageManager.__init__` builds and starts the components:
 
 ```python
 if cfg.remote_controller_config:
-    transfer = NixlTransferBackend(...)
-    local_handle = transfer.register_local_memory(
-        l1_buf.ptr, l1_buf.size, device="cpu"
-    )
-    rc = build_remote_controller(cfg.remote_controller_config, l1_manager, transfer)
+    rio = NixlIOAdapter(cfg.remote_io_adapter_config)
+    rio.register_local_memory(l1_buf.ptr, l1_buf.size, device="cpu")
+    rc = build_remote_controller(cfg.remote_controller_config, l1_manager, rio)
     rc.start()
-    remote_l2 = RemoteL2Adapter(
-        rc, transfer, local_handle,
-        l1_manager.get_l1_memory_desc().align_bytes,
-    )
+    remote_l2 = RemoteL2Adapter(rc, rio)
     remote_l2.start()
     self._prefetch_adapters.append(remote_l2)
     # self._store_adapters does NOT include remote_l2
 ```
 
 `PrefetchController` is constructed with `prefetch_adapters`; `StoreController`
-with `store_adapters`. `PrefetchController` itself is unchanged — it sees
+with `store_adapters`. `PrefetchController` itself is unchanged — it treats
 `RemoteL2Adapter` as an ordinary `L2AdapterInterface` entry.
 
 ### 6.1 RemoteL2Adapter Internals
 
-`RemoteL2Adapter` implements `L2AdapterInterface` and orchestrates
-`RemoteController` + `RemoteTransferAdapter` behind two eventfds, keeping
-`PrefetchController` completely unaware of the remote path.
+`RemoteL2Adapter` is a **thin wrapper** — its only role is to translate
+`L2AdapterInterface` calls into `RemoteIOAdapter` calls. All task tracking,
+handle caching, ZMQ fan-out, and RDMA polling live in `RemoteIOAdapter`.
 
 #### State
 
 ```python
 class RemoteL2Adapter(L2AdapterInterface):
-    _rc:           RemoteController
-    _rta:          RemoteTransferAdapter
+    _rc:  RemoteController   # for peer lifecycle: register_peer / unregister_peer
+    _rio: RemoteIOAdapter    # for all I/O: lookup, fetch, unlock
+    # No internal task state — fully delegated to _rio
+```
+
+#### Method delegation
+
+| `L2AdapterInterface` method | Delegation |
+|---|---|
+| `get_lookup_and_lock_event_fd()` | `_rio.get_lookup_event_fd()` |
+| `get_load_event_fd()` | `_rio.get_fetch_event_fd()` |
+| `get_store_event_fd()` | dummy fd that never fires |
+| `submit_lookup_and_lock_task(keys)` | `_rio.submit_lookup_task(keys)` |
+| `query_lookup_and_lock_result(task_id)` | `_rio.query_lookup_result(task_id)` |
+| `submit_load_task(keys, objs)` | `_rio.submit_fetch_task(keys, objs)` |
+| `query_load_result(task_id)` | `_rio.query_fetch_result(task_id)` |
+| `submit_unlock(keys)` | `_rio.submit_unlock(keys)` |
+| `submit_store_task(...)` | no-op (read-only adapter) |
+| `pop_completed_store_tasks()` | returns `{}` |
+| `delete()` / `get_usage()` | no-op / default |
+
+### 6.2 NixlIOAdapter Internals
+
+`NixlIOAdapter` is the concrete `RemoteIOAdapter`. It manages one ZMQ REQ
+socket per peer (for lookup traffic) and one NIXL agent (for RDMA).
+
+**State:**
+
+```python
+class NixlIOAdapter(RemoteIOAdapter):
+    _agent:        NixlAgent
     _local_handle: LocalMemHandle
     _l1_align:     int
 
-    _next_task_id: int
-    _lookup_lock:  threading.Lock
-    # Populated by lookup thread; consumed by query_lookup_and_lock_result (one-shot)
-    _completed_lookups: dict[L2TaskId, Bitmap]
-    # Per-task remote handle cache: consumed by submit_load_task
-    _handle_cache: dict[L2TaskId, dict[ObjectKey, RemoteKeyInfo]]
-    # Key → request_id: used by submit_unlock to route to rc.unlock()
-    _key_to_reqid: dict[ObjectKey, str]
+    # Per-peer state (set by connect_peer, cleared by disconnect_peer)
+    _peer_channels:      dict[str, ZMQControlChannel]  # ZMQ REQ for lookup traffic
+    _peer_remote_handle: dict[str, RemoteMemHandle]    # NIXL descriptors per peer
+    _disconnected_peers: set[str]                      # reported via get_disconnected_peers()
+    _peers_lock:         RWLock
 
-    _load_lock:    threading.Lock
-    # task_id → [(key, TransferHandle)] for in-flight RDMA reads
-    _pending_loads:   dict[L2TaskId, list[tuple[ObjectKey, TransferHandle]]]
-    # Populated by RDMA poll thread; consumed by query_load_result (one-shot)
-    _completed_loads: dict[L2TaskId, Bitmap]
+    # Task state
+    _next_task_id:       int
+    _lookup_lock:        threading.Lock
+    _completed_lookups:  dict[IOTaskId, Bitmap]
+    _handle_cache:       dict[IOTaskId, dict[ObjectKey, tuple[str, list[int]]]]
+    # (peer_id, remote_pages) per key, for submit_fetch_task
 
-    # Eventfds (distinct per L2AdapterInterface contract)
-    _lookup_event_fd: int   # signaled when a lookup task result is ready
-    _load_event_fd:   int   # signaled when all RDMA reads for a load task finish
+    _load_lock:          threading.Lock
+    _pending_fetches:    dict[IOTaskId, list[tuple[ObjectKey, TransferHandle]]]
+    _completed_fetches:  dict[IOTaskId, Bitmap]
 
-    _lookup_executor:  ThreadPoolExecutor   # rc.lookup() calls (blocking network I/O)
-    _rdma_poll_thread: threading.Thread     # polls rta.poll() for in-flight transfers
+    _lookup_executor:    ThreadPoolExecutor   # ZMQ lookup fan-out
+    _fetch_poll_thread:  threading.Thread    # NIXL completion polling
+    _lookup_event_fd:    int
+    _fetch_event_fd:     int
+
+    _lookup_policy:      str   # "first_found" | "round_robin"
 ```
 
-#### Lookup path
+**Lookup fan-out** (`submit_lookup_task`): submits a thread-pool task that fans out
+`LookupRequest` to all connected peers via their per-peer `ZMQControlChannel`,
+applies `lookup_policy`, caches handles, and signals `_lookup_event_fd`. ZMQ
+timeout causes the peer to be added to `_disconnected_peers`.
 
-`submit_lookup_and_lock_task(keys)` submits a thread-pool task that calls
-`rc.lookup(request_id, keys)` (blocking ZMQ round-trip). On completion:
+**ZMQ channel resilience** (Lazy Pirate): identical to the former
+`ZMQControlChannel.send_request()` — recreates the REQ socket on each timeout
+before retrying. Transparent to the fan-out task.
 
-1. Cache `result.key_info` in `_handle_cache[task_id]`.
-2. Record `{key: request_id}` for each found key in `_key_to_reqid`.
-3. Build `Bitmap` from `result.found_keys`.
-4. Under `_lookup_lock`: store bitmap in `_completed_lookups[task_id]`.
-5. Signal `_lookup_event_fd`.
+**Fetch** (`submit_fetch_task`): uses `_handle_cache` to retrieve
+`(peer_id, remote_pages)` per key, calls `_agent.issue_request(NIXL_READ)` for
+each key, and stores `TransferHandle`s in `_pending_fetches`.
 
-`query_lookup_and_lock_result(task_id)` pops and returns the cached bitmap
-(one-shot), or `None` if not yet ready.
-
-#### Load path
-
-`submit_load_task(keys, local_objs)` retrieves `_handle_cache[task_id]` for
-per-key `RemoteKeyInfo`, then calls `rta.read()` for each key. The resulting
-`TransferHandle`s are stored in `_pending_loads[task_id]`.
-
-The RDMA poll thread wakes on a short timer (or on NIXL's completion fd if
-exposed) and calls `rta.poll(handle)` for all pending handles:
-
-- `DONE` → mark key successful; call `rta.release(handle)`.
-- `ERROR` → mark key failed; call `rta.release(handle)`.
-
-When all handles for a `task_id` are resolved:
-
-1. Build result `Bitmap`.
-2. Under `_load_lock`: store in `_completed_loads[task_id]`.
-3. Signal `_load_event_fd`.
-
-`query_load_result(task_id)` pops and returns the cached bitmap (one-shot).
-
-#### Unlock path
-
-`submit_unlock(keys)` groups keys by their `request_id` from `_key_to_reqid`,
-calls `rc.unlock(request_id, per_request_keys)` for each group (fire-and-forget;
-`RemoteController` retries internally), then cleans up `_key_to_reqid` entries.
-
-#### NIXL completion fd (optional optimisation)
-
-If `NixlTransferBackend` exposes a hardware completion fd, the RDMA poll thread
-can `select.poll()` on it instead of spinning — eliminating busy-wait CPU use.
-The lookup thread is unaffected (it blocks on ZMQ I/O).
+**Fetch poll thread**: calls `_agent.check_request(handle)` for all pending
+handles. On completion, builds result `Bitmap` and signals `_fetch_event_fd`.
+If NIXL exposes a completion fd, this thread can `select.poll()` on it instead
+of spinning.
 
 ---
 
@@ -406,8 +336,7 @@ The lookup thread is unaffected (it blocks on ZMQ I/O).
 ```
 lmcache/v1/distributed/
 │
-├── storage_manager.py                      # + remote_controller_config field   [modified]
-│                                           # + separate store/prefetch adapter lists
+├── storage_manager.py                      # + separate store/prefetch adapter lists [modified]
 ├── l1_manager.py                           # (unchanged)
 ├── memory_manager.py                       # (unchanged)
 │
@@ -416,27 +345,29 @@ lmcache/v1/distributed/
 │   └── store_controller.py                 # (unchanged)
 │
 ├── l2_adapters/
-│   ├── remote_l2_adapter.py               # RemoteL2Adapter                    [NEW]
+│   ├── remote_l2_adapter.py               # RemoteL2Adapter (thin wrapper)      [NEW]
 │   └── nixl_store_l2_adapter.py           # (unchanged)
 │
-├── remote_controller/                      # Control-plane coordinator          [NEW]
+├── remote_controller/                      # Server + peer connection management  [NEW]
 │   ├── __init__.py
 │   ├── config.py                           # PeerConfig, RemoteControllerConfig
 │   ├── protocol.py                         # ZMQ message structs (msgspec)
 │   │                                       # Init/MemReg/Lookup/Unpin Req+Resp
-│   ├── types.py                            # RemoteKeyInfo, LookupResult
 │   ├── controller.py                       # RemoteController ABC + ZMQRemoteController
 │   └── factory.py                          # build_remote_controller(...)
 │
-└── remote_transfer/                        # Data-plane transport               [NEW]
+└── remote_io/                              # Client-side I/O: lookup + RDMA       [NEW]
     ├── __init__.py
-    ├── adapter.py                          # RemoteTransferAdapter ABC
-    │                                       # + LocalMemHandle, RemoteMemHandle,
-    │                                       #   TransferHandle, TransferStatus
+    ├── adapter.py                          # RemoteIOAdapter ABC
+    │                                       # + LocalMemHandle, IOTaskId
+    ├── config.py                           # RemoteIOAdapterConfig (lookup_policy)
     └── backends/
         ├── __init__.py
-        └── nixl_backend.py                 # NixlTransferBackend (UCX/RDMA)
+        └── nixl_backend.py                 # NixlIOAdapter (ZMQ fan-out + NIXL/UCX)
 ```
+
+> `remote_controller/types.py` (RemoteKeyInfo, LookupResult) is removed — those
+> types are now internal to `NixlIOAdapter`.
 
 ---
 
@@ -444,9 +375,9 @@ lmcache/v1/distributed/
 
 | Existing component | Reused as |
 |---|---|
-| `NixlChannel` — ZMQ REQ/REP + handshake | Template for `ZMQControlChannel` and `InitRequest/MemRegRequest` sequence |
-| `NixlAgentWrapper` — agent init + xfer_descs | Moved into `NixlTransferBackend.register_local_memory` and `get_local_xfer_descs` |
-| `NixlStoreL2Adapter` — eventfd + async poll loop | Template for `RemoteL2Adapter` lookup/load eventfds and RDMA poll thread |
+| `NixlChannel` — ZMQ REQ/REP + handshake | Template for `ZMQControlChannel` in RC (Init/MemReg) and per-peer ZMQ REQ sockets in `NixlIOAdapter` (lookup traffic) |
+| `NixlAgentWrapper` — agent init + xfer_descs | Moved into `NixlIOAdapter.register_local_memory` and `get_local_xfer_descs` |
+| `NixlStoreL2Adapter` — eventfd + async poll loop | Template for `NixlIOAdapter` lookup/fetch eventfds and fetch poll thread |
 | `L1Manager.reserve_read / finish_read` | Called by `ZMQRemoteController` server-side handlers for `LookupRequest` and `UnpinRequest` |
 | `L1Manager.reserve_write / finish_write` | Called by `PrefetchController` (unchanged) after lookup returns found keys |
 | `PrefetchController` | Unchanged — treats `RemoteL2Adapter` as a standard L2 adapter |
