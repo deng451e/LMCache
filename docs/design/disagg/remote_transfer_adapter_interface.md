@@ -5,8 +5,9 @@
 **Date**: 2026-04-19
 
 Pure data-plane transport. No protocol knowledge, no peer state, no ZMQ.
-Called by the application layer after `RemoteController.lookup()` returns
-remote handles and page indices.
+Internal to `RemoteL2Adapter` — called after `RemoteController.lookup()`
+populates the adapter's handle cache. External components do not call it
+directly.
 
 ---
 

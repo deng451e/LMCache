@@ -13,14 +13,12 @@ The controller runs a background thread with an event-driven loop that:
 """
 
 # Standard
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Iterable
 import enum
 import os
 import select
 import threading
-import time
 
 # First Party
 from lmcache.logging import init_logger
@@ -29,12 +27,6 @@ from lmcache.v1.distributed.api import MemoryLayoutDesc, ObjectKey
 from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
-from lmcache.v1.distributed.remote_controller.controller import RemoteController
-from lmcache.v1.distributed.remote_transfer.adapter import (
-    LocalMemHandle,
-    RemoteTransferAdapter,
-    TransferStatus,
-)
 from lmcache.v1.distributed.storage_controller import StorageControllerInterface
 from lmcache.v1.distributed.storage_controllers.prefetch_policy import (
     PrefetchPolicy,
@@ -137,28 +129,7 @@ PrefetchRequestId = int
 
 class PrefetchPhase(enum.Enum):
     LOOKUP = enum.auto()
-    REMOTE_LOOKUP = enum.auto()  # rc.lookup() + rta.read() running in thread-pool
     PLAN_AND_LOAD = enum.auto()
-
-
-@dataclass
-class RemotePrefetchResult:
-    """Result produced by the thread-pool remote pipeline task."""
-
-    request_id: str
-    """Matches the RemoteController.lookup() call (str(PrefetchRequestId))."""
-
-    found_keys: list[ObjectKey]
-    """All keys pinned by rc.lookup(); passed to rc.unlock()."""
-
-    loaded_keys: list[ObjectKey]
-    """RDMA succeeded; already read-locked in L1."""
-
-    failed_keys: list[ObjectKey]
-    """RDMA failed or reserve_write failed; already cleaned from L1."""
-
-    prefix_hits: int
-    """Contiguous prefix count among loaded_keys within the missed_keys list."""
 
 
 @dataclass
@@ -188,13 +159,6 @@ class InFlightPrefetchRequest:
     # Load phase: keys that were write-reserved in L1
     write_reserved_keys: list[ObjectKey] = field(default_factory=list)
     write_reserved_objs: dict[ObjectKey, MemoryObj] = field(default_factory=dict)
-
-    # Remote lookup phase (set when _submit_remote_lookup is called)
-    has_remote_lookup: bool = False
-    l2_prefix_hits: int = 0
-    """L2 prefix hit count stored before transitioning to REMOTE_LOOKUP phase."""
-    remote_result: RemotePrefetchResult | None = None
-    """Set by the background loop when the thread-pool task completes."""
 
     def all_lookups_done(self) -> bool:
         return len(self.pending_lookup_tasks) == 0
@@ -230,18 +194,12 @@ class PrefetchController(StorageControllerInterface):
         adapter_descriptors: list[AdapterDescriptor],
         policy: PrefetchPolicy,
         max_in_flight: int = 8,
-        remote_controller: RemoteController | None = None,
-        remote_transfer: RemoteTransferAdapter | None = None,
-        local_handle: LocalMemHandle | None = None,
     ) -> None:
         self._l1_manager = l1_manager
         self._l2_adapters = l2_adapters
         self._adapter_descriptors = adapter_descriptors
         self._policy = policy
         self._max_in_flight = max_in_flight
-        self._remote_controller = remote_controller
-        self._remote_transfer = remote_transfer
-        self._local_handle = local_handle
 
         # In-flight request tracking (background thread only)
         self._in_flight_requests: dict[PrefetchRequestId, InFlightPrefetchRequest] = {}
@@ -280,19 +238,6 @@ class PrefetchController(StorageControllerInterface):
         for i, adapter in enumerate(self._l2_adapters):
             self._lookup_efd_to_adapter[adapter.get_lookup_and_lock_event_fd()] = i
             self._load_efd_to_adapter[adapter.get_load_event_fd()] = i
-
-        # Remote lookup eventfd and thread pool (only when remote_controller configured)
-        self._remote_efd: int | None = None
-        self._remote_executor: ThreadPoolExecutor | None = None
-        self._completed_remote_lock = threading.Lock()
-        self._completed_remote: dict[PrefetchRequestId, RemotePrefetchResult] = {}
-
-        if self._remote_controller is not None:
-            self._remote_efd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-            self._remote_executor = ThreadPoolExecutor(
-                max_workers=max_in_flight,
-                thread_name_prefix="rc-pipeline",
-            )
 
         self._event_bus = get_event_bus()
 
@@ -436,10 +381,6 @@ class PrefetchController(StorageControllerInterface):
         self._thread.join()
         self._cleanup_in_flight_requests()
         os.close(self._submission_efd)
-        if self._remote_executor is not None:
-            self._remote_executor.shutdown(wait=False)
-        if self._remote_efd is not None:
-            os.close(self._remote_efd)
 
     # =========================================================================
     # Background loop
@@ -460,8 +401,6 @@ class PrefetchController(StorageControllerInterface):
             poller.register(efd, select.POLLIN)
         for efd in self._load_efd_to_adapter:
             poller.register(efd, select.POLLIN)
-        if self._remote_efd is not None:
-            poller.register(self._remote_efd, select.POLLIN)
 
         while not self._stop_flag.is_set():
             ready = poller.poll(PREFETCH_LOOP_POLL_TIMEOUT_MS)
@@ -484,8 +423,6 @@ class PrefetchController(StorageControllerInterface):
                         )
                     elif fd in self._load_efd_to_adapter:
                         self._process_load_completions(self._load_efd_to_adapter[fd])
-                    elif fd == self._remote_efd:
-                        self._process_remote_completions()
                 except Exception:
                     logger.exception(
                         "Unexpected error in prefetch loop while processing fd %d",
@@ -530,20 +467,7 @@ class PrefetchController(StorageControllerInterface):
     ) -> None:
         """Submit lookup_and_lock to all adapters for a new request."""
         if not self._l2_adapters:
-            # No L2 adapters — go straight to remote lookup if configured
-            if self._remote_controller is not None:
-                request = InFlightPrefetchRequest(
-                    request_id=request_id,
-                    keys=keys,
-                    layout_desc=layout_desc,
-                    phase=PrefetchPhase.REMOTE_LOOKUP,
-                    extra_count=extra_count,
-                )
-                self._in_flight_requests[request_id] = request
-                self._status_in_flight_count += 1
-                self._submit_remote_lookup(request, keys)
-            else:
-                self._complete_request(request_id, 0)
+            self._complete_request(request_id, 0)
             return
 
         pending_lookup_tasks: dict[int, L2TaskId] = {}
@@ -836,231 +760,7 @@ class PrefetchController(StorageControllerInterface):
         if non_prefix_loaded:
             l1_mgr.finish_read(non_prefix_loaded, extra_count=request.extra_count)
 
-        # Determine which keys L2 did not load so remote can be tried
-        l2_loaded_set = set(loaded_keys)
-        missed_keys = [k for k in request.keys if k not in l2_loaded_set]
-
-        if missed_keys and self._remote_controller is not None:
-            # Transition to REMOTE_LOOKUP: store L2 hits and submit remote task
-            request.l2_prefix_hits = prefix_hits
-            request.phase = PrefetchPhase.REMOTE_LOOKUP
-            self._update_lookup_results(request.request_id, prefix_hits)
-            self._submit_remote_lookup(request, missed_keys)
-        else:
-            self._complete_request(request.request_id, prefix_hits)
-
-    # =========================================================================
-    # Remote lookup phase
-    # =========================================================================
-
-    def _submit_remote_lookup(
-        self,
-        request: InFlightPrefetchRequest,
-        missed_keys: list[ObjectKey],
-    ) -> None:
-        """Submit the remote pipeline task for keys not found in L2.
-
-        The thread-pool task performs rc.lookup() + rta.read() + L1 finalize,
-        then signals _remote_efd. The background loop picks up the result via
-        _process_remote_completions().
-
-        Args:
-            request:     In-flight request being processed.
-            missed_keys: Keys not found (or not loaded) from L2 adapters.
-        """
-        request.has_remote_lookup = True
-        assert self._remote_executor is not None  # guarded by caller
-        self._remote_executor.submit(
-            self._run_remote_pipeline,
-            request.request_id,
-            missed_keys,
-            request.layout_desc,
-            request.extra_count,
-        )
-
-    def _run_remote_pipeline(
-        self,
-        request_id: PrefetchRequestId,
-        missed_keys: list[ObjectKey],
-        layout_desc: MemoryLayoutDesc,
-        extra_count: int,
-    ) -> None:
-        """Thread-pool task: full remote pipeline for missed_keys.
-
-        Calls rc.lookup(), reserves L1 write slots, issues RDMA READs, polls
-        to completion, finalizes L1 state, then signals _remote_efd.
-
-        Args:
-            request_id:  PrefetchRequestId of the owning request.
-            missed_keys: Keys to look up on remote peers.
-            layout_desc: Memory layout for L1 write reservation.
-            extra_count: Extra read locks per loaded key.
-        """
-        remote_request_id = str(request_id)
-        rc = self._remote_controller
-        rta = self._remote_transfer
-        local_handle = self._local_handle
-        l1_mgr = self._l1_manager
-
-        # All three are guaranteed non-None: _submit_remote_lookup is only
-        # called when _remote_controller is configured, which implies
-        # _remote_transfer and _local_handle were set at the same time.
-        if rc is None or rta is None or local_handle is None:
-            self._store_remote_result(
-                RemotePrefetchResult(
-                    request_id=remote_request_id,
-                    found_keys=[],
-                    loaded_keys=[],
-                    failed_keys=[],
-                    prefix_hits=0,
-                )
-            )
-            return
-
-        try:
-            lookup_result = rc.lookup(remote_request_id, missed_keys)
-        except Exception:
-            logger.exception("Remote lookup failed for request %d", request_id)
-            self._store_remote_result(
-                RemotePrefetchResult(
-                    request_id=remote_request_id,
-                    found_keys=[],
-                    loaded_keys=[],
-                    failed_keys=[],
-                    prefix_hits=0,
-                )
-            )
-            return
-
-        if not lookup_result.found_keys:
-            rc.unlock(remote_request_id, [])
-            self._store_remote_result(
-                RemotePrefetchResult(
-                    request_id=remote_request_id,
-                    found_keys=[],
-                    loaded_keys=[],
-                    failed_keys=[],
-                    prefix_hits=0,
-                )
-            )
-            return
-
-        # Reserve L1 write slots for found keys
-        write_results = l1_mgr.reserve_write(
-            keys=lookup_result.found_keys,
-            is_temporary=[False] * len(lookup_result.found_keys),
-            layout_desc=layout_desc,
-            mode="new",
-        )
-        reserved: dict[ObjectKey, MemoryObj] = {
-            k: obj
-            for k, (err, obj) in write_results.items()
-            if err == L1Error.SUCCESS and obj is not None
-        }
-
-        # Submit RDMA READs for reserved keys
-        # First Party
-        from lmcache.v1.distributed.remote_transfer.adapter import TransferHandle
-
-        transfer_handles: dict[ObjectKey, TransferHandle] = {}
-        for key, obj in reserved.items():
-            info = lookup_result.key_info[key]
-            align = self._l1_manager.get_l1_memory_desc().align_bytes
-            start = obj.meta.address // align
-            count = obj.meta.phy_size // align
-            local_pages = list(range(start, start + count))
-            try:
-                h = rta.read(
-                    local_handle,
-                    local_pages,
-                    info.remote_handle,
-                    info.remote_pages,
-                )
-                transfer_handles[key] = h
-            except Exception:
-                logger.exception("rta.read() failed for key %s", key)
-
-        # Poll all transfers to completion
-        loaded_keys: list[ObjectKey] = []
-        failed_keys: list[ObjectKey] = list(set(reserved) - set(transfer_handles))
-
-        _POLL_SLEEP_S = 0.001
-        for key, h in transfer_handles.items():
-            while True:
-                status = rta.poll(h)
-                if status == TransferStatus.DONE:
-                    loaded_keys.append(key)
-                    rta.release(h)
-                    break
-                if status == TransferStatus.ERROR:
-                    failed_keys.append(key)
-                    rta.release(h)
-                    break
-                time.sleep(_POLL_SLEEP_S)
-
-        # Keys found remotely but reserve_write failed
-        unreserved = [k for k in lookup_result.found_keys if k not in reserved]
-
-        # Finalize L1 state
-        if loaded_keys:
-            l1_mgr.finish_write_and_reserve_read(loaded_keys, extra_count=extra_count)
-        all_failed = failed_keys + unreserved
-        if all_failed:
-            l1_mgr.finish_write(all_failed)
-            l1_mgr.delete(all_failed)
-
-        # Release remote read locks
-        rc.unlock(remote_request_id, lookup_result.found_keys)
-
-        # Compute prefix hits within missed_keys order
-        loaded_set = set(loaded_keys)
-        prefix_hits = 0
-        for key in missed_keys:
-            if key in loaded_set:
-                prefix_hits += 1
-            else:
-                break
-
-        self._store_remote_result(
-            RemotePrefetchResult(
-                request_id=remote_request_id,
-                found_keys=lookup_result.found_keys,
-                loaded_keys=loaded_keys,
-                failed_keys=all_failed,
-                prefix_hits=prefix_hits,
-            )
-        )
-
-    def _store_remote_result(self, result: RemotePrefetchResult) -> None:
-        """Store a completed remote pipeline result and signal _remote_efd.
-
-        Called from the thread-pool task. Thread-safe.
-
-        Args:
-            result: Completed RemotePrefetchResult.
-        """
-        request_id = int(result.request_id)
-        with self._completed_remote_lock:
-            self._completed_remote[request_id] = result
-        if self._remote_efd is not None:
-            os.eventfd_write(self._remote_efd, 1)
-
-    def _process_remote_completions(self) -> None:
-        """Drain _completed_remote and finalise REMOTE_LOOKUP requests.
-
-        Called from the background loop when _remote_efd fires.
-        """
-        with self._completed_remote_lock:
-            completed = dict(self._completed_remote)
-            self._completed_remote.clear()
-
-        for req_id, result in completed.items():
-            request = self._in_flight_requests.get(req_id)
-            if request is None:
-                continue
-            request.remote_result = result
-            total_hits = request.l2_prefix_hits + result.prefix_hits
-            self._complete_request(req_id, total_hits)
+        self._complete_request(request.request_id, prefix_hits)
 
     # =========================================================================
     # Unlock helpers
@@ -1105,7 +805,6 @@ class PrefetchController(StorageControllerInterface):
                 self._status_lookup_phase_count -= 1
             elif removed.phase == PrefetchPhase.PLAN_AND_LOAD:
                 self._status_load_phase_count -= 1
-            # REMOTE_LOOKUP phase does not have its own status counter
         logger.debug(
             "Prefetch request %d completed: %d prefix hits",
             request_id,
@@ -1123,8 +822,6 @@ class PrefetchController(StorageControllerInterface):
                 self._unlock_all_plan_keys(request)
             elif request.phase == PrefetchPhase.LOOKUP:
                 self._unlock_all_lookups(request)
-            # REMOTE_LOOKUP: the thread-pool task owns the L1/RC cleanup;
-            # nothing to release here since we don't have the keys list.
             logger.warning(
                 "Cleaning up in-flight prefetch request %d (%d keys).",
                 request.request_id,

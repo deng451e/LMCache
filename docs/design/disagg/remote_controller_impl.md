@@ -279,7 +279,11 @@ using the same protocol as P2P.
 
 ## 6. StorageManager Integration
 
-`RemoteController` is wired in via `StorageManagerConfig`:
+`RemoteL2Adapter` is wired in via `StorageManagerConfig` and added to the
+**prefetch-only** adapter list. It must not be in the `StoreController`'s list —
+remote peers are read sources, not write destinations.
+
+`StorageManager` therefore maintains two separate adapter lists:
 
 ```python
 @dataclass
@@ -288,7 +292,7 @@ class StorageManagerConfig:
     remote_controller_config: RemoteControllerConfig | None = None
 ```
 
-`StorageManager.__init__` builds and starts the controller:
+`StorageManager.__init__` builds and starts the adapter:
 
 ```python
 if cfg.remote_controller_config:
@@ -298,101 +302,102 @@ if cfg.remote_controller_config:
     )
     rc = build_remote_controller(cfg.remote_controller_config, l1_manager, transfer)
     rc.start()
-    self._remote_controller = rc
-    self._local_handle      = local_handle
+    remote_l2 = RemoteL2Adapter(
+        rc, transfer, local_handle,
+        l1_manager.get_l1_memory_desc().align_bytes,
+    )
+    remote_l2.start()
+    self._prefetch_adapters.append(remote_l2)
+    # self._store_adapters does NOT include remote_l2
 ```
 
-`PrefetchController` receives `remote_controller: RemoteController | None`,
-`remote_transfer_adapter: RemoteTransferAdapter | None`, and
-`local_handle: LocalMemHandle | None` as optional constructor dependencies.
-`StoreController` is unchanged.
+`PrefetchController` is constructed with `prefetch_adapters`; `StoreController`
+with `store_adapters`. `PrefetchController` itself is unchanged — it sees
+`RemoteL2Adapter` as an ordinary `L2AdapterInterface` entry.
 
-### 6.1 PrefetchController Integration (P2P and PD-decode modes)
+### 6.1 RemoteL2Adapter Internals
 
-**Design principle**: `rc.lookup()` is never called on the `PrefetchController`
-background thread. The full remote pipeline runs in a thread-pool task and signals
-an eventfd on completion, preserving the non-blocking event-driven invariant of the
-existing loop.
+`RemoteL2Adapter` implements `L2AdapterInterface` and orchestrates
+`RemoteController` + `RemoteTransferAdapter` behind two eventfds, keeping
+`PrefetchController` completely unaware of the remote path.
 
-#### New phase
+#### State
 
 ```python
-class PrefetchPhase(enum.Enum):
-    LOOKUP        = enum.auto()   # L2 adapter lookup_and_lock (unchanged)
-    REMOTE_LOOKUP = enum.auto()   # rc.lookup() + rta.read() in thread-pool task
-    PLAN_AND_LOAD = enum.auto()   # L2 load (unchanged)
+class RemoteL2Adapter(L2AdapterInterface):
+    _rc:           RemoteController
+    _rta:          RemoteTransferAdapter
+    _local_handle: LocalMemHandle
+    _l1_align:     int
+
+    _next_task_id: int
+    _lookup_lock:  threading.Lock
+    # Populated by lookup thread; consumed by query_lookup_and_lock_result (one-shot)
+    _completed_lookups: dict[L2TaskId, Bitmap]
+    # Per-task remote handle cache: consumed by submit_load_task
+    _handle_cache: dict[L2TaskId, dict[ObjectKey, RemoteKeyInfo]]
+    # Key → request_id: used by submit_unlock to route to rc.unlock()
+    _key_to_reqid: dict[ObjectKey, str]
+
+    _load_lock:    threading.Lock
+    # task_id → [(key, TransferHandle)] for in-flight RDMA reads
+    _pending_loads:   dict[L2TaskId, list[tuple[ObjectKey, TransferHandle]]]
+    # Populated by RDMA poll thread; consumed by query_load_result (one-shot)
+    _completed_loads: dict[L2TaskId, Bitmap]
+
+    # Eventfds (distinct per L2AdapterInterface contract)
+    _lookup_event_fd: int   # signaled when a lookup task result is ready
+    _load_event_fd:   int   # signaled when all RDMA reads for a load task finish
+
+    _lookup_executor:  ThreadPoolExecutor   # rc.lookup() calls (blocking network I/O)
+    _rdma_poll_thread: threading.Thread     # polls rta.poll() for in-flight transfers
 ```
 
-#### New result type
+#### Lookup path
 
-```python
-@dataclass
-class RemotePrefetchResult:
-    """Produced by the thread-pool task; consumed by the background loop."""
-    request_id:  str              # matches the RemoteController.lookup() call
-    found_keys:  list[ObjectKey]  # all keys pinned by rc.lookup(); passed to rc.unlock()
-    loaded_keys: list[ObjectKey]  # RDMA succeeded; already read-locked in L1
-    failed_keys: list[ObjectKey]  # RDMA failed; already cleaned from L1
-    prefix_hits: int              # contiguous prefix count among loaded_keys
-```
+`submit_lookup_and_lock_task(keys)` submits a thread-pool task that calls
+`rc.lookup(request_id, keys)` (blocking ZMQ round-trip). On completion:
 
-#### New InFlightPrefetchRequest field
+1. Cache `result.key_info` in `_handle_cache[task_id]`.
+2. Record `{key: request_id}` for each found key in `_key_to_reqid`.
+3. Build `Bitmap` from `result.found_keys`.
+4. Under `_lookup_lock`: store bitmap in `_completed_lookups[task_id]`.
+5. Signal `_lookup_event_fd`.
 
-```python
-remote_future: Future[RemotePrefetchResult] | None = None
-```
+`query_lookup_and_lock_result(task_id)` pops and returns the cached bitmap
+(one-shot), or `None` if not yet ready.
 
-#### Thread-pool task (remote pipeline)
+#### Load path
 
-Submitted by `_submit_remote_lookup()`. Runs entirely outside the background thread.
-`request_id` is `str(InFlightPrefetchRequest.request_id)` — stable across retries.
+`submit_load_task(keys, local_objs)` retrieves `_handle_cache[task_id]` for
+per-key `RemoteKeyInfo`, then calls `rta.read()` for each key. The resulting
+`TransferHandle`s are stored in `_pending_loads[task_id]`.
 
-```
-rc.lookup(request_id, missed_keys)
-  → for each found_key: l1.reserve_write([found_key], ...)
-  → rta.read(local_handle, local_pages, info.remote_handle, info.remote_pages)
-  → busy-poll rta.poll(handle) until DONE or ERROR; rta.release(handle)
-  → l1.finish_write_and_reserve_read(loaded_keys, extra_count)
-  → l1.finish_write(failed_keys); l1.delete(failed_keys)
-  → rc.unlock(request_id, found_keys)
-  → compute prefix_hits over loaded_keys
-  → store RemotePrefetchResult in _completed_remote[request_id]; signal _remote_efd
-```
+The RDMA poll thread wakes on a short timer (or on NIXL's completion fd if
+exposed) and calls `rta.poll(handle)` for all pending handles:
 
-#### Eventfd and thread pool
+- `DONE` → mark key successful; call `rta.release(handle)`.
+- `ERROR` → mark key failed; call `rta.release(handle)`.
 
-```python
-self._remote_efd      = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-self._remote_executor = ThreadPoolExecutor(max_workers=max_in_flight)
+When all handles for a `task_id` are resolved:
 
-# Background-thread-only dict: request_id -> RemotePrefetchResult
-self._completed_remote: dict[PrefetchRequestId, RemotePrefetchResult] = {}
-```
+1. Build result `Bitmap`.
+2. Under `_load_lock`: store in `_completed_loads[task_id]`.
+3. Signal `_load_event_fd`.
 
-`_remote_efd` is registered in the `select.poll()` set alongside the existing
-L2 adapter eventfds. `_process_remote_completions()` drains `_completed_remote`
-and finalises any request in `REMOTE_LOOKUP` phase whose result has arrived.
+`query_load_result(task_id)` pops and returns the cached bitmap (one-shot).
 
-#### Integration flow
+#### Unlock path
 
-After L2 lookup completes (`_transition_to_load_phase`):
+`submit_unlock(keys)` groups keys by their `request_id` from `_key_to_reqid`,
+calls `rc.unlock(request_id, per_request_keys)` for each group (fire-and-forget;
+`RemoteController` retries internally), then cleans up `_key_to_reqid` entries.
 
-1. Compute L2 load plan for keys found in L2 (unchanged).
-2. Keys **not** in the L2 load plan: if `_remote_controller` is configured, call
-   `_submit_remote_lookup(request, missed_keys)`.
-3. Transition request to `REMOTE_LOOKUP` phase. The L2 `PLAN_AND_LOAD` phase and
-   the remote pipeline task run **concurrently** — they operate on disjoint key sets
-   so there is no conflict.
-4. When `_remote_efd` fires, `_process_remote_completions()` merges the remote
-   `prefix_hits` with any L2 prefix count already recorded and calls
-   `_complete_request()`.
+#### NIXL completion fd (optional optimisation)
 
-#### No L2 adapters (PD-decode or remote-only P2P)
-
-When `self._l2_adapters` is empty and `_remote_controller` is configured,
-`_start_lookup_phase` skips the L2 fan-out entirely and calls
-`_submit_remote_lookup(request, all_keys)` immediately, transitioning straight
-to `REMOTE_LOOKUP` phase.
+If `NixlTransferBackend` exposes a hardware completion fd, the RDMA poll thread
+can `select.poll()` on it instead of spinning — eliminating busy-wait CPU use.
+The lookup thread is unaffected (it blocks on ZMQ I/O).
 
 ---
 
@@ -401,36 +406,36 @@ to `REMOTE_LOOKUP` phase.
 ```
 lmcache/v1/distributed/
 │
-├── storage_manager.py                      # + remote_controller_config field  [modified]
+├── storage_manager.py                      # + remote_controller_config field   [modified]
+│                                           # + separate store/prefetch adapter lists
 ├── l1_manager.py                           # (unchanged)
 ├── memory_manager.py                       # (unchanged)
 │
 ├── storage_controllers/
-│   ├── prefetch_controller.py              # + REMOTE_LOOKUP phase, eventfd,    [modified]
-│   │                                       #   thread-pool task, RemotePrefetchResult
+│   ├── prefetch_controller.py              # (unchanged)
 │   └── store_controller.py                 # (unchanged)
 │
 ├── l2_adapters/
-│   └── nixl_store_l2_adapter.py           # template for NixlTransferBackend   (unchanged)
+│   ├── remote_l2_adapter.py               # RemoteL2Adapter                    [NEW]
+│   └── nixl_store_l2_adapter.py           # (unchanged)
 │
 ├── remote_controller/                      # Control-plane coordinator          [NEW]
-│   ├── __init__.py                         #                                    [NEW]
-│   ├── config.py                           # PeerConfig, RemoteControllerConfig [NEW]
-│   ├── protocol.py                         # ZMQ message structs (msgspec)      [NEW]
+│   ├── __init__.py
+│   ├── config.py                           # PeerConfig, RemoteControllerConfig
+│   ├── protocol.py                         # ZMQ message structs (msgspec)
 │   │                                       # Init/MemReg/Lookup/Unpin Req+Resp
-│   ├── types.py                            # RemoteKeyInfo, LookupResult        [NEW]
-│   ├── controller.py                       # RemoteController ABC               [NEW]
-│   │                                       # + ZMQRemoteController
-│   └── factory.py                          # build_remote_controller(...)       [NEW]
+│   ├── types.py                            # RemoteKeyInfo, LookupResult
+│   ├── controller.py                       # RemoteController ABC + ZMQRemoteController
+│   └── factory.py                          # build_remote_controller(...)
 │
 └── remote_transfer/                        # Data-plane transport               [NEW]
-    ├── __init__.py                         #                                    [NEW]
-    ├── adapter.py                          # RemoteTransferAdapter ABC          [NEW]
+    ├── __init__.py
+    ├── adapter.py                          # RemoteTransferAdapter ABC
     │                                       # + LocalMemHandle, RemoteMemHandle,
     │                                       #   TransferHandle, TransferStatus
     └── backends/
-        ├── __init__.py                     #                                    [NEW]
-        └── nixl_backend.py                 # NixlTransferBackend (UCX/RDMA)     [NEW]
+        ├── __init__.py
+        └── nixl_backend.py                 # NixlTransferBackend (UCX/RDMA)
 ```
 
 ---
@@ -441,8 +446,8 @@ lmcache/v1/distributed/
 |---|---|
 | `NixlChannel` — ZMQ REQ/REP + handshake | Template for `ZMQControlChannel` and `InitRequest/MemRegRequest` sequence |
 | `NixlAgentWrapper` — agent init + xfer_descs | Moved into `NixlTransferBackend.register_local_memory` and `get_local_xfer_descs` |
-| `NixlStoreL2Adapter` — eventfd + async poll loop | Template for `_remote_efd` pattern and `_process_remote_completions()` in `PrefetchController` |
+| `NixlStoreL2Adapter` — eventfd + async poll loop | Template for `RemoteL2Adapter` lookup/load eventfds and RDMA poll thread |
 | `L1Manager.reserve_read / finish_read` | Called by `ZMQRemoteController` server-side handlers for `LookupRequest` and `UnpinRequest` |
-| `L1Manager.reserve_write / finish_write` | Called by thread-pool task inside `_submit_remote_lookup()` |
-| `PrefetchController` | Add `REMOTE_LOOKUP` phase, `_remote_efd`, `_remote_executor`; thread-pool task drives full remote pipeline |
+| `L1Manager.reserve_write / finish_write` | Called by `PrefetchController` (unchanged) after lookup returns found keys |
+| `PrefetchController` | Unchanged — treats `RemoteL2Adapter` as a standard L2 adapter |
 | `pd_backend.py` — proxy key-ready notification | Unchanged; sends key list to decode side after KV store completes |

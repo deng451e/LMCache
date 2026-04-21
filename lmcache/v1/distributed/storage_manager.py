@@ -20,15 +20,6 @@ from lmcache.v1.distributed.error import L1Error, strerror
 from lmcache.v1.distributed.l1_manager import L1Manager
 from lmcache.v1.distributed.l2_adapters import create_l2_adapter
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface
-from lmcache.v1.distributed.remote_controller.controller import RemoteController
-from lmcache.v1.distributed.remote_controller.factory import build_remote_controller
-from lmcache.v1.distributed.remote_transfer.adapter import (
-    LocalMemHandle,
-    RemoteTransferAdapter,
-)
-from lmcache.v1.distributed.remote_transfer.backends.nixl_backend import (
-    NixlTransferBackend,
-)
 from lmcache.v1.distributed.storage_controllers import (
     L1EvictionController,
     L2AdapterEvictionState,
@@ -115,29 +106,6 @@ class StorageManager:
         )
         self._store_controller.start()
 
-        # Optional RemoteController for P2P / PD-decode
-        self._remote_controller: RemoteController | None = None
-        self._remote_transfer: RemoteTransferAdapter | None = None
-        self._local_handle: LocalMemHandle | None = None
-
-        if config.remote_controller_config is not None:
-            transfer = NixlTransferBackend(align_bytes=l1_memory_desc.align_bytes)
-            local_handle = transfer.register_local_memory(
-                ptr=l1_memory_desc.ptr,
-                size=l1_memory_desc.size,
-                device="cpu",
-            )
-            rc = build_remote_controller(
-                config=config.remote_controller_config,
-                l1_manager=self._l1_manager,
-                l1_mem_desc=l1_memory_desc,
-                transfer=transfer,
-            )
-            rc.start()
-            self._remote_controller = rc
-            self._remote_transfer = transfer
-            self._local_handle = local_handle
-
         # Prefetch controller
         self._prefetch_controller = PrefetchController(
             l1_manager=self._l1_manager,
@@ -145,9 +113,6 @@ class StorageManager:
             adapter_descriptors=adapter_descriptors,
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
-            remote_controller=self._remote_controller,
-            remote_transfer=self._remote_transfer,
-            local_handle=self._local_handle,
         )
         self._prefetch_controller.start()
 
@@ -512,11 +477,6 @@ class StorageManager:
         self._store_controller.stop()
         self._eviction_controller.stop()
         self._l2_eviction_controller.stop()
-
-        if self._remote_controller is not None:
-            self._remote_controller.stop()
-        if self._remote_transfer is not None:
-            self._remote_transfer.close()
 
         for adapter in self._l2_adapters:
             adapter.close()

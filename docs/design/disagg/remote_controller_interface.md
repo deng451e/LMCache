@@ -7,8 +7,10 @@
 Control-plane coordinator: peer registry, ZMQ channels, metadata exchange,
 lookup policy, dedup cache, and L1Manager pin management (server side).
 
-At runtime, `lookup()` returns remote handles and page indices; the caller
-passes these directly to `RemoteTransferAdapter.read()`. `RemoteController`
+`RemoteController` is an **internal dependency of `RemoteL2Adapter`** — it is
+not called directly by `PrefetchController`, the Engine, or `StorageManager`.
+At runtime, `lookup()` returns remote handles that `RemoteL2Adapter` caches
+internally and passes to `RemoteTransferAdapter.read()`. `RemoteController`
 does not call `RemoteTransferAdapter` at runtime — only during `register_peer()`
 to exchange NIXL descriptors via `connect_peer()`.
 
@@ -170,30 +172,32 @@ class RemoteController(ABC):
 
 ---
 
-## 4. Caller Usage Pattern
+## 4. Internal Usage (RemoteL2Adapter)
+
+`RemoteController` is an internal dependency of `RemoteL2Adapter`; external
+components do not call it directly.
 
 ```python
-# 1. lookup — RemoteController resolves keys and pins remote L1
+# Inside RemoteL2Adapter — thread-pool task backing submit_lookup_and_lock_task()
 result = remote_controller.lookup(request_id, keys)
+# result.key_info cached internally; only a Bitmap is exposed to PrefetchController
 
-# 2. reserve local write slots
-write_result = l1_manager.reserve_write(result.found_keys, ...)
-
-# 3. RDMA READ — caller drives RemoteTransferAdapter directly
-handles = []
-for key in load_keys:
-    info = result.key_info[key]
-    h = remote_transfer_adapter.read(
+# Inside RemoteL2Adapter — submit_load_task() uses cached key_info to drive RTA
+for key, obj in zip(keys, local_objs):
+    info = _handle_cache[task_id][key]
+    handle = remote_transfer_adapter.read(
         local_handle, local_pages[key],
         info.remote_handle, info.remote_pages,
     )
-    handles.append(h)
+    # ... poll loop in background thread ...
 
-# poll to completion ...
-
-# 4. unlock — releases remote read locks regardless of transfer outcome
-remote_controller.unlock(request_id, result.found_keys)
+# Inside RemoteL2Adapter — submit_unlock() routes by originating request_id
+remote_controller.unlock(request_id, per_request_keys)
 ```
+
+`RemoteController.register_peer()` is called once per peer during
+`RemoteL2Adapter.__init__` (or at runtime for dynamic peers) to exchange NIXL
+descriptors and establish the ZMQ channel.
 
 ---
 

@@ -4,16 +4,10 @@
 Configuration for distributed storage manager
 """
 
-# Future
-from __future__ import annotations
-
 # Standard
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal
+from typing import Literal
 import argparse
-
-if TYPE_CHECKING:
-    from lmcache.v1.distributed.remote_controller.config import RemoteControllerConfig
 
 # First Party
 from lmcache.v1.distributed.l2_adapters.config import (
@@ -102,9 +96,6 @@ class StorageManagerConfig:
 
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
-
-    remote_controller_config: "RemoteControllerConfig | None" = None
-    """ Optional configuration for RemoteController (P2P / PD-decode). """
 
 
 def add_storage_manager_args(
@@ -248,52 +239,6 @@ def add_storage_manager_args(
 
     # Adapter config
     add_l2_adapters_args(parser)
-
-    # Remote Controller (optional — disabled when --remote-mode is omitted)
-    remote_group = parser.add_argument_group(
-        "Remote Controller",
-        "P2P / PD-decode remote controller via ZMQ + NIXL (optional). "
-        "Requires --remote-mode to enable.",
-    )
-    remote_group.add_argument(
-        "--remote-mode",
-        type=str,
-        choices=["p2p", "pd_prefill", "pd_decode"],
-        default=None,
-        help="Enable RemoteController in the given deployment mode. "
-        "Omit to disable (default).",
-    )
-    remote_group.add_argument(
-        "--remote-serve-port",
-        type=int,
-        default=5200,
-        help="ZMQ port the local RemoteController server listens on. Default 5200.",
-    )
-    remote_group.add_argument(
-        "--remote-peer",
-        type=str,
-        action="append",
-        default=[],
-        dest="remote_peers",
-        metavar="PEER_ID:HOST:PORT",
-        help="Add a peer in the format 'peer_id:host:port'. "
-        "Repeatable; e.g. --remote-peer peer1:10.0.0.2:5201.",
-    )
-    remote_group.add_argument(
-        "--remote-lookup-policy",
-        type=str,
-        choices=["first_found", "round_robin"],
-        default="first_found",
-        help="Key resolution policy when multiple peers have the same key. "
-        "Default 'first_found'.",
-    )
-    remote_group.add_argument(
-        "--remote-zmq-timeout-ms",
-        type=int,
-        default=5000,
-        help="Per-request ZMQ timeout in milliseconds. Default 5000.",
-    )
-
     return parser
 
 
@@ -348,33 +293,6 @@ def parse_args_to_config(
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)
 
-    remote_controller_config = None
-    if getattr(args, "remote_mode", None) is not None:
-        # Import here to avoid circular dependency at module level.
-        # First Party
-        from lmcache.v1.distributed.remote_controller.config import (  # noqa: PLC0415
-            PeerConfig,
-            RemoteControllerConfig,
-        )
-
-        peers = []
-        for spec in getattr(args, "remote_peers", []):
-            parts = spec.split(":", 2)
-            if len(parts) != 3:
-                raise ValueError(
-                    f"Invalid --remote-peer value {spec!r}; "
-                    "expected format 'peer_id:host:port'."
-                )
-            peer_id, host, port_str = parts
-            peers.append(PeerConfig(peer_id=peer_id, host=host, port=int(port_str)))
-        remote_controller_config = RemoteControllerConfig(
-            mode=args.remote_mode,
-            serve_port=getattr(args, "remote_serve_port", 5200),
-            peers=peers,
-            lookup_policy=getattr(args, "remote_lookup_policy", "first_found"),
-            zmq_timeout_ms=getattr(args, "remote_zmq_timeout_ms", 5000),
-        )
-
     return StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
@@ -382,7 +300,6 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
-        remote_controller_config=remote_controller_config,
     )
 
 
