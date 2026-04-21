@@ -208,7 +208,9 @@ class MockL2Adapter(L2AdapterInterface):
         with self._lock:
             return self._completed_lookup_tasks.pop(task_id, None)
 
-    def submit_unlock(self, keys: list[ObjectKey]) -> None:
+    def submit_unlock(
+        self, keys: list[ObjectKey], lookup_task_id: "L2TaskId | None" = None
+    ) -> None:
         def _unlock_keys(keys: list[ObjectKey]) -> None:
             """
             Coroutine to unlock keys in the event loop thread.
@@ -229,6 +231,7 @@ class MockL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        lookup_task_id: "L2TaskId | None" = None,
     ) -> L2TaskId:
         with self._lock:
             task_id = self._get_next_task_id()

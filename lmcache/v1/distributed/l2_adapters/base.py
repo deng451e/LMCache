@@ -204,12 +204,18 @@ class L2AdapterInterface(ABC):
     def submit_unlock(
         self,
         keys: list[ObjectKey],
+        lookup_task_id: "L2TaskId | None" = None,
     ) -> None:
         """
         Submit an unlock task to unlock a batch of objects by the given keys.
 
         Args:
             keys (list[ObjectKey]): the list of keys to be unlocked.
+            lookup_task_id (L2TaskId | None): task ID of the originating
+                submit_lookup_and_lock_task call. Required by adapters that
+                cache per-lookup routing state (e.g. RemoteL2Adapter), where
+                it is used to look up which peer owns each key. Pass None for
+                adapters that do not use it.
 
         Note:
             This function does not return any task id, meaning that the caller
@@ -229,6 +235,7 @@ class L2AdapterInterface(ABC):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        lookup_task_id: "L2TaskId | None" = None,
     ) -> L2TaskId:
         """
         Submit a load task to load a batch of objects by the given keys. The load
@@ -244,6 +251,11 @@ class L2AdapterInterface(ABC):
                 until the load task is completed.
                 The length of the objects list should be the same as the length of the
                 keys list.
+            lookup_task_id (L2TaskId | None): task ID of the originating
+                submit_lookup_and_lock_task call. Required by adapters that
+                cache per-lookup routing state (e.g. RemoteL2Adapter), where
+                it is used to look up which peer owns each key. Pass None for
+                adapters that do not use it.
 
         Returns:
             L2TaskId: the task id of the submitted load task.

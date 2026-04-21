@@ -108,20 +108,24 @@ class RemoteIOAdapter(ABC):
     @abstractmethod
     def connect_peer(
         self,
-        peer_id:        str,
-        endpoint:       str,
-        peer_metadata:  bytes,
+        peer_id:         str,
+        endpoint:        str,
+        unpin_endpoint:  str,
+        peer_metadata:   bytes,
         peer_xfer_descs: bytes,
     ) -> None:
         """Register a peer for lookup and RDMA.
 
         Called by RemoteController after the Init/MemReg handshake completes.
-        The adapter creates its own ZMQ REQ socket to `endpoint` for lookup
-        traffic and registers the peer's NIXL descriptors for RDMA.
+        Creates two ZMQ sockets to the peer: a REQ socket to `endpoint` for
+        lookup traffic (Lazy Pirate, one in-flight request), and a PUSH socket
+        to `unpin_endpoint` for fire-and-forget UnpinRequests. Also registers
+        the peer's NIXL descriptors for RDMA.
 
         Args:
             peer_id:         Logical peer identifier.
-            endpoint:        ZMQ endpoint string, e.g. "tcp://host:5200".
+            endpoint:        ZMQ REQ endpoint, e.g. "tcp://host:5200".
+            unpin_endpoint:  ZMQ PUSH endpoint, e.g. "tcp://host:5201".
             peer_metadata:   Serialised NIXL agent descriptor from InitResponse.
             peer_xfer_descs: Serialised NIXL transfer descriptors from MemRegResponse.
 
@@ -194,8 +198,9 @@ class RemoteIOAdapter(ABC):
     @abstractmethod
     def submit_fetch_task(
         self,
-        keys:       list[ObjectKey],
-        local_objs: list[MemoryObj],
+        keys:           list[ObjectKey],
+        local_objs:     list[MemoryObj],
+        lookup_task_id: IOTaskId | None = None,
     ) -> IOTaskId:
         """Issue RDMA READs for keys using handles cached by the prior lookup.
 
@@ -204,9 +209,17 @@ class RemoteIOAdapter(ABC):
         (write destination); the caller manages their lifecycle.
 
         Args:
-            keys:       Keys to fetch. Must be a subset of a prior lookup's
-                        found keys.
-            local_objs: L1 write buffers, one per key (same order).
+            keys:           Keys to fetch. Must be a subset of a prior lookup's
+                            found keys.
+            local_objs:     L1 write buffers, one per key (same order).
+            lookup_task_id: Task ID of the prior submit_lookup_task() call whose
+                            cached handles should be used. When provided, handles
+                            are looked up from _handle_cache[lookup_task_id],
+                            which is unambiguous even with concurrent overlapping
+                            requests under round_robin policy. When None, the
+                            implementation falls back to per-key routing
+                            (last-write-wins), which is safe only for
+                            first_found policy with non-overlapping requests.
 
         Returns:
             Task ID for use with query_fetch_result().
@@ -235,15 +248,31 @@ class RemoteIOAdapter(ABC):
     ###################################
 
     @abstractmethod
-    def submit_unlock(self, keys: list[ObjectKey]) -> None:
+    def submit_unlock(
+        self,
+        keys:           list[ObjectKey],
+        lookup_task_id: IOTaskId | None = None,
+    ) -> None:
         """Send ZMQ UnpinRequest to each owning peer for the given keys.
 
         Fire-and-forget. The implementation must guarantee eventual delivery
-        (internal retry). The adapter routes each key to the peer that served
-        it in the most recent lookup.
+        (internal retry).
+
+        When `lookup_task_id` is provided the adapter routes each key to the
+        peer recorded in `_handle_cache[lookup_task_id]` and removes those
+        entries from the cache (releasing the cache entry entirely once all
+        keys for that task have been unlocked or fetched). This is the only
+        correct path when `round_robin` lookup policy is active or when
+        multiple concurrent requests share overlapping keys.
+
+        When `lookup_task_id` is None the adapter falls back to a per-key
+        routing dict (last-write-wins). Safe only for `first_found` policy
+        with non-overlapping concurrent requests.
 
         Args:
-            keys: Keys whose remote read locks should be released.
+            keys:           Keys whose remote read locks should be released.
+            lookup_task_id: Task ID of the originating submit_lookup_task()
+                            call. Should always be provided by RemoteL2Adapter.
         """
 
     ###########
@@ -283,11 +312,28 @@ class RemoteIOAdapter(ABC):
 - `register_local_memory` → `NixlAgent.register_buffer`
 - `get_local_metadata` → `NixlAgent.get_agent_metadata`
 - `get_local_xfer_descs` → `NixlAgent.get_xfer_descs`
-- `connect_peer` → create ZMQ REQ socket to endpoint; `NixlAgent.add_remote_agent` + `add_remote_descs`
-- `disconnect_peer` → close ZMQ socket; `NixlAgent.remove_remote_agent`
-- `submit_lookup_task` → thread-pool fan-out of ZMQ `LookupRequest` per peer
-- `submit_fetch_task` → `NixlAgent.issue_request(NIXL_READ)` per key
-- `query_fetch_result` → background thread: `NixlAgent.check_request`; or `select.poll()` on NIXL completion fd if exposed
+- `connect_peer` → create ZMQ REQ socket to `endpoint` (lookup); create ZMQ PUSH
+  socket to `unpin_endpoint` (unlock); `NixlAgent.add_remote_agent` + `add_remote_descs`
+- `disconnect_peer` → drain `_peer_rdma_inflight`; close both ZMQ sockets;
+  `NixlAgent.remove_remote_agent`
+- `submit_lookup_task` → thread-pool fan-out of ZMQ `LookupRequest` per peer;
+  results cached in `_handle_cache[task_id]`
+- `submit_fetch_task(keys, objs, lookup_task_id)` → reads handles from
+  `_handle_cache[lookup_task_id]` (**does not remove them** — still needed by
+  the subsequent `submit_unlock` for routing); issues `NIXL_READ` per key
+- `submit_unlock(keys, lookup_task_id)` → the **only** removal point: reads each
+  key's peer from `_handle_cache[lookup_task_id]`, sends `UnpinRequest` via the
+  peer's PUSH socket, removes the entry; deletes `_handle_cache[lookup_task_id]`
+  once all keys for that task have been unlocked
+- `query_fetch_result` → background thread: `NixlAgent.check_request`; or
+  `select.poll()` on NIXL completion fd if exposed
+
+**Handle cache lifecycle**: `_handle_cache[task_id]` is created by
+`submit_lookup_task`, read (not removed) by `submit_fetch_task`, and fully
+released by `submit_unlock` (called twice — unneeded keys before fetch, plan
+keys after fetch — together covering all found keys). There is no other cleanup path — callers must
+always call `submit_unlock` for every key returned by a lookup, even when no
+fetch is issued.
 
 **ZMQ channel resilience (Lazy Pirate)**: each per-peer REQ socket recreates
 itself on timeout before retrying, preventing stuck socket state. After all

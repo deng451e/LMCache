@@ -16,7 +16,10 @@ class PeerConfig:
     """Hostname or IP address of the peer."""
 
     port: int
-    """ZMQ server port on the peer."""
+    """ZMQ REP socket port (lookup / Init / MemReg traffic)."""
+
+    unpin_port: int
+    """ZMQ PULL socket port (UnpinRequest fire-and-forget traffic)."""
 
 
 @dataclass
@@ -30,19 +33,21 @@ class RemoteControllerConfig:
     """Address the local ZMQ server binds to."""
 
     serve_port: int = 5200
-    """Port the local ZMQ server listens on."""
+    """Port the local ZMQ REP server listens on (lookup / Init / MemReg)."""
+
+    serve_unpin_port: int = 5201
+    """Port the local ZMQ PULL server listens on (UnpinRequest). Must differ
+    from serve_port."""
 
     peers: list[PeerConfig] = field(default_factory=list)
     """Pre-configured peers. register_peer() can add more at runtime."""
 
-    lookup_policy: str = "first_found"
-    """Key resolution across peers: 'first_found' | 'round_robin'."""
-
     zmq_timeout_ms: int = 5000
-    """Per-request ZMQ timeout in milliseconds."""
+    """Per-request ZMQ timeout in milliseconds for lookup traffic."""
 
     remote_pin_ttl_s: int = 60
-    """Server-side read-lock TTL. Unpin expires after this if UnpinRequest is lost."""
+    """Server-side read-lock TTL. Unpin expires after this if UnpinRequest
+    is lost."""
 
     reconnect_interval_s: int = 30
     """Interval between reconnect attempts for disconnected peers."""

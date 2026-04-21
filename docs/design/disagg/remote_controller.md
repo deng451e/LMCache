@@ -79,7 +79,7 @@ Read-only: `submit_store_task` is a no-op. Must not be added to the
 | Mode | Required | Optional |
 |------|----------|---------|
 | P2P (both hosts) | `RemoteController` + `RemoteIOAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
-| PD prefill | `RemoteController` + `StoreController` | — |
+| PD prefill | `RemoteController` + `RemoteIOAdapter` (registration only) + `StoreController` | — |
 | PD decode | `RemoteController` + `RemoteIOAdapter` + `RemoteL2Adapter` + `PrefetchController` | — |
 
 ---
@@ -88,30 +88,32 @@ Read-only: `submit_store_task` is a no-op. Must not be added to the
 
 All messages use `msgspec.Struct` with `tag=True`.  Encoded as msgpack.
 
+Two sockets on the server, two on the client per peer:
+
 ```
-Message                 Direction          Purpose
-──────────────────────────────────────────────────────────────────
-InitRequest             client → server    Exchange NIXL agent metadata
-InitResponse            server → client    ack + server metadata
-MemRegRequest           client → server    Exchange NIXL xfer_descs
-MemRegResponse          server → client    ack + server xfer_descs
-──────────────────────────────────────────────────────────────────
-LookupRequest           client → server    Which keys exist in remote L1?
-                                           fields: request_id, keys
-                                           request_id is stable across retries (see impl §3)
-LookupResponse          server → client    bitmap + page_indices per found key
-──────────────────────────────────────────────────────────────────
-UnpinRequest            client → server    Release read locks for keys
-                                           fields: request_id, found_keys
-                                           request_id matches the originating LookupRequest
-UnpinResponse           server → client    ack
-──────────────────────────────────────────────────────────────────
+Socket pair         Transport   Message                 Purpose
+────────────────────────────────────────────────────────────────────────────────
+REQ  → REP          serve_port  InitRequest             Exchange NIXL agent metadata
+                                InitResponse            ack + server metadata
+                                MemRegRequest           Exchange NIXL xfer_descs
+                                MemRegResponse          ack + server xfer_descs
+                                LookupRequest           Which keys exist in remote L1?
+                                  fields: request_id, keys
+                                  request_id stable across retries (see impl §4)
+                                LookupResponse          bitmap + page_indices per found key
+────────────────────────────────────────────────────────────────────────────────
+PUSH → PULL         unpin_port  UnpinRequest            Release read locks (fire-and-forget)
+                                  fields: request_id, found_keys
+                                  request_id matches the originating LookupRequest
+────────────────────────────────────────────────────────────────────────────────
 ```
 
+`UnpinRequest` uses a dedicated PUSH/PULL channel (no reply). This keeps the REQ
+socket free for lookup traffic — the two can now run concurrently for the same peer
+without ZMQ REQ single-in-flight-request restrictions causing errors.
+
 `InitRequest / MemRegRequest / Response` are reused verbatim from the existing
-`NixlChannel` handshake protocol.  All messages are handled by `RemoteController`
-on both the sending and receiving side.  `RemoteTransferAdapter` has no protocol
-knowledge and handles no control messages.
+`NixlChannel` handshake protocol.
 
 > **PD pull reuses P2P messages.** Both flows use `LookupRequest → RDMA READ →
 > UnpinRequest`.  There are no PD-specific control messages.
@@ -158,7 +160,7 @@ sequenceDiagram
     L1B -->> PC: write_bitmap + local_objs
 
     PC ->> RLA: submit_load_task(found_keys, local_objs)
-    RLA ->> RIA: submit_fetch_task(found_keys, local_objs)
+    RLA ->> RIA: submit_fetch_task(found_keys, local_objs, lookup_task_id)
     activate RIA
     Note over RIA: use cached handles; issue RDMA READs
     par RDMA READ per key
@@ -180,8 +182,8 @@ sequenceDiagram
         PC ->> L1B: delete(load_failed_keys)
     end
 
-    PC ->> RLA: submit_unlock(found_keys)
-    RLA ->> RIA: submit_unlock(found_keys)
+    PC ->> RLA: submit_unlock(found_keys, lookup_task_id)
+    RLA ->> RIA: submit_unlock(found_keys, lookup_task_id)
     par ZMQ UnpinRequest per peer
         RIA ->> RCA: UnpinRequest(request_id, peer_found_keys)
         Note over RCA: finish_read; evict dedup entry
@@ -239,7 +241,7 @@ sequenceDiagram
     L1D -->> PC: write_bitmap + local_objs
 
     PC ->> RLA: submit_load_task(found_keys, local_objs)
-    RLA ->> RIA: submit_fetch_task(found_keys, local_objs)
+    RLA ->> RIA: submit_fetch_task(found_keys, local_objs, lookup_task_id)
     activate RIA
     Note over RIA: use cached handles; issue RDMA READs
     RIA ->> L1P: RDMA READ
@@ -259,8 +261,8 @@ sequenceDiagram
 
     ENG ->> L1D: read_prefetched_results(loaded_keys)
 
-    PC ->> RLA: submit_unlock(found_keys)
-    RLA ->> RIA: submit_unlock(found_keys)
+    PC ->> RLA: submit_unlock(found_keys, lookup_task_id)
+    RLA ->> RIA: submit_unlock(found_keys, lookup_task_id)
     RIA ->> RCP: ZMQ UnpinRequest(request_id, found_keys)
     activate RCP
     RCP ->> L1P: finish_read(found_keys)

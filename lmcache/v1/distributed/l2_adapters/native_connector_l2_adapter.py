@@ -211,7 +211,9 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         with self._lock:
             return self._completed_lookups.pop(task_id, None)
 
-    def submit_unlock(self, keys: list[ObjectKey]) -> None:
+    def submit_unlock(
+        self, keys: list[ObjectKey], lookup_task_id: "L2TaskId | None" = None
+    ) -> None:
         with self._lock:
             for key in keys:
                 if key not in self._locked_keys:
@@ -229,6 +231,7 @@ class NativeConnectorL2Adapter(L2AdapterInterface):
         self,
         keys: list[ObjectKey],
         objects: list[MemoryObj],
+        lookup_task_id: "L2TaskId | None" = None,
     ) -> L2TaskId:
         key_strings = [_object_key_to_string(k) for k in keys]
         memviews = [_obj_to_memoryview(obj) for obj in objects]

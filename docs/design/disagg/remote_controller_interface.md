@@ -29,7 +29,9 @@ class PeerConfig:
     """Logical name, e.g. 'decode-0' or 'peer-gpu-1'."""
 
     host: str
-    port: int
+    port:       int
+    unpin_port: int
+    """PULL socket port for UnpinRequest (fire-and-forget unlock traffic)."""
 
 
 @dataclass
@@ -39,9 +41,11 @@ class RemoteControllerConfig:
     mode: str
     """Deployment role: 'p2p' | 'pd_prefill' | 'pd_decode'."""
 
-    serve_host: str         = "0.0.0.0"
-    serve_port: int         = 5200
-    peers: list[PeerConfig] = field(default_factory=list)
+    serve_host:       str         = "0.0.0.0"
+    serve_port:       int         = 5200
+    serve_unpin_port: int         = 5201
+    """PULL socket port for incoming UnpinRequests. Must differ from serve_port."""
+    peers: list[PeerConfig]       = field(default_factory=list)
 
     zmq_timeout_ms:   int = 5000
     remote_pin_ttl_s: int = 60
@@ -131,4 +135,4 @@ Incoming ZMQ messages handled internally — not part of the public interface:
 | `InitRequest` | Return `_io.get_local_metadata()` |
 | `MemRegRequest` | Return `_io.get_local_xfer_descs()` |
 | `LookupRequest` | `l1_manager.reserve_read(keys)` → store in dedup cache → `LookupResponse` |
-| `UnpinRequest` | `l1_manager.finish_read(found_keys)` → evict dedup entry → `UnpinResponse` |
+| `UnpinRequest` | `l1_manager.finish_read(found_keys)` → evict dedup entry (no reply — PULL socket) |

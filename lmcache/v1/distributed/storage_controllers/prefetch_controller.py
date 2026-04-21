@@ -147,6 +147,8 @@ class InFlightPrefetchRequest:
 
     # Lookup phase: adapter_idx -> task_id (removed as results arrive)
     pending_lookup_tasks: dict[int, L2TaskId] = field(default_factory=dict)
+    # Lookup phase: adapter_idx -> task_id (kept for load/unlock routing)
+    completed_lookup_task_ids: dict[int, L2TaskId] = field(default_factory=dict)
     # Lookup phase: adapter_idx -> bitmap (populated as results arrive)
     lookup_results: dict[int, Bitmap] = field(default_factory=dict)
 
@@ -516,6 +518,7 @@ class PrefetchController(StorageControllerInterface):
 
             if result is not None:
                 request.lookup_results[adapter_index] = result
+                request.completed_lookup_task_ids[adapter_index] = task_id
                 del request.pending_lookup_tasks[adapter_index]
 
                 if request.all_lookups_done():
@@ -630,7 +633,9 @@ class PrefetchController(StorageControllerInterface):
                 request.write_reserved_objs[key] for key in per_adapter_keys
             ]
             task_id = self._l2_adapters[adapter_idx].submit_load_task(
-                per_adapter_keys, per_adapter_objs
+                per_adapter_keys,
+                per_adapter_objs,
+                lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
             )
             request.pending_load_tasks[adapter_idx] = task_id
 
@@ -773,20 +778,29 @@ class PrefetchController(StorageControllerInterface):
             to_unlock_bitmap = lookup_bitmap & (~plan_bitmap)
             unlock_keys = to_unlock_bitmap.gather(request.keys)
             if unlock_keys:
-                self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+                self._l2_adapters[adapter_idx].submit_unlock(
+                    unlock_keys,
+                    lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+                )
 
     def _unlock_all_plan_keys(self, request: InFlightPrefetchRequest) -> None:
         """Phase 2 unlock: release L2 locks for all keys in the load plan."""
         for adapter_idx, load_bitmap in request.load_plan.items():
             unlock_keys = load_bitmap.gather(request.keys)
-            self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+            self._l2_adapters[adapter_idx].submit_unlock(
+                unlock_keys,
+                lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+            )
 
     def _unlock_all_lookups(self, request: InFlightPrefetchRequest) -> None:
         """Unlock all keys locked during lookup (nothing to load case)."""
         for adapter_idx, lookup_bitmap in request.lookup_results.items():
             unlock_keys = lookup_bitmap.gather(request.keys)
             if unlock_keys:
-                self._l2_adapters[adapter_idx].submit_unlock(unlock_keys)
+                self._l2_adapters[adapter_idx].submit_unlock(
+                    unlock_keys,
+                    lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+                )
 
     # =========================================================================
     # Completion and cleanup

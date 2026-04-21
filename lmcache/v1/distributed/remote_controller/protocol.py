@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """ZMQ control-plane message structs for RemoteController.
 
-All messages are encoded as msgpack via msgspec with tag=True so the Union
-decoder can distinguish them without an explicit type annotation at the call
-site.
+All messages are encoded as msgpack via msgspec with tag=True.
+
+Socket layout:
+  REP socket (serve_port):   InitRequest/Response, MemRegRequest/Response,
+                              LookupRequest/Response
+  PULL socket (serve_unpin_port): UnpinRequest (no reply)
 """
 
 # Standard
@@ -72,7 +75,7 @@ class LookupResponse(msgspec.Struct, tag=True):
 
 
 class UnpinRequest(msgspec.Struct, tag=True):
-    """Client -> server: release read locks for the given keys.
+    """Client -> server (PUSH/PULL, no reply): release read locks.
 
     request_id must match the originating LookupRequest so the server can
     evict the dedup cache entry.
@@ -82,17 +85,13 @@ class UnpinRequest(msgspec.Struct, tag=True):
     found_keys: list[WireObjectKey]
 
 
-class UnpinResponse(msgspec.Struct, tag=True):
-    """Server -> client: ack."""
-
-
-ZMQMessage = Union[
+# Union used only for REP socket messages (InitRequest through LookupResponse).
+# UnpinRequest arrives on the PULL socket and is decoded separately.
+ZMQRepMessage = Union[
     InitRequest,
     InitResponse,
     MemRegRequest,
     MemRegResponse,
     LookupRequest,
     LookupResponse,
-    UnpinRequest,
-    UnpinResponse,
 ]

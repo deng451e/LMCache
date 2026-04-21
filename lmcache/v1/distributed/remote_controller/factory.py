@@ -9,14 +9,14 @@ from lmcache.v1.distributed.remote_controller.controller import (
     RemoteController,
     ZMQRemoteController,
 )
-from lmcache.v1.distributed.remote_transfer.adapter import RemoteTransferAdapter
+from lmcache.v1.distributed.remote_io.adapter import RemoteIOAdapter
 
 
 def build_remote_controller(
     config: RemoteControllerConfig,
     l1_manager: L1Manager,
     l1_mem_desc: L1MemoryDesc,
-    transfer: RemoteTransferAdapter,
+    io: RemoteIOAdapter,
 ) -> RemoteController:
     """Construct and return a RemoteController for the given configuration.
 
@@ -24,10 +24,10 @@ def build_remote_controller(
     may select different backends based on config.mode.
 
     Args:
-        config:      Controller configuration (mode, peers, policy, etc.).
+        config:      Controller configuration (mode, peers, ports, etc.).
         l1_manager:  Local L1Manager for server-side pin management.
         l1_mem_desc: L1 memory descriptor providing align_bytes.
-        transfer:    RemoteTransferAdapter for data-plane operations.
+        io:          RemoteIOAdapter for peer connect/disconnect and lookups.
 
     Returns:
         Configured RemoteController (not yet started).
@@ -36,5 +36,5 @@ def build_remote_controller(
         config=config,
         l1_manager=l1_manager,
         l1_mem_desc=l1_mem_desc,
-        transfer=transfer,
+        io=io,
     )
