@@ -21,6 +21,8 @@ class L1MemoryDesc:
     ptr: int
     size: int
     align_bytes: int
+    device: str = "cpu"
+    """PyTorch device type of the buffer: "cpu" or "cuda"."""
 
 
 class EventListener(ABC):  # noqa: B024

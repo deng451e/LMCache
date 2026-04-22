@@ -15,6 +15,10 @@ from lmcache.v1.distributed.l2_adapters.config import (
     add_l2_adapters_args,
     parse_args_to_l2_adapters_config,
 )
+from lmcache.v1.distributed.remote_controller.config import (
+    PeerConfig,
+    RemoteControllerConfig,
+)
 
 
 @dataclass
@@ -96,6 +100,9 @@ class StorageManagerConfig:
 
     prefetch_max_in_flight: int = 8
     """ Maximum number of concurrent prefetch requests. """
+
+    remote_controller_config: RemoteControllerConfig | None = None
+    """ Optional remote controller config. None means no remote P2P/PD. """
 
 
 def add_storage_manager_args(
@@ -237,6 +244,49 @@ def add_storage_manager_args(
         help="Maximum number of concurrent prefetch requests. Default is 8.",
     )
 
+    # Remote Controller
+    remote_group = parser.add_argument_group(
+        "Remote Controller",
+        "P2P / PD disaggregation via ZMQ + NIXL RDMA. Omit --remote-mode to disable.",
+    )
+    remote_group.add_argument(
+        "--remote-mode",
+        type=str,
+        choices=["p2p", "pd_prefill", "pd_decode"],
+        default=None,
+        help="Enable remote KV-cache transfer. 'p2p' for symmetric sharing; "
+        "'pd_prefill'/'pd_decode' for prefill-decode disaggregation.",
+    )
+    remote_group.add_argument(
+        "--remote-serve-port",
+        type=int,
+        default=5200,
+        help="ZMQ REP port this server listens on for lookup / Init / MemReg. "
+        "Default: 5200.",
+    )
+    remote_group.add_argument(
+        "--remote-serve-unpin-port",
+        type=int,
+        default=None,
+        help="ZMQ PULL port for UnpinRequest (fire-and-forget). "
+        "Default: --remote-serve-port + 1.",
+    )
+    remote_group.add_argument(
+        "--remote-peer",
+        type=str,
+        action="append",
+        default=[],
+        metavar="ID:HOST:PORT",
+        help="Pre-configure a remote peer. Format: peer_id:host:lookup_port. "
+        "The unpin port is derived as lookup_port + 1. Repeatable.",
+    )
+    remote_group.add_argument(
+        "--remote-zmq-timeout-ms",
+        type=int,
+        default=5000,
+        help="Per-request ZMQ timeout in milliseconds. Default: 5000.",
+    )
+
     # Adapter config
     add_l2_adapters_args(parser)
     return parser
@@ -293,6 +343,32 @@ def parse_args_to_config(
 
     l2_adapter_config = parse_args_to_l2_adapters_config(args)
 
+    remote_controller_config: RemoteControllerConfig | None = None
+    if getattr(args, "remote_mode", None) is not None:
+        serve_port: int = getattr(args, "remote_serve_port", 5200)
+        serve_unpin_port: int = getattr(args, "remote_serve_unpin_port", None) or (
+            serve_port + 1
+        )
+        peers: list[PeerConfig] = []
+        for peer_str in getattr(args, "remote_peer", None) or []:
+            parts = peer_str.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError(
+                    f"--remote-peer must be 'peer_id:host:port', got {peer_str!r}"
+                )
+            peer_id, host, port_str = parts
+            port = int(port_str)
+            peers.append(
+                PeerConfig(peer_id=peer_id, host=host, port=port, unpin_port=port + 1)
+            )
+        remote_controller_config = RemoteControllerConfig(
+            mode=args.remote_mode,
+            serve_port=serve_port,
+            serve_unpin_port=serve_unpin_port,
+            peers=peers,
+            zmq_timeout_ms=getattr(args, "remote_zmq_timeout_ms", 5000),
+        )
+
     return StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
@@ -300,6 +376,7 @@ def parse_args_to_config(
         store_policy=args.l2_store_policy,
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
+        remote_controller_config=remote_controller_config,
     )
 
 

@@ -166,6 +166,7 @@ class L1MemoryManager:
             ptr=buffer.data_ptr(),
             size=self._size_in_bytes,
             align_bytes=self._align_bytes,
+            device=buffer.device.type,
         )
 
     def close(self) -> None:

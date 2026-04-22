@@ -298,7 +298,12 @@ class ZMQRemoteController(RemoteController):
                 zmq_channel=channel,
                 status=PeerStatus.CONNECTED,
             )
-        logger.info("Registered peer %s at %s", config.peer_id, endpoint)
+        logger.info(
+            "[Remote] peer connection established: %s at %s (unpin=%s)",
+            config.peer_id,
+            endpoint,
+            unpin_endpoint,
+        )
 
     def unregister_peer(self, peer_id: str) -> None:
         """Remove a peer from the registry and release its resources.
@@ -420,8 +425,13 @@ class ZMQRemoteController(RemoteController):
             Response message to send back to the client.
         """
         if isinstance(msg, InitRequest):
+            logger.info("[Remote] incoming peer handshake: InitRequest received")
             return InitResponse(server_agent_metadata=self._io.get_local_metadata())
         if isinstance(msg, MemRegRequest):
+            logger.info(
+                "[Remote] incoming peer handshake: "
+                "MemRegRequest received — peer fully connected"
+            )
             return MemRegResponse(server_xfer_descs=self._io.get_local_xfer_descs())
         if isinstance(msg, LookupRequest):
             return self._handle_lookup(msg)
@@ -467,6 +477,13 @@ class ZMQRemoteController(RemoteController):
             num_pages = obj.meta.phy_size // self._align_bytes
             pages_per_found.append(list(range(start_page, start_page + num_pages)))
 
+        logger.info(
+            "[Remote] lookup: found %d/%d keys in local L1 (request_id=%s)",
+            len(found_positions),
+            len(keys),
+            msg.request_id,
+        )
+
         expires_at = now + self._config.remote_pin_ttl_s + 10
         with self._dedup_lock:
             self._dedup[msg.request_id] = _DeduplicatedEntry(
@@ -491,6 +508,11 @@ class ZMQRemoteController(RemoteController):
         ]
         if keys:
             self._l1_manager.finish_read(keys)
+            logger.info(
+                "[Remote] unpin: released %d read locks (request_id=%s)",
+                len(keys),
+                msg.request_id,
+            )
         with self._dedup_lock:
             self._dedup.pop(msg.request_id, None)
 

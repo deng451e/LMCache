@@ -10,6 +10,7 @@ not supported (remote peers are read-only from this side).
 from __future__ import annotations
 
 # Standard
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -19,8 +20,49 @@ if TYPE_CHECKING:
 # First Party
 from lmcache.v1.distributed.api import ObjectKey
 from lmcache.v1.distributed.l2_adapters.base import L2AdapterInterface, L2TaskId
+from lmcache.v1.distributed.l2_adapters.config import (
+    L2AdapterConfigBase,
+    register_l2_adapter_type,
+)
 from lmcache.v1.distributed.remote_io.adapter import RemoteIOAdapter
 from lmcache.v1.memory_management import MemoryObj
+
+# ---------------------------------------------------------------------------
+# Sentinel config — used only for AdapterDescriptor; not parsed from JSON
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RemoteL2AdapterConfig(L2AdapterConfigBase):
+    """Sentinel config for RemoteL2Adapter.
+
+    Not intended for JSON-based instantiation. Used exclusively to populate
+    AdapterDescriptor so the prefetch policy can identify this adapter.
+    """
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "RemoteL2AdapterConfig":
+        """Return a default instance (no JSON fields are consumed).
+
+        Args:
+            d: Ignored.
+
+        Returns:
+            A new RemoteL2AdapterConfig instance.
+        """
+        return cls()
+
+    @classmethod
+    def help(cls) -> str:
+        """Return help text for this adapter type.
+
+        Returns:
+            Description string.
+        """
+        return "Remote P2P/PD adapter; configured via --remote-mode, not --l2-adapter."
+
+
+register_l2_adapter_type("remote", RemoteL2AdapterConfig)
 
 
 class RemoteL2Adapter(L2AdapterInterface):

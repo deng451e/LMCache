@@ -106,11 +106,65 @@ class StorageManager:
         )
         self._store_controller.start()
 
-        # Prefetch controller
+        # Remote controller + adapter (prefetch-only; not wired into store)
+        self._remote_controller = None
+        self._remote_l2_adapter = None
+        prefetch_adapters: list[L2AdapterInterface] = list(self._l2_adapters)
+        prefetch_descriptors = list(adapter_descriptors)
+
+        if config.remote_controller_config is not None:
+            # Lazy imports to keep remote deps optional
+            # First Party
+            from lmcache.v1.distributed.l2_adapters.remote_l2_adapter import (  # noqa: PLC0415
+                RemoteL2Adapter,
+                RemoteL2AdapterConfig,
+            )
+            from lmcache.v1.distributed.remote_controller.factory import (  # noqa: PLC0415
+                build_remote_controller,
+            )
+            from lmcache.v1.distributed.remote_io.backends.nixl_backend import (  # noqa: PLC0415
+                NixlIOAdapter,
+            )
+            from lmcache.v1.distributed.remote_io.config import (  # noqa: PLC0415
+                RemoteIOAdapterConfig,
+            )
+
+            nixl_io = NixlIOAdapter(
+                RemoteIOAdapterConfig(align_bytes=l1_memory_desc.align_bytes)
+            )
+            nixl_io.register_local_memory(
+                l1_memory_desc.ptr, l1_memory_desc.size, l1_memory_desc.device
+            )
+            self._remote_l2_adapter = RemoteL2Adapter(io=nixl_io)
+            remote_descriptor = AdapterDescriptor(
+                index=len(prefetch_adapters),
+                config=RemoteL2AdapterConfig(),
+            )
+            prefetch_adapters.append(self._remote_l2_adapter)
+            prefetch_descriptors.append(remote_descriptor)
+
+            self._remote_controller = build_remote_controller(
+                config.remote_controller_config,
+                self._l1_manager,
+                l1_memory_desc,
+                nixl_io,
+            )
+            self._remote_controller.start()
+            logger.info(
+                "RemoteController started (mode=%s, serve_port=%d)",
+                config.remote_controller_config.mode,
+                config.remote_controller_config.serve_port,
+            )
+
+        # Used by schedule_prefetch to decide whether to invoke PrefetchController.
+        # Includes the remote adapter (if configured), unlike self._l2_adapters.
+        self._prefetch_adapters = prefetch_adapters
+
+        # Prefetch controller — receives remote adapter if configured
         self._prefetch_controller = PrefetchController(
             l1_manager=self._l1_manager,
-            l2_adapters=self._l2_adapters,
-            adapter_descriptors=adapter_descriptors,
+            l2_adapters=prefetch_adapters,
+            adapter_descriptors=prefetch_descriptors,
             policy=create_prefetch_policy(config.prefetch_policy),
             max_in_flight=config.prefetch_max_in_flight,
         )
@@ -342,7 +396,7 @@ class StorageManager:
         # Submit remaining keys to L2 prefetch controller
         remaining_keys = keys[hit_count:]
         prefetch_request_id = -1
-        if remaining_keys and self._l2_adapters:
+        if remaining_keys and self._prefetch_adapters:
             prefetch_request_id = self._prefetch_controller.submit_prefetch_request(
                 remaining_keys,
                 layout_desc,
@@ -477,6 +531,11 @@ class StorageManager:
         self._store_controller.stop()
         self._eviction_controller.stop()
         self._l2_eviction_controller.stop()
+
+        if self._remote_controller is not None:
+            self._remote_controller.stop()
+        if self._remote_l2_adapter is not None:
+            self._remote_l2_adapter.close()
 
         for adapter in self._l2_adapters:
             adapter.close()
