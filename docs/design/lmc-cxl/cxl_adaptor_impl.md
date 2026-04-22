@@ -1,0 +1,682 @@
+# Implementation: CXL Adaptor
+
+**Status**: Draft
+**Author**: weishu@tensormesh.ai
+**Date**: 2026-04-22
+
+Implementation companion to [cxl_adaptor.md](cxl_adaptor.md).
+
+---
+
+## 1. `CxlAdaptor` — Local CXL Region
+
+Implements `L1ManagerListener` + `L2AdapterInterface`.  Owns the local CXL
+allocator and `_index`.
+
+### Config
+
+```python
+@dataclass
+class CxlAdaptorConfig:
+    dax_device_path: str  # e.g. "/dev/dax0.0"
+    region_size:     int  # mapped region size in bytes
+    align_bytes:     int  # allocation alignment; passed to TensorMemoryAllocator
+    cxl_numa_node:   int  # NUMA node ID of this host's CXL sub-region
+```
+
+### Internal index
+
+```python
+@dataclass
+class CxlIndexEntry:
+    obj:            TensorMemoryObj  # suballocation; carries data_ptr(), phy_size,
+                                     # shapes, dtypes directly
+    pending_free:   bool = False     # deferred free flag
+    l2_lock_count:  int  = 0        # >0 while any caller (local or remote) holds
+                                     # a lock between lookup and unlock
+```
+
+### Interface
+
+```python
+class CxlAdaptor(L1ManagerListener, L2AdapterInterface):
+
+    # -----------------------------------------------------------------------
+    # L2AdapterInterface — event fds
+    # -----------------------------------------------------------------------
+
+    def get_store_event_fd(self) -> int:
+        """Eventfd signaled when a store task completes (immediate no-op)."""
+
+    def get_lookup_and_lock_event_fd(self) -> int:
+        """Eventfd signaled when a lookup_and_lock task result is ready."""
+
+    def get_load_event_fd(self) -> int:
+        """Eventfd signaled when a shadow-registration (load) task completes."""
+
+    def requires_pre_allocation(self) -> bool:
+        """Return False.
+
+        PrefetchController must NOT call reserve_write before submit_load_task
+        for CXL hits.  The adapter re-registers a CXL_SHADOW object in
+        L1Manager; no DRAM buffer is needed."""
+        return False
+
+    # -----------------------------------------------------------------------
+    # L2AdapterInterface — store (no-op: data already in CXL)
+    # -----------------------------------------------------------------------
+
+    def submit_store_task(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+    ) -> L2TaskId:
+        """No-op — objects are CXL_SHADOW; data is already in CXL.
+        Signals get_store_event_fd() immediately."""
+
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+        """Return all immediately-completed no-op tasks."""
+
+    # -----------------------------------------------------------------------
+    # L2AdapterInterface — lookup and lock
+    # -----------------------------------------------------------------------
+
+    def submit_lookup_and_lock_task(self, keys: list[ObjectKey]) -> L2TaskId:
+        """Check _index for each key; increment l2_lock_count for found keys.
+        Skips entries with pending_free=True (being evicted; not returned as hits).
+        Non-blocking; result available immediately (signals lookup_efd)."""
+
+    def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """Return found bitmap once ready. One-shot."""
+
+    # -----------------------------------------------------------------------
+    # L2AdapterInterface — unlock
+    # -----------------------------------------------------------------------
+
+    def submit_unlock(
+        self,
+        keys: list[ObjectKey],
+        lookup_task_id: L2TaskId | None = None,
+    ) -> None:
+        """Decrement l2_lock_count for each key.
+        If l2_lock_count reaches 0 and pending_free is True, free CXL pages."""
+
+    # -----------------------------------------------------------------------
+    # L2AdapterInterface — load (shadow re-registration, no copy)
+    # -----------------------------------------------------------------------
+
+    def submit_load_task(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],   # always [] for CXL (requires_pre_allocation=False)
+        lookup_task_id: L2TaskId | None = None,
+    ) -> L2TaskId:
+        """Re-register each found key as a write-locked shadow in L1Manager.
+        objects must be [] (CxlAdaptor owns allocation). Non-blocking."""
+
+    def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """Return shadow-registered bitmap once ready. One-shot."""
+
+    # -----------------------------------------------------------------------
+    # Shadow page lifecycle (called from L1Manager.reserve_write and read path)
+    # -----------------------------------------------------------------------
+
+    def allocate_and_register_shadow(
+        self,
+        key: ObjectKey,
+        layout_desc: MemoryLayoutDesc,
+        is_temporary: bool = False,
+    ) -> TensorMemoryObj:
+        """Allocate from _allocator, set meta.fmt = CXL_SHADOW, store in
+        _index, and register as write-locked shadow in L1Manager."""
+
+    def reregister_shadow(self, key: ObjectKey) -> TensorMemoryObj:
+        """Re-register a shadow whose L1 entry was evicted.
+        Reconstructs CXL_SHADOW obj from _index[key].obj and calls
+        L1Manager.register_shadow."""
+
+    def transfer_to_gpu(self, obj: TensorMemoryObj, dst: MemoryObj) -> Future:
+        """Async cudaMemcpy: CXL NUMA VA → GPU buffer (ThreadPoolExecutor)."""
+
+    # -----------------------------------------------------------------------
+    # Server-side methods (called by CxlRemoteController in ZMQ thread)
+    # -----------------------------------------------------------------------
+
+    def server_lookup_and_lock(
+        self,
+        keys: list[ObjectKey],
+    ) -> dict[ObjectKey, tuple[int, int]]:
+        """Synchronously look up keys and increment l2_lock_count.
+
+        Does NOT interact with L1Manager.  Reads _index only.
+        Skips entries with pending_free=True (same guard as submit_lookup_and_lock_task).
+
+        Args:
+            keys: Keys to look up.
+
+        Returns:
+            {key: (byte_offset, byte_size)} for found keys only.
+            byte_offset = obj.data_ptr() - _region_va_base.
+        """
+
+    def server_unpin(self, keys: list[ObjectKey]) -> None:
+        """Decrement l2_lock_count; free if pending_free.
+        Called by CxlRemoteController._handle_unpin()."""
+
+    def get_local_metadata(self) -> CxlRegionMeta:
+        """Return {dax_device_path, region_size, align_bytes}.
+        Called by CxlRemoteController during peer handshake."""
+
+    # -----------------------------------------------------------------------
+    # L1ManagerListener (all 6 callbacks)
+    # -----------------------------------------------------------------------
+
+    def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_reserved_write(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+        """No-op — StoreController handles L2 persistence; data is in CXL."""
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_read_finished(self, keys: list[ObjectKey]) -> None:
+        """Queue pending-free keys for the deferred-free background thread.
+
+        Called by L1Manager from inside finish_read() — which holds
+        L1Manager._lock — so this callback MUST NOT call any L1Manager method
+        (deadlock).  Instead it enqueues candidate keys and signals the
+        background _deferred_free_thread via _deferred_free_efd.
+        """
+        to_queue: list[ObjectKey] = []
+        with self._lock:
+            for key in keys:
+                entry = self._index.get(key)
+                if entry is not None and entry.pending_free and entry.l2_lock_count == 0:
+                    to_queue.append(key)
+        if to_queue:
+            with self._deferred_free_lock:
+                self._deferred_free_queue.extend(to_queue)
+            os.eventfd_write(self._deferred_free_efd, 1)
+
+    def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
+        """Shadow evicted by L1Manager (called while L1 lock is held).
+
+        Acquire _lock.  CXL pages survive — _index entry stays.
+        If pending_free=True and l2_lock_count==0, free CXL pages now.
+        """
+```
+
+`CxlAdaptor` holds an injected `L1Manager` reference for `register_shadow`
+and CXL-side eviction.
+
+### `L1Manager.reserve_write` tiering hook
+
+```python
+# inside L1Manager.reserve_write (simplified new branch):
+for i, key in enumerate(need_to_allocate):
+    if self._cxl_adaptor and self._tiering_policy.should_use_cxl(key, layout_desc):
+        try:
+            obj = self._cxl_adaptor.allocate_and_register_shadow(
+                key, layout_desc, is_temporary=is_temporary[i]
+            )
+        except OutOfMemoryError:
+            obj = self._memory_manager.allocate_one(layout_desc)  # DRAM fallback
+    else:
+        obj = self._memory_manager.allocate_one(layout_desc)
+    result[key] = (L1Error.OK, obj)
+```
+
+`TieringPolicy` protocol:
+
+```python
+class TieringPolicy(Protocol):
+    def should_use_cxl(self, key: ObjectKey, layout: MemoryLayoutDesc) -> bool: ...
+```
+
+Both `_cxl_adaptor` and `_tiering_policy` are `None` when CXL is not
+configured — existing path is completely unchanged.
+
+---
+
+### Eviction retry invariant
+
+A CXL allocation is freed only when **both** conditions hold:
+1. `l2_lock_count == 0` — no outstanding lookup results (local or remote).
+2. L1 delete succeeds — the L1 shadow is not read-locked.
+
+When either condition fails, `pending_free=True` is set and the free is retried from
+the first callback that observes both conditions satisfied:
+
+| Trigger | When it fires |
+|---|---|
+| `submit_unlock` | Local PrefetchController releases L2 lock after load |
+| `server_unpin` | Remote client sends CxlUnpinRequest |
+| `on_l1_keys_read_finished` | L1 read lock released (engine called `finish_read`) |
+| `on_l1_keys_deleted_by_manager` | L1Manager evicts the shadow under memory pressure |
+
+Lookups (`submit_lookup_and_lock_task`, `server_lookup_and_lock`) skip keys with
+`pending_free=True` so no new lock-holders are created for a draining entry.
+
+### Deferred-free background thread
+
+`on_l1_keys_read_finished` is called while `L1Manager._lock` is held
+(`finish_read` is `@l1_mgr_synchronized`).  Calling `l1_manager.delete()`
+inline would deadlock.  `CxlAdaptor` therefore runs a lightweight
+**`_deferred_free_thread`** that does the actual delete + free:
+
+```python
+# CxlAdaptor internal state (added):
+_deferred_free_queue: list[ObjectKey]  # guarded by _deferred_free_lock
+_deferred_free_lock:  threading.Lock
+_deferred_free_efd:   int              # eventfd, non-blocking
+
+def _deferred_free_loop(self) -> None:
+    """Background thread: retry l1_manager.delete + allocator free for
+    keys enqueued by on_l1_keys_read_finished."""
+    while not self._stop_event.is_set():
+        try:
+            os.eventfd_read(self._deferred_free_efd)
+        except BlockingIOError:
+            time.sleep(0.01)
+            continue
+
+        with self._deferred_free_lock:
+            keys, self._deferred_free_queue = self._deferred_free_queue, []
+
+        for key in keys:
+            with self._lock:
+                entry = self._index.get(key)
+                if entry is None or not entry.pending_free or entry.l2_lock_count > 0:
+                    continue
+            err = self._l1_manager.delete(key)
+            with self._lock:
+                entry = self._index.get(key)
+                if entry is None:
+                    continue
+                if err == L1Error.SUCCESS and entry.l2_lock_count == 0:
+                    self._allocator.batched_free([entry.obj])
+                    del self._index[key]
+                # else KEY_IS_LOCKED or other error: leave pending_free=True;
+                # next on_l1_keys_read_finished or on_l1_keys_deleted_by_manager retries
+```
+
+`_deferred_free_thread` is a daemon thread started in `CxlAdaptor.__init__`
+and stopped (via `_stop_event`) in `close()`.
+
+---
+
+## 2. `CXL_SHADOW` Memory Format
+
+No `CXLMemoryObj` subclass needed.  `allocate_and_register_shadow` sets
+`meta.fmt = MemoryFormat.CXL_SHADOW` on the standard `TensorMemoryObj`
+returned by `_allocator.batched_allocate()`.
+
+### `L1MemoryManager.free()` guard
+
+```python
+def free(self, objs: list[MemoryObj]) -> None:
+    dram_objs = [o for o in objs if o.get_memory_format() != MemoryFormat.CXL_SHADOW]
+    self._allocator.batched_free(dram_objs)
+```
+
+---
+
+## 3. `L1Manager.register_shadow()`
+
+```python
+def register_shadow(
+    self,
+    key: ObjectKey,
+    obj: TensorMemoryObj,   # meta.fmt == MemoryFormat.CXL_SHADOW
+    is_temporary: bool = False,
+) -> L1Error:
+    """Register an externally-allocated CXL_SHADOW TensorMemoryObj without
+    calling _memory_manager.allocate().  Entry is created write-locked.
+
+    Returns L1Error.EXIST if key is already present.
+    """
+```
+
+---
+
+## 4. `L2AdapterInterface.requires_pre_allocation()`
+
+```python
+class L2AdapterInterface(ABC):
+    def requires_pre_allocation(self) -> bool:
+        """Whether PrefetchController should reserve L1 write buffers before
+        calling submit_load_task.
+
+        Default True (all existing adapters unchanged).
+        CxlAdaptor returns False: load re-registers a CXL_SHADOW object;
+        no DRAM buffer is needed or expected.
+        """
+        return True
+```
+
+### `PrefetchController._transition_to_load_phase` update
+
+The load phase is split into per-adapter allocation:
+
+```python
+# (replaces the single reserve_write call, lines ~567-638 of prefetch_controller.py)
+pre_alloc_plan: dict[int, Bitmap] = {}
+no_pre_alloc_plan: dict[int, Bitmap] = {}
+for adapter_idx, bitmap in trimmed_plan.items():
+    if self._l2_adapters[adapter_idx].requires_pre_allocation():
+        pre_alloc_plan[adapter_idx] = bitmap
+    else:
+        no_pre_alloc_plan[adapter_idx] = bitmap
+
+# Reserve L1 write buffers only for adapters that need them.
+pre_alloc_keys = set()
+for bitmap in pre_alloc_plan.values():
+    pre_alloc_keys.update(bitmap.gather(request.keys))
+write_results = (
+    l1_mgr.reserve_write(list(pre_alloc_keys), ...)
+    if pre_alloc_keys
+    else {}
+)
+# ... rest of reservation logic unchanged ...
+
+# Submit load tasks: pass objects for pre-alloc adapters, [] for CXL.
+for adapter_idx, bitmap in trimmed_plan.items():
+    per_adapter_keys = bitmap.gather(request.keys)
+    if adapter_idx in pre_alloc_plan:
+        per_adapter_objs = [request.write_reserved_objs[k] for k in per_adapter_keys]
+    else:
+        per_adapter_objs = []
+    task_id = self._l2_adapters[adapter_idx].submit_load_task(
+        per_adapter_keys, per_adapter_objs,
+        lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+    )
+    request.pending_load_tasks[adapter_idx] = task_id
+```
+
+The `_finalize_load` path is unchanged: it calls
+`l1_mgr.finish_write_and_reserve_read(loaded_keys)` for all loaded keys
+regardless of adapter type, because `CxlAdaptor.submit_load_task` already
+wrote a write-locked shadow into `L1Manager` — `finish_write_and_reserve_read`
+just transitions it to read-locked.
+
+---
+
+## 5. `CxlRemoteController`
+
+Analogous to `ZMQRemoteController`.  Server queries `CxlAdaptor` instead of
+`L1Manager`.  No `MemReg` step.
+
+```python
+@dataclass
+class CxlControllerConfig:
+    serve_host:       str   = "0.0.0.0"
+    serve_port:       int   = 5300
+    serve_unpin_port: int   = 5301
+    peers:            list[PeerConfig] = field(default_factory=list)
+    zmq_timeout_ms:   int   = 5000
+    remote_pin_ttl_s: int   = 60
+    reconnect_interval_s: int = 30
+```
+
+Reuses `PeerConfig` from `remote_controller/config.py`.
+
+### Server loop
+
+```
+REP socket:
+  CxlInitRequest  → CxlInitResponse { server_region_meta = _cxl_adaptor.get_local_metadata() }
+  CxlLookupRequest → _handle_lookup() → CxlLookupResponse
+  (unknown msgs)  → empty CxlLookupResponse
+
+PULL socket:
+  CxlUnpinRequest → _handle_unpin()
+```
+
+### `_handle_lookup`
+
+```python
+def _handle_lookup(self, msg: CxlLookupRequest) -> CxlLookupResponse:
+    # 1. Check dedup cache (same pattern as ZMQRemoteController).
+    # 2. Call _cxl_adaptor.server_lookup_and_lock(keys).
+    # 3. Build found_positions, byte_offsets, byte_sizes from returned dict.
+    # 4. Store in dedup cache; return response.
+```
+
+### `_handle_unpin`
+
+```python
+def _handle_unpin(self, msg: CxlUnpinRequest) -> None:
+    # 1. Convert WireObjectKey → ObjectKey.
+    # 2. Call _cxl_adaptor.server_unpin(keys).
+    # 3. Remove from dedup cache.
+```
+
+### Peer lifecycle
+
+`register_peer(config)`:
+1. Open ZMQ REQ channel to peer.
+2. Send `CxlInitRequest { get_local_metadata() }`, receive `CxlInitResponse`.
+3. Call `_cxl_io_adapter.connect_peer(peer_id, endpoint, unpin_endpoint, server_region_meta)`.
+4. Store `PeerState`.
+
+`unregister_peer(peer_id)`: calls `_cxl_io_adapter.disconnect_peer(peer_id)`.
+
+Reconnect thread: same pattern as `ZMQRemoteController`.
+
+---
+
+## 6. `CxlRemoteIOAdapter`
+
+Client-side: ZMQ lookup fan-out + DAX window memcpy.
+
+```python
+@dataclass
+class CxlPeerRegion:
+    peer_id:     str
+    va_base:     int   # mmap base VA of peer DAX device window
+    region_size: int
+    _mmap_obj:   mmap.mmap
+    _fd:         int
+```
+
+```python
+@dataclass
+class CxlRemoteHandle:
+    peer_id:     str
+    byte_offset: int
+    byte_size:   int
+```
+
+```python
+class CxlRemoteIOAdapter:
+    """Client-side remote CXL I/O: ZMQ lookup fan-out + DAX memcpy.
+
+    Handle cache lifecycle mirrors RemoteIOAdapter:
+      _handle_cache[task_id] created by submit_lookup_task,
+      read (not removed) by submit_fetch_task,
+      fully released by submit_unlock.
+    """
+
+    def connect_peer(
+        self,
+        peer_id: str,
+        endpoint: str,
+        unpin_endpoint: str,
+        peer_meta: CxlRegionMeta,
+    ) -> None:
+        """Open ZMQ channels and mmap peer DAX device window.
+
+        Args:
+            peer_id:         Logical peer ID.
+            endpoint:        ZMQ REQ endpoint for lookup traffic.
+            unpin_endpoint:  ZMQ PUSH endpoint for fire-and-forget unpins.
+            peer_meta:       CxlRegionMeta from CxlInitResponse.
+        """
+        # mmap peer's DAX device:
+        #   fd = os.open(peer_meta.dax_device_path, os.O_RDWR)
+        #   m  = mmap.mmap(fd, peer_meta.region_size, MAP_SHARED, PROT_READ)
+        # Store CxlPeerRegion.
+
+    def disconnect_peer(self, peer_id: str) -> None:
+        """Close ZMQ channels and munmap peer DAX window."""
+
+    def get_disconnected_peers(self) -> list[str]:
+        """Return peers that timed out during lookup. (mirrors RemoteIOAdapter)"""
+
+    def submit_lookup_task(self, keys: list[ObjectKey]) -> IOTaskId:
+        """Fan-out CxlLookupRequest to all connected peers (background thread).
+        Builds _handle_cache[task_id] from aggregated responses.
+        Signals lookup_efd on completion."""
+
+    def query_lookup_result(self, task_id: IOTaskId) -> Bitmap | None:
+        """One-shot query. Returns Bitmap where bit i = key i found on any peer."""
+
+    def submit_fetch_task(
+        self,
+        keys: list[ObjectKey],
+        local_objs: list[MemoryObj],   # pre-allocated DRAM write buffers
+        lookup_task_id: IOTaskId | None = None,
+    ) -> IOTaskId:
+        """Issue parallel memcpy per key from mapped peer DAX window to local DRAM.
+
+        Per-key: memcpy(local_obj.data_ptr() ← peer_region.va_base + byte_offset,
+                        byte_size)
+        Uses ThreadPoolExecutor. Signals fetch_efd on completion."""
+
+    def query_fetch_result(self, task_id: IOTaskId) -> Bitmap | None:
+        """One-shot query. Returns Bitmap of successfully copied keys."""
+
+    def submit_unlock(
+        self,
+        keys: list[ObjectKey],
+        lookup_task_id: IOTaskId | None = None,
+    ) -> None:
+        """Send CxlUnpinRequest to owning peer for each key.
+        Removes entries from _handle_cache[lookup_task_id].
+        Deletes _handle_cache entry once all keys for that task are unlocked."""
+
+    def get_lookup_event_fd(self) -> int: ...
+    def get_fetch_event_fd(self) -> int: ...
+    def close(self) -> None: ...
+```
+
+### Peer address formula
+
+```python
+# On server (CxlRemoteController._handle_lookup):
+byte_offset = obj.data_ptr() - _region_va_base
+byte_size   = obj.phy_size
+
+# On client (CxlRemoteIOAdapter.submit_fetch_task):
+peer_va   = peer_region.va_base + byte_offset
+ctypes.memmove(local_obj.data_ptr(), peer_va, byte_size)
+```
+
+Both values are byte-granular; no page-size dependency.
+
+---
+
+## 7. `CxlRemoteL2Adapter`
+
+Wraps `CxlRemoteIOAdapter` with the `L2AdapterInterface` contract.
+Mirrors `RemoteL2Adapter` exactly — store operations raise `NotImplementedError`.
+
+```python
+class CxlRemoteL2Adapter(L2AdapterInterface):
+    """L2AdapterInterface backed by CxlRemoteIOAdapter.
+
+    read-only: remote CXL peers are lookup/fetch sources only.
+    requires_pre_allocation() returns True (default): PrefetchController
+    must reserve DRAM write buffers before calling submit_load_task.
+    """
+
+    def __init__(self, io: CxlRemoteIOAdapter) -> None: ...
+
+    def get_store_event_fd(self) -> int:
+        raise NotImplementedError
+
+    def get_lookup_and_lock_event_fd(self) -> int:
+        return self._io.get_lookup_event_fd()
+
+    def get_load_event_fd(self) -> int:
+        return self._io.get_fetch_event_fd()
+
+    def submit_store_task(self, ...) -> L2TaskId:
+        raise NotImplementedError
+
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+        raise NotImplementedError
+
+    def submit_lookup_and_lock_task(self, keys) -> L2TaskId:
+        return self._io.submit_lookup_task(keys)
+
+    def query_lookup_and_lock_result(self, task_id) -> Bitmap | None:
+        return self._io.query_lookup_result(task_id)
+
+    def submit_unlock(self, keys, lookup_task_id=None) -> None:
+        self._io.submit_unlock(keys, lookup_task_id=lookup_task_id)
+
+    def submit_load_task(self, keys, objects, lookup_task_id=None) -> L2TaskId:
+        return self._io.submit_fetch_task(keys, objects, lookup_task_id=lookup_task_id)
+
+    def query_load_result(self, task_id) -> Bitmap | None:
+        return self._io.query_fetch_result(task_id)
+
+    def close(self) -> None:
+        self._io.close()
+```
+
+---
+
+## 8. Integration Points Summary
+
+| Component | Change |
+|---|---|
+| `memory_management.py` | Add `MemoryFormat.CXL_SHADOW` |
+| `distributed/l1_manager.py` | Add `register_shadow()` + TieringPolicy hook in `reserve_write` |
+| `distributed/memory_manager.py` | Add `CXL_SHADOW` format guard in `free()` |
+| `distributed/l2_adapters/base.py` | Add `requires_pre_allocation() → bool` (default `True`) |
+| `distributed/storage_controllers/prefetch_controller.py` | Split `_transition_to_load_phase` to handle `requires_pre_allocation=False` adapters |
+| `distributed/storage_manager.py` | Accept `CxlAdaptor` + `CxlRemoteL2Adapter` as optional L2 adapters |
+
+---
+
+## 9. File Structure
+
+```
+lmcache/v1/
+├── memory_management.py                        # modified: + MemoryFormat.CXL_SHADOW
+└── distributed/
+    ├── l1_manager.py                           # modified: + register_shadow(), TieringPolicy hook
+    ├── memory_manager.py                       # modified: + CXL_SHADOW guard in free()
+    ├── l2_adapters/
+    │   └── base.py                             # modified: + requires_pre_allocation()
+    │
+    ├── storage_controllers/
+    │   └── prefetch_controller.py              # modified: per-adapter pre_allocation check
+    │
+    └── cxl/
+        ├── __init__.py
+        ├── adaptor.py                          # CxlAdaptor, CxlAdaptorConfig,
+        │                                       # CxlIndexEntry, TieringPolicy
+        ├── controller.py                       # CxlRemoteController, CxlControllerConfig
+        │                                       # ZMQCxlControlChannel (lazy-pirate)
+        ├── protocol.py                         # CxlRegionMeta, CxlInitRequest/Response,
+        │                                       # CxlLookupRequest/Response, CxlUnpinRequest
+        ├── remote_io_adapter.py                # CxlRemoteIOAdapter, CxlPeerRegion,
+        │                                       # CxlRemoteHandle, IOTaskId
+        └── remote_l2_adapter.py                # CxlRemoteL2Adapter
+
+tests/v1/distributed/cxl/
+├── test_cxl_adaptor.py                         # alloc, store, lookup, shadow cycle
+├── test_cxl_shadow_registration.py             # register_shadow / eviction
+├── test_cxl_eviction_consistency.py            # Path A + Path B under concurrent access
+├── test_cxl_server_methods.py                  # server_lookup_and_lock / server_unpin
+├── test_cxl_remote_controller.py               # handshake, lookup, dedup, unpin
+├── test_cxl_remote_io_adapter.py               # connect_peer, fetch, unlock with mock mmap
+└── test_cxl_e2e.py                             # end-to-end: local + remote CXL prefetch
+```
