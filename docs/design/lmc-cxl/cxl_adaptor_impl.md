@@ -2,7 +2,7 @@
 
 **Status**: Draft
 **Author**: weishu@tensormesh.ai
-**Date**: 2026-04-22
+**Date**: 2026-04-23
 
 Implementation companion to [cxl_adaptor.md](cxl_adaptor.md).
 
@@ -460,18 +460,43 @@ def _handle_unpin(self, msg: CxlUnpinRequest) -> None:
 `register_peer(config)`:
 1. Open ZMQ REQ channel to peer.
 2. Send `CxlInitRequest { get_local_metadata() }`, receive `CxlInitResponse`.
-3. Call `_cxl_io_adapter.connect_peer(peer_id, endpoint, unpin_endpoint, server_region_meta)`.
+3. Call `_remote_l2_adapter.connect_peer(peer_id, endpoint, unpin_endpoint, server_region_meta)`.
 4. Store `PeerState`.
 
-`unregister_peer(peer_id)`: calls `_cxl_io_adapter.disconnect_peer(peer_id)`.
+`unregister_peer(peer_id)`: calls `_remote_l2_adapter.disconnect_peer(peer_id)`.
 
 Reconnect thread: same pattern as `ZMQRemoteController`.
 
+`CxlRemoteController` holds `_remote_l2_adapter: CxlRemoteL2Adapter` as a
+concrete type (not `L2AdapterInterface`) so it can call peer lifecycle methods
+not part of the interface.
+
 ---
 
-## 6. `CxlRemoteIOAdapter`
+## 6. `CxlRemoteL2Adapter`
 
-Client-side: ZMQ lookup fan-out + DAX window memcpy.
+Implements `L2AdapterInterface` directly — no separate IO adapter layer.
+Owns ZMQ channels, peer DAX window mmaps, and the handle cache.
+`CxlRemoteController` additionally calls peer lifecycle methods on a concrete
+reference; `PrefetchController` uses it only through `L2AdapterInterface`.
+
+Supports two access modes via `CxlRemoteL2AdapterConfig.access_mode`:
+
+- **`dram_bounce`** (default): peer CXL → CPU `memcpy` → local DRAM → GPU.
+  `requires_pre_allocation() = True`.
+- **`gpu_direct`**: peer CXL → GPU DMA directly from peer DAX window VA.
+  `requires_pre_allocation() = False`.  Also implements `L1ManagerListener`
+  to defer `CxlUnpinRequest` until the L1 read lock is released (GPU done).
+
+### Config
+
+```python
+@dataclass
+class CxlRemoteL2AdapterConfig:
+    access_mode: Literal["dram_bounce", "gpu_direct"] = "dram_bounce"
+```
+
+### Internal types
 
 ```python
 @dataclass
@@ -481,9 +506,7 @@ class CxlPeerRegion:
     region_size: int
     _mmap_obj:   mmap.mmap
     _fd:         int
-```
 
-```python
 @dataclass
 class CxlRemoteHandle:
     peer_id:     str
@@ -491,15 +514,28 @@ class CxlRemoteHandle:
     byte_size:   int
 ```
 
-```python
-class CxlRemoteIOAdapter:
-    """Client-side remote CXL I/O: ZMQ lookup fan-out + DAX memcpy.
+### Interface
 
-    Handle cache lifecycle mirrors RemoteIOAdapter:
-      _handle_cache[task_id] created by submit_lookup_task,
-      read (not removed) by submit_fetch_task,
-      fully released by submit_unlock.
+```python
+class CxlRemoteL2Adapter(L2AdapterInterface):
+    """Client-side remote CXL adapter: ZMQ lookup fan-out + peer DAX access.
+
+    Implements L2AdapterInterface for PrefetchController.
+    In gpu_direct mode also implements L1ManagerListener to defer remote
+    unlock until the engine releases its L1 read lock (GPU DMA complete).
+
+    Store operations raise NotImplementedError (remote peers are read-only).
+
+    Handle cache lifecycle:
+      _handle_cache[task_id] created by submit_lookup_and_lock_task,
+      read (not removed) by submit_load_task,
+      released by submit_unlock (dram_bounce) or on_l1_keys_read_finished
+      (gpu_direct).
     """
+
+    # ------------------------------------------------------------------
+    # Peer lifecycle — called by CxlRemoteController (concrete reference)
+    # ------------------------------------------------------------------
 
     def connect_peer(
         self,
@@ -510,58 +546,178 @@ class CxlRemoteIOAdapter:
     ) -> None:
         """Open ZMQ channels and mmap peer DAX device window.
 
+        In gpu_direct mode, also calls
+        cudaHostRegister(peer_region.va_base, peer_meta.region_size)
+        so the GPU can DMA directly from the peer CXL NUMA VA.
+
         Args:
-            peer_id:         Logical peer ID.
-            endpoint:        ZMQ REQ endpoint for lookup traffic.
-            unpin_endpoint:  ZMQ PUSH endpoint for fire-and-forget unpins.
-            peer_meta:       CxlRegionMeta from CxlInitResponse.
+            peer_id:        Logical peer ID.
+            endpoint:       ZMQ REQ endpoint for lookup traffic.
+            unpin_endpoint: ZMQ PUSH endpoint for fire-and-forget unpins.
+            peer_meta:      CxlRegionMeta from CxlInitResponse.
         """
         # mmap peer's DAX device:
         #   fd = os.open(peer_meta.dax_device_path, os.O_RDWR)
         #   m  = mmap.mmap(fd, peer_meta.region_size, MAP_SHARED, PROT_READ)
         # Store CxlPeerRegion.
+        # if gpu_direct: cudaHostRegister(peer_region.va_base, region_size)
 
     def disconnect_peer(self, peer_id: str) -> None:
-        """Close ZMQ channels and munmap peer DAX window."""
+        """Close ZMQ channels; cudaHostUnregister + munmap peer DAX window."""
 
     def get_disconnected_peers(self) -> list[str]:
-        """Return peers that timed out during lookup. (mirrors RemoteIOAdapter)"""
+        """Return peers that timed out during lookup fan-out."""
 
-    def submit_lookup_task(self, keys: list[ObjectKey]) -> IOTaskId:
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — event fds
+    # ------------------------------------------------------------------
+
+    def get_store_event_fd(self) -> int:
+        """Not supported; raises NotImplementedError."""
+        raise NotImplementedError
+
+    def get_lookup_and_lock_event_fd(self) -> int:
+        """Eventfd signaled when a lookup task result is ready."""
+
+    def get_load_event_fd(self) -> int:
+        """Eventfd signaled when a load task completes."""
+
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — requires_pre_allocation
+    # ------------------------------------------------------------------
+
+    def requires_pre_allocation(self) -> bool:
+        """Return True in dram_bounce mode, False in gpu_direct mode.
+
+        gpu_direct: submit_load_task registers REMOTE_CXL_SHADOW objects
+        in L1Manager; no DRAM buffer is needed or expected (objects=[]).
+        """
+        return self._access_mode == "dram_bounce"
+
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — store (unsupported)
+    # ------------------------------------------------------------------
+
+    def submit_store_task(self, keys, objects) -> L2TaskId:
+        raise NotImplementedError
+
+    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
+        raise NotImplementedError
+
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — lookup and lock
+    # ------------------------------------------------------------------
+
+    def submit_lookup_and_lock_task(self, keys: list[ObjectKey]) -> L2TaskId:
         """Fan-out CxlLookupRequest to all connected peers (background thread).
-        Builds _handle_cache[task_id] from aggregated responses.
-        Signals lookup_efd on completion."""
 
-    def query_lookup_result(self, task_id: IOTaskId) -> Bitmap | None:
+        Builds _handle_cache[task_id] from aggregated responses.
+        Signals lookup_and_lock_efd on completion.
+
+        Args:
+            keys: Keys to look up across all peers.
+
+        Returns:
+            Task ID for use with query_lookup_and_lock_result.
+        """
+
+    def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
         """One-shot query. Returns Bitmap where bit i = key i found on any peer."""
 
-    def submit_fetch_task(
-        self,
-        keys: list[ObjectKey],
-        local_objs: list[MemoryObj],   # pre-allocated DRAM write buffers
-        lookup_task_id: IOTaskId | None = None,
-    ) -> IOTaskId:
-        """Issue parallel memcpy per key from mapped peer DAX window to local DRAM.
-
-        Per-key: memcpy(local_obj.data_ptr() ← peer_region.va_base + byte_offset,
-                        byte_size)
-        Uses ThreadPoolExecutor. Signals fetch_efd on completion."""
-
-    def query_fetch_result(self, task_id: IOTaskId) -> Bitmap | None:
-        """One-shot query. Returns Bitmap of successfully copied keys."""
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — unlock
+    # ------------------------------------------------------------------
 
     def submit_unlock(
         self,
         keys: list[ObjectKey],
-        lookup_task_id: IOTaskId | None = None,
+        lookup_task_id: L2TaskId | None = None,
     ) -> None:
-        """Send CxlUnpinRequest to owning peer for each key.
-        Removes entries from _handle_cache[lookup_task_id].
-        Deletes _handle_cache entry once all keys for that task are unlocked."""
+        """Release remote lock for each key.
 
-    def get_lookup_event_fd(self) -> int: ...
-    def get_fetch_event_fd(self) -> int: ...
-    def close(self) -> None: ...
+        dram_bounce: sends CxlUnpinRequest immediately (data already in DRAM).
+        gpu_direct:  no-op — actual CxlUnpinRequest is deferred to
+                     on_l1_keys_read_finished (fired when GPU DMA completes and
+                     engine releases L1 read lock).
+
+        Args:
+            keys:           Keys whose remote locks should be released.
+            lookup_task_id: Task ID from submit_lookup_and_lock_task.
+        """
+
+    # ------------------------------------------------------------------
+    # L2AdapterInterface — load
+    # ------------------------------------------------------------------
+
+    def submit_load_task(
+        self,
+        keys: list[ObjectKey],
+        objects: list[MemoryObj],
+        lookup_task_id: L2TaskId | None = None,
+    ) -> L2TaskId:
+        """Load found keys from remote CXL peer.
+
+        dram_bounce: memcpy(objects[i].data_ptr() ← peer_va, byte_size) per
+            key using ThreadPoolExecutor. Signals load_efd on completion.
+
+        gpu_direct: for each key, create TensorMemoryObj(peer_va,
+            REMOTE_CXL_SHADOW) and call L1Manager.register_shadow write-locked.
+            Store key → CxlRemoteHandle in _pending_remote_unpin.
+            Signals load_efd immediately (no copy). objects must be [].
+
+        Args:
+            keys:           Keys to load (subset of prior lookup found keys).
+            objects:        Pre-allocated DRAM buffers (dram_bounce) or []
+                            (gpu_direct).
+            lookup_task_id: Originating lookup task ID; resolves handle cache.
+
+        Returns:
+            Task ID for use with query_load_result.
+        """
+
+    def query_load_result(self, task_id: L2TaskId) -> Bitmap | None:
+        """One-shot query. Returns Bitmap of successfully loaded keys."""
+
+    # ------------------------------------------------------------------
+    # L1ManagerListener — gpu_direct mode only
+    # ------------------------------------------------------------------
+
+    def on_l1_keys_read_finished(self, keys: list[ObjectKey]) -> None:
+        """Fire deferred CxlUnpinRequests for REMOTE_CXL_SHADOW keys.
+
+        Called by L1Manager (inside finish_read) when the engine releases
+        its read lock — i.e., after GPU DMA completes and the engine calls
+        finish_read_prefetched().  Only acts on keys present in
+        _pending_remote_unpin; ignores all others.
+
+        Must be fast and must NOT call any L1Manager method (deadlock).
+        Sends CxlUnpinRequest via ZMQ PUSH socket (fire-and-forget).
+
+        Args:
+            keys: Keys whose L1 read locks were just released.
+        """
+
+    def on_l1_keys_reserved_read(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_reserved_write(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_write_finished(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_finish_write_and_reserve_read(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    def on_l1_keys_deleted_by_manager(self, keys: list[ObjectKey]) -> None:
+        """No-op."""
+
+    # ------------------------------------------------------------------
+    # Cleanup
+    # ------------------------------------------------------------------
+
+    def close(self) -> None:
+        """Close ZMQ sockets; cudaHostUnregister + munmap all peer DAX windows."""
 ```
 
 ### Peer address formula
@@ -571,81 +727,48 @@ class CxlRemoteIOAdapter:
 byte_offset = obj.data_ptr() - _region_va_base
 byte_size   = obj.phy_size
 
-# On client (CxlRemoteIOAdapter.submit_fetch_task):
-peer_va   = peer_region.va_base + byte_offset
-ctypes.memmove(local_obj.data_ptr(), peer_va, byte_size)
+# On client — dram_bounce (submit_load_task):
+peer_va = peer_region.va_base + byte_offset
+ctypes.memmove(objects[i].data_ptr(), peer_va, byte_size)
+
+# On client — gpu_direct (submit_load_task):
+peer_va = peer_region.va_base + byte_offset
+# TensorMemoryObj wrapping peer_va with meta.fmt = REMOTE_CXL_SHADOW
+# GPU cudaMemcpy(gpu_dst ← peer_va) issued by PrefetchController / engine
 ```
 
 Both values are byte-granular; no page-size dependency.
 
----
-
-## 7. `CxlRemoteL2Adapter`
-
-Wraps `CxlRemoteIOAdapter` with the `L2AdapterInterface` contract.
-Mirrors `RemoteL2Adapter` exactly — store operations raise `NotImplementedError`.
+### `gpu_direct` internal state
 
 ```python
-class CxlRemoteL2Adapter(L2AdapterInterface):
-    """L2AdapterInterface backed by CxlRemoteIOAdapter.
-
-    read-only: remote CXL peers are lookup/fetch sources only.
-    requires_pre_allocation() returns True (default): PrefetchController
-    must reserve DRAM write buffers before calling submit_load_task.
-    """
-
-    def __init__(self, io: CxlRemoteIOAdapter) -> None: ...
-
-    def get_store_event_fd(self) -> int:
-        raise NotImplementedError
-
-    def get_lookup_and_lock_event_fd(self) -> int:
-        return self._io.get_lookup_event_fd()
-
-    def get_load_event_fd(self) -> int:
-        return self._io.get_fetch_event_fd()
-
-    def submit_store_task(self, ...) -> L2TaskId:
-        raise NotImplementedError
-
-    def pop_completed_store_tasks(self) -> dict[L2TaskId, bool]:
-        raise NotImplementedError
-
-    def submit_lookup_and_lock_task(self, keys) -> L2TaskId:
-        return self._io.submit_lookup_task(keys)
-
-    def query_lookup_and_lock_result(self, task_id) -> Bitmap | None:
-        return self._io.query_lookup_result(task_id)
-
-    def submit_unlock(self, keys, lookup_task_id=None) -> None:
-        self._io.submit_unlock(keys, lookup_task_id=lookup_task_id)
-
-    def submit_load_task(self, keys, objects, lookup_task_id=None) -> L2TaskId:
-        return self._io.submit_fetch_task(keys, objects, lookup_task_id=lookup_task_id)
-
-    def query_load_result(self, task_id) -> Bitmap | None:
-        return self._io.query_fetch_result(task_id)
-
-    def close(self) -> None:
-        self._io.close()
+# Added fields for gpu_direct mode:
+_l1_manager:            L1Manager           # injected; needed for register_shadow
+_pending_remote_unpin:  dict[ObjectKey, CxlRemoteHandle]
+_pending_unpin_lock:    threading.Lock
 ```
+
+`_pending_remote_unpin` is populated in `submit_load_task` (one entry per
+loaded key) and drained in `on_l1_keys_read_finished`.  The lock guards
+concurrent access between the PrefetchController thread (writer) and the
+L1Manager callback thread (reader/drainer).
 
 ---
 
-## 8. Integration Points Summary
+## 7. Integration Points Summary
 
 | Component | Change |
 |---|---|
-| `memory_management.py` | Add `MemoryFormat.CXL_SHADOW` |
+| `memory_management.py` | Add `MemoryFormat.CXL_SHADOW`, `MemoryFormat.REMOTE_CXL_SHADOW` |
 | `distributed/l1_manager.py` | Add `register_shadow()` + TieringPolicy hook in `reserve_write` |
-| `distributed/memory_manager.py` | Add `CXL_SHADOW` format guard in `free()` |
+| `distributed/memory_manager.py` | Skip `CXL_SHADOW` and `REMOTE_CXL_SHADOW` objects in `free()` |
 | `distributed/l2_adapters/base.py` | Add `requires_pre_allocation() → bool` (default `True`) |
 | `distributed/storage_controllers/prefetch_controller.py` | Split `_transition_to_load_phase` to handle `requires_pre_allocation=False` adapters |
-| `distributed/storage_manager.py` | Accept `CxlAdaptor` + `CxlRemoteL2Adapter` as optional L2 adapters |
+| `distributed/storage_manager.py` | Accept `CxlAdaptor` + `CxlRemoteL2Adapter` as optional L2 adapters; register `CxlRemoteL2Adapter` as `L1ManagerListener` when in `gpu_direct` mode |
 
 ---
 
-## 9. File Structure
+## 8. File Structure
 
 ```
 lmcache/v1/
@@ -667,9 +790,8 @@ lmcache/v1/
         │                                       # ZMQCxlControlChannel (lazy-pirate)
         ├── protocol.py                         # CxlRegionMeta, CxlInitRequest/Response,
         │                                       # CxlLookupRequest/Response, CxlUnpinRequest
-        ├── remote_io_adapter.py                # CxlRemoteIOAdapter, CxlPeerRegion,
-        │                                       # CxlRemoteHandle, IOTaskId
-        └── remote_l2_adapter.py                # CxlRemoteL2Adapter
+        └── remote_l2_adapter.py                # CxlRemoteL2Adapter, CxlRemoteL2AdapterConfig
+                                                # CxlPeerRegion, CxlRemoteHandle
 
 tests/v1/distributed/cxl/
 ├── test_cxl_adaptor.py                         # alloc, store, lookup, shadow cycle
@@ -677,6 +799,8 @@ tests/v1/distributed/cxl/
 ├── test_cxl_eviction_consistency.py            # Path A + Path B under concurrent access
 ├── test_cxl_server_methods.py                  # server_lookup_and_lock / server_unpin
 ├── test_cxl_remote_controller.py               # handshake, lookup, dedup, unpin
-├── test_cxl_remote_io_adapter.py               # connect_peer, fetch, unlock with mock mmap
+├── test_cxl_remote_l2_adapter.py               # dram_bounce + gpu_direct modes;
+│                                               # connect_peer, load, unlock, deferred unpin
 └── test_cxl_e2e.py                             # end-to-end: local + remote CXL prefetch
+                                                # (both dram_bounce and gpu_direct)
 ```

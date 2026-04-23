@@ -2,7 +2,7 @@
 
 **Status**: Draft
 **Author**: weishu@tensormesh.ai
-**Date**: 2026-04-22
+**Date**: 2026-04-23
 
 Companion to [cxl_adaptor_impl.md](cxl_adaptor_impl.md) (implementation details).
 
@@ -52,8 +52,22 @@ cudaHostRegister(_region_va_base, config.region_size, cudaHostRegisterDefault)
 |---|---|---|
 | `CxlAdaptor` | `L1ManagerListener` + `L2AdapterInterface` | Local CXL: allocation, shadow registration, GPU transfer, local L2 lookup/load/store |
 | `CxlRemoteController` | — | ZMQ server: lookup requests from remote clients against local `CxlAdaptor._index` |
-| `CxlRemoteIOAdapter` | — | Client-side: ZMQ lookup fan-out to peers, DAX window memcpy for data transfer |
-| `CxlRemoteL2Adapter` | `L2AdapterInterface` | L2 wrapper around `CxlRemoteIOAdapter` (read-only) |
+| `CxlRemoteL2Adapter` | `L2AdapterInterface` (+ optionally `L1ManagerListener`) | Client-side: ZMQ lookup fan-out to peers, peer DAX window access, peer lifecycle. Two access modes: DRAM-bounce and GPU-direct. |
+
+`CxlRemoteL2Adapter` implements `L2AdapterInterface` directly — there is no
+separate IO adapter layer.  Unlike the NIXL split (`RemoteIOAdapter` +
+`RemoteL2Adapter`), the CXL client has no RDMA memory registration or
+multi-step descriptor exchange, so the two-class separation adds no value.
+`CxlRemoteController` holds a concrete `CxlRemoteL2Adapter` reference and
+calls peer lifecycle methods (`connect_peer`, `disconnect_peer`,
+`get_disconnected_peers`) on it directly.
+
+`CxlRemoteL2Adapter` supports two access modes selected at construction time:
+
+| Mode | `requires_pre_allocation` | Data path | When to use |
+|---|---|---|---|
+| `dram_bounce` (default) | `True` | peer CXL → local DRAM → GPU | Conservative; always correct |
+| `gpu_direct` | `False` | peer CXL → GPU directly (no DRAM copy) | CXL fabric supports `cudaHostRegister` on peer DAX window |
 
 **Control plane** (`CxlRemoteController`) is modelled after `ZMQRemoteController`
 but queries `CxlAdaptor._index` instead of `L1Manager`.
@@ -76,7 +90,7 @@ L1Manager._objects                       CxlAdaptor._index
 
 `l2_lock_count` guards against CXL-side eviction while the object is in use by
 either the local `PrefetchController` or a remote peer reading via
-`CxlRemoteIOAdapter`.  Both increment/decrement the same counter.
+`CxlRemoteL2Adapter`.  Both increment/decrement the same counter.
 
 ### Benefits
 
@@ -112,8 +126,10 @@ def requires_pre_allocation(self) -> bool:
 per adapter and only reserve L1 write buffers for adapters that need them.
 Adapters returning `False` receive `objects=[]` in `submit_load_task`.
 
-`CxlRemoteL2Adapter` returns `True` (default) because remote data must land in
-a pre-allocated DRAM buffer via `memcpy`.
+`CxlRemoteL2Adapter` returns `True` in `dram_bounce` mode (remote data lands in
+a pre-allocated DRAM buffer via `memcpy`) and `False` in `gpu_direct` mode
+(adapter registers a `REMOTE_CXL_SHADOW` object in `L1Manager` so the GPU can
+DMA directly from the peer DAX window VA).
 
 ---
 
@@ -177,45 +193,101 @@ sequenceDiagram
     Note over CXL: decrement l2_lock_count; free if pending_free
 ```
 
-### 4.3 Remote CXL Read (PrefetchController → CxlRemoteL2Adapter)
+### 4.3 Remote CXL Read — Variant A: DRAM bounce (`dram_bounce` mode)
 
-`CxlRemoteL2Adapter.requires_pre_allocation()` returns `True`.
-`PrefetchController` pre-allocates DRAM buffers and passes them to
-`submit_load_task`.  Data flows: peer CXL NUMA → local DRAM via `memcpy`
-over the CXL fabric.
+`requires_pre_allocation()` returns `True`.  `PrefetchController` pre-allocates
+local DRAM buffers.  Data flows: peer CXL NUMA → local DRAM via CPU `memcpy`,
+then GPU reads from DRAM.  Remote `l2_lock_count` is released as soon as
+`memcpy` finishes — the peer can evict safely at that point.
 
 ```mermaid
 sequenceDiagram
     participant PC  as PrefetchController (local)
-    participant RIA as CxlRemoteIOAdapter (local)
+    participant RL2 as CxlRemoteL2Adapter (local)
     participant RC  as CxlRemoteController (peer)
     participant CXL as CxlAdaptor (peer)
     participant WIN as Peer DAX Window (local mmap)
 
-    PC  ->> RIA: submit_lookup_task(keys)
-    Note over RIA: fan-out ZMQ CxlLookupRequest to all peers (background)
-    RIA ->> RC:  CxlLookupRequest(request_id, keys)
+    PC  ->> RL2: submit_lookup_and_lock_task(keys)
+    Note over RL2: fan-out ZMQ CxlLookupRequest to all peers (background)
+    RL2 ->> RC:  CxlLookupRequest(request_id, keys)
     RC  ->> CXL: server_lookup_and_lock(keys)
     Note over CXL: check _index; increment l2_lock_count; return byte_offsets
-    RC -->> RIA: CxlLookupResponse(found_positions, byte_offsets, byte_sizes)
-    Note over RIA: cache CxlRemoteHandle per key; signal lookup_efd
+    RC -->> RL2: CxlLookupResponse(found_positions, byte_offsets, byte_sizes)
+    Note over RL2: cache CxlRemoteHandle per key; signal lookup_and_lock_efd
 
     Note over PC: requires_pre_allocation() = True → reserve_write(found_keys)
 
-    PC  ->> RIA: submit_fetch_task(found_keys, dram_objs, lookup_task_id)
-    Note over RIA: for each key: memcpy(dram_obj.ptr ← WIN.va + byte_offset, byte_size)
-    RIA ->> WIN: parallel memcpy (ThreadPoolExecutor)
-    Note over RIA: signal fetch_efd on completion
+    PC  ->> RL2: submit_load_task(found_keys, dram_objs, lookup_task_id)
+    Note over RL2: peer_va = WIN.va_base + byte_offset<br/>memcpy(dram_obj.ptr ← peer_va, byte_size) per key
+    RL2 ->> WIN: parallel memcpy (ThreadPoolExecutor)
+    Note over RL2: signal load_efd on completion
 
     PC  ->> L1:  finish_write_and_reserve_read(loaded_keys)
 
-    PC  ->> RIA: submit_unlock(keys, lookup_task_id)
-    RIA ->> RC:  CxlUnpinRequest(request_id, found_keys)
+    PC  ->> RL2: submit_unlock(keys, lookup_task_id)
+    Note over RL2: data already in DRAM — safe to unpin immediately
+    RL2 ->> RC:  CxlUnpinRequest(request_id, found_keys)
     RC  ->> CXL: server_unpin(keys)
     Note over CXL: decrement l2_lock_count; free if pending_free
 ```
 
-### 4.4 Eviction Consistency
+### 4.4 Remote CXL Read — Variant B: GPU-direct (`gpu_direct` mode)
+
+`requires_pre_allocation()` returns `False`.  `PrefetchController` skips
+`reserve_write`.  `submit_load_task` registers a `REMOTE_CXL_SHADOW` object in
+`L1Manager` whose `data_ptr()` points directly into the peer DAX window VA
+(`peer_region.va_base + byte_offset`).  The GPU DMA reads from that address
+over the CXL fabric — no local DRAM copy.
+
+The peer's `l2_lock_count` must stay > 0 until the GPU DMA completes (not just
+until the load task signals done).  `CxlRemoteL2Adapter` implements
+`L1ManagerListener`: `submit_unlock` is a no-op; the actual `CxlUnpinRequest`
+fires in `on_l1_keys_read_finished`, which is called when the engine releases
+its L1 read lock after GPU DMA completes.
+
+```mermaid
+sequenceDiagram
+    participant PC  as PrefetchController (local)
+    participant RL2 as CxlRemoteL2Adapter (local)
+    participant L1  as L1Manager (local)
+    participant RC  as CxlRemoteController (peer)
+    participant CXL as CxlAdaptor (peer)
+    participant WIN as Peer DAX Window (cudaHostRegistered mmap)
+    participant GPU as GPU
+
+    PC  ->> RL2: submit_lookup_and_lock_task(keys)
+    RL2 ->> RC:  CxlLookupRequest(request_id, keys)
+    RC  ->> CXL: server_lookup_and_lock(keys)
+    Note over CXL: increment l2_lock_count; return byte_offsets
+    RC -->> RL2: CxlLookupResponse(found_positions, byte_offsets, byte_sizes)
+
+    Note over PC: requires_pre_allocation() = False → skip reserve_write
+
+    PC  ->> RL2: submit_load_task(found_keys, objects=[], lookup_task_id)
+    Note over RL2: peer_va = WIN.va_base + byte_offset<br/>create TensorMemoryObj(peer_va, REMOTE_CXL_SHADOW)<br/>store key→handle in _pending_remote_unpin
+    RL2 ->> L1:  register_shadow(key, remote_shadow_obj) write-locked
+    Note over RL2: signal load_efd immediately (no copy needed)
+
+    PC  ->> L1:  finish_write_and_reserve_read(loaded_keys)
+    Note over L1: shadow transitions write-locked → read-locked
+
+    PC  ->> RL2: submit_unlock(keys, lookup_task_id)
+    Note over RL2: gpu_direct mode — no-op<br/>remote lock held until GPU done
+
+    Note over PC: engine reads prefetched results
+    PC  ->> GPU: cudaMemcpy(gpu_dst ← remote_shadow_obj.data_ptr())
+    Note over GPU: GPU DMA reads directly from peer CXL NUMA VA
+
+    Note over PC: engine calls finish_read_prefetched → L1.finish_read
+    L1  ->> RL2: on_l1_keys_read_finished(keys)  [L1ManagerListener callback]
+    Note over RL2: read from _pending_remote_unpin; send deferred CxlUnpinRequest
+    RL2 ->> RC:  CxlUnpinRequest(request_id, found_keys)
+    RC  ->> CXL: server_unpin(keys)
+    Note over CXL: decrement l2_lock_count; free if pending_free
+```
+
+### 4.5 Eviction Consistency
 
 CXL-side eviction must not free pages while `l2_lock_count > 0`.
 
@@ -362,15 +434,14 @@ callers (local and remote) increment/decrement under `_lock`.
 
 | Component | Change | Notes |
 |---|---|---|
-| `MemoryFormat` | Add `CXL_SHADOW` | Tag on `TensorMemoryObj.meta.fmt` |
+| `MemoryFormat` | Add `CXL_SHADOW`, `REMOTE_CXL_SHADOW` | Tags on `TensorMemoryObj.meta.fmt`; both skipped by `L1MemoryManager.free()` |
 | `L1Manager` | Add `register_shadow()` + TieringPolicy branch in `reserve_write` | ~40 lines |
 | `L1MemoryManager.free()` | Skip `CXL_SHADOW` objects | Freed by `CxlAdaptor._allocator` only |
 | `L2AdapterInterface` | Add `requires_pre_allocation() → bool` (default `True`) | Non-breaking; existing adapters unchanged |
 | `PrefetchController` | Check `requires_pre_allocation()` per adapter in `_transition_to_load_phase` | Skip `reserve_write` + pass `objects=[]` for `False` adapters |
 | `CxlAdaptor` | New file | Local CXL L2 adapter + server-side index methods |
 | `CxlRemoteController` | New file | ZMQ server; queries `CxlAdaptor` |
-| `CxlRemoteIOAdapter` | New file | Client-side ZMQ fan-out + memcpy |
-| `CxlRemoteL2Adapter` | New file | `L2AdapterInterface` wrapper |
+| `CxlRemoteL2Adapter` | New file | Client-side `L2AdapterInterface` (+`L1ManagerListener` in `gpu_direct` mode): ZMQ lookup fan-out, peer DAX access, peer lifecycle, two access modes |
 | Engine / consumer | Check `CXL_SHADOW`, call `transfer_to_gpu` | Single dispatch point |
 | `RemoteController` / `StoreController` | **unchanged** | Format-agnostic |
 
