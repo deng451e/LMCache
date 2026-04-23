@@ -70,6 +70,14 @@ class MemoryFormat(Enum):
     """[1, num_layers, num_tokens, aligned_head_size]
     """
 
+    CXL_SHADOW = auto()
+    """Shadow page in CXL NUMA memory; owned exclusively by CxlAdaptor.
+    Skipped by L1MemoryManager.free() — CxlAdaptor manages lifetime."""
+
+    REMOTE_CXL_SHADOW = auto()
+    """View into remote peer's CXL NUMA region via DAX window VA.
+    Skipped by L1MemoryManager.free() — memory is remote; never freed locally."""
+
     def token_dim(self) -> int:
         if self == MemoryFormat.KV_2LTD:
             return 2

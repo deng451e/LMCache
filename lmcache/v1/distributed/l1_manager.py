@@ -5,7 +5,7 @@ Managing objects and memory for L1 cache
 
 # Standard
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 import threading
 
 # First Party
@@ -19,6 +19,10 @@ from lmcache.v1.distributed.memory_manager import L1MemoryManager
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.mp_observability.event import Event, EventType
 from lmcache.v1.mp_observability.event_bus import get_event_bus
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.cxl.adaptor import CxlAdaptor, TieringPolicy
 
 logger = init_logger(__name__)
 
@@ -171,6 +175,9 @@ class L1Manager:
 
         self._event_bus = get_event_bus()
 
+        self._cxl_adaptor: "CxlAdaptor | None" = None
+        self._tiering_policy: "TieringPolicy | None" = None
+
     def register_listener(self, listener: L1ManagerListener) -> None:
         """Register a listener for L1Manager events.
 
@@ -179,6 +186,67 @@ class L1Manager:
         """
         with self._lock:
             self._registered_listeners.append(listener)
+
+    def set_cxl_adaptor(
+        self,
+        cxl_adaptor: "CxlAdaptor",
+        tiering_policy: "TieringPolicy",
+    ) -> None:
+        """Inject a CXL adaptor and tiering policy for use in reserve_write.
+
+        Must be called before any reserve_write calls that should route to CXL.
+
+        Args:
+            cxl_adaptor: The CxlAdaptor instance that owns the CXL sub-region.
+            tiering_policy: Policy deciding per-key whether to allocate in CXL.
+        """
+        with self._lock:
+            self._cxl_adaptor = cxl_adaptor
+            self._tiering_policy = tiering_policy
+
+    @l1_mgr_synchronized
+    def register_shadow(
+        self,
+        key: ObjectKey,
+        obj: MemoryObj,
+        is_temporary: bool = False,
+    ) -> L1Error:
+        """Register a pre-allocated CXL shadow object as write-locked in L1.
+
+        Called from CxlAdaptor.submit_load_task while L1._lock is NOT held,
+        so acquiring the lock here is safe.  The object is registered in
+        write-locked state; the caller must call finish_write to make it readable.
+
+        Args:
+            key: The object key.
+            obj: Pre-allocated CXL TensorMemoryObj (MemoryFormat.CXL_SHADOW or
+                REMOTE_CXL_SHADOW).  CxlAdaptor owns the lifecycle; L1MemoryManager
+                will not free it.
+            is_temporary: Whether the object should be deleted after the first read.
+
+        Returns:
+            L1Error.SUCCESS on success.
+            L1Error.KEY_NOT_WRITABLE if the key already exists in L1.
+        """
+        if key in self._objects:
+            return L1Error.KEY_NOT_WRITABLE
+        state = L1ObjectState(
+            memory_obj=obj,
+            write_lock=TTLLock(self._write_ttl_seconds),
+            read_lock=TTLLock(self._read_ttl_seconds),
+            is_temporary=is_temporary,
+        )
+        state.write_lock.lock()
+        self._objects[key] = state
+        for listener in self._registered_listeners:
+            listener.on_l1_keys_reserved_write([key])
+        self._event_bus.publish(
+            Event(
+                event_type=EventType.L1_WRITE_RESERVED,
+                metadata={"keys": [key]},
+            )
+        )
+        return L1Error.SUCCESS
 
     @l1_mgr_synchronized
     def reserve_read(
@@ -436,31 +504,63 @@ class L1Manager:
                 ret[key] = (L1Error.KEY_NOT_WRITABLE, None)
             return ret
 
-        err, allocated_objs = self._memory_manager.allocate(
-            layout_desc, len(need_to_allocate)
-        )
-
-        if err != L1Error.SUCCESS:
-            for key, _ in need_to_allocate:
-                ret[key] = (L1Error.OUT_OF_MEMORY, None)
-
-            # Free the memory if partial allocation succeeded
-            if allocated_objs:
-                self._memory_manager.free(allocated_objs)
-
+        # Split candidates by tiering policy (CXL vs DRAM)
+        cxl_candidates: list[tuple[ObjectKey, bool]] = []
+        dram_candidates: list[tuple[ObjectKey, bool]] = []
+        if self._cxl_adaptor is not None and self._tiering_policy is not None:
+            for key, is_temp in need_to_allocate:
+                if self._tiering_policy.should_use_cxl(key, layout_desc):
+                    cxl_candidates.append((key, is_temp))
+                else:
+                    dram_candidates.append((key, is_temp))
         else:
-            for (key, is_temp), mem_obj in zip(
-                need_to_allocate, allocated_objs, strict=False
-            ):
-                self._objects[key] = L1ObjectState(
-                    memory_obj=mem_obj,
-                    write_lock=TTLLock(self._write_ttl_seconds),
-                    read_lock=TTLLock(self._read_ttl_seconds),
-                    is_temporary=is_temp,
-                )
-                self._objects[key].write_lock.lock()
-                ret[key] = (L1Error.SUCCESS, mem_obj)
-                successful_keys.append(key)
+            dram_candidates = need_to_allocate
+
+        # CXL allocation — MUST NOT call any L1Manager method
+        # (this runs inside @l1_mgr_synchronized; _evict_one would deadlock).
+        # cxl_allocate() returns None on OOM; background eviction reclaims space.
+        for key, is_temp in cxl_candidates:
+            obj = self._cxl_adaptor.cxl_allocate(key, layout_desc, is_temp)  # type: ignore[union-attr]
+            if obj is None:
+                ret[key] = (L1Error.OUT_OF_MEMORY, None)
+                continue
+            self._objects[key] = L1ObjectState(
+                memory_obj=obj,
+                write_lock=TTLLock(self._write_ttl_seconds),
+                read_lock=TTLLock(self._read_ttl_seconds),
+                is_temporary=is_temp,
+            )
+            self._objects[key].write_lock.lock()
+            ret[key] = (L1Error.SUCCESS, obj)
+            successful_keys.append(key)
+
+        # DRAM allocation (existing path)
+        if dram_candidates:
+            err, allocated_objs = self._memory_manager.allocate(
+                layout_desc, len(dram_candidates)
+            )
+
+            if err != L1Error.SUCCESS:
+                for key, _ in dram_candidates:
+                    ret[key] = (L1Error.OUT_OF_MEMORY, None)
+
+                # Free the memory if partial allocation succeeded
+                if allocated_objs:
+                    self._memory_manager.free(allocated_objs)
+
+            else:
+                for (key, is_temp), mem_obj in zip(
+                    dram_candidates, allocated_objs, strict=False
+                ):
+                    self._objects[key] = L1ObjectState(
+                        memory_obj=mem_obj,
+                        write_lock=TTLLock(self._write_ttl_seconds),
+                        read_lock=TTLLock(self._read_ttl_seconds),
+                        is_temporary=is_temp,
+                    )
+                    self._objects[key].write_lock.lock()
+                    ret[key] = (L1Error.SUCCESS, mem_obj)
+                    successful_keys.append(key)
 
         for listener in self._registered_listeners:
             listener.on_l1_keys_reserved_write(successful_keys)

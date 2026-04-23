@@ -38,6 +38,10 @@ vllm_default_out="$("${DEFAULT_VENV_BIN}/python" -c "import vllm; print(vllm.__v
 }
 echo "vLLM in default venv (${DEFAULT_VENV_BIN}): ${vllm_default_out}"
 
+# Detect CUDA version from the already-verified default venv torch; fall back to cu128.
+_CUDA_TAG=$("${DEFAULT_VENV_BIN}/python" -c \
+    "import torch; v=torch.version.cuda; print('cu'+v.replace('.',''))" 2>/dev/null || echo "cu128")
+echo "Detected CUDA tag: ${_CUDA_TAG}"
 
 # If uv prompts because /workspace/.venv already exists: use the `--clear` flag or set UV_VENV_CLEAR=1
 # to skip the prompt and recreate; this script defaults to --allow-existing (reuse, non-interactive).
@@ -54,9 +58,9 @@ TEST_VENV_BIN="/workspace/.venv/bin"
 # When flashinfer and flashinfer-cubin resolve to different patch versions, skip strict check.
 export FLASHINFER_DISABLE_VERSION_CHECK=1
 
-"${UV_BIN}" pip install -p "${TEST_VENV_BIN}/python" -U vllm "torch==2.10.0+cu128" --pre \
-    --extra-index-url https://wheels.vllm.ai/nightly/cu128 \
-    --extra-index-url https://download.pytorch.org/whl/cu128 \
+"${UV_BIN}" pip install -p "${TEST_VENV_BIN}/python" -U vllm --pre \
+    --extra-index-url "https://wheels.vllm.ai/nightly/${_CUDA_TAG}" \
+    --extra-index-url "https://download.pytorch.org/whl/${_CUDA_TAG}" \
     --index-strategy unsafe-best-match
 
 

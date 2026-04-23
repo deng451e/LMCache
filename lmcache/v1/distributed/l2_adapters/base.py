@@ -121,6 +121,20 @@ class L2AdapterInterface(ABC):
         """
         pass
 
+    def requires_pre_allocation(self) -> bool:
+        """Whether PrefetchController should call L1Manager.reserve_write
+        before submit_load_task for this adapter.
+
+        Default True (existing adapters unchanged).  CxlAdaptor returns False:
+        it re-registers a CXL_SHADOW object in L1Manager during submit_load_task
+        so no DRAM buffer is needed or expected (objects=[]).
+
+        Returns:
+            True if PrefetchController must pre-allocate L1 write buffers;
+            False if this adapter manages its own memory allocation.
+        """
+        return True
+
     #####################
     # Store Interface
     #####################

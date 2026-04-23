@@ -563,14 +563,24 @@ class PrefetchController(StorageControllerInterface):
             self._complete_request(request.request_id, 0)
             return
 
-        # Step 3: reserve L1 write buffers
-        merged_bitmap = merge_bitmaps(trimmed_plan.values(), len(request.keys))
-        keys_to_reserve = merged_bitmap.gather(request.keys)
+        # Step 3: reserve L1 write buffers for pre-alloc adapters only.
+        # Adapters where requires_pre_allocation()==False (e.g. CxlAdaptor) manage
+        # their own L1 registration inside submit_load_task; no DRAM buffer needed.
+        pre_alloc_bitmap = Bitmap(len(request.keys))
+        no_pre_alloc_bitmap = Bitmap(len(request.keys))
+        for adapter_idx, bitmap in trimmed_plan.items():
+            if self._l2_adapters[adapter_idx].requires_pre_allocation():
+                pre_alloc_bitmap = pre_alloc_bitmap | bitmap
+            else:
+                no_pre_alloc_bitmap = no_pre_alloc_bitmap | bitmap
+
+        keys_to_reserve = pre_alloc_bitmap.gather(request.keys)
+        no_pre_alloc_key_set: set[ObjectKey] = set(
+            no_pre_alloc_bitmap.gather(request.keys)
+        )
         l1_mgr = self._l1_manager
 
-        retentions = self._policy.select_l1_retentions(
-            keys_to_reserve,
-        )
+        retentions = self._policy.select_l1_retentions(keys_to_reserve)
         write_results = l1_mgr.reserve_write(
             keys=keys_to_reserve,
             is_temporary=[not r for r in retentions],
@@ -593,10 +603,12 @@ class PrefetchController(StorageControllerInterface):
                     err,
                 )
 
-        # Step 5: recompute load plan excluding failed reservations
+        # Step 5: recompute load plan excluding failed DRAM reservations.
+        # No-pre-alloc keys (e.g. CXL shadow) are always counted as reserved since
+        # their L1 registration happens inside submit_load_task, not here.
         reserved_bitmap = Bitmap(len(request.keys))
         for i, key in enumerate(request.keys):
-            if key in reserved_key_set:
+            if key in reserved_key_set or key in no_pre_alloc_key_set:
                 reserved_bitmap.set(i)
 
         prefix_length = reserved_bitmap.count_leading_ones()
@@ -626,13 +638,20 @@ class PrefetchController(StorageControllerInterface):
             self._complete_request(request.request_id, 0)
             return
 
-        ## Step 7: submit load tasks per adapter
+        ## Step 7: submit load tasks per adapter.
+        # Pre-alloc adapters receive the reserved MemoryObj buffers.
+        # No-pre-alloc adapters (e.g. CxlAdaptor) receive objects=[] and manage
+        # their own L1 shadow registration inside submit_load_task.
         for adapter_idx, bitmap in trimmed_plan.items():
             per_adapter_keys = bitmap.gather(request.keys)
-            per_adapter_objs = [
-                request.write_reserved_objs[key] for key in per_adapter_keys
-            ]
-            task_id = self._l2_adapters[adapter_idx].submit_load_task(
+            adapter = self._l2_adapters[adapter_idx]
+            if adapter.requires_pre_allocation():
+                per_adapter_objs = [
+                    request.write_reserved_objs[key] for key in per_adapter_keys
+                ]
+            else:
+                per_adapter_objs = []
+            task_id = adapter.submit_load_task(
                 per_adapter_keys,
                 per_adapter_objs,
                 lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),

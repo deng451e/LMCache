@@ -76,6 +76,49 @@ class EvictionConfig:
 
 
 @dataclass
+class CxlConfig:
+    """Configuration for the CXL shared memory cache tier.
+
+    All hosts sharing the CXL region must use the same ``dax_device_path``
+    and ``region_size``.  Each host owns a disjoint sub-region
+    (``subregion_offset``, ``subregion_size``) for writes; any host can
+    read any byte offset.
+    """
+
+    dax_device_path: str
+    """Linux DAX device path, e.g. /dev/dax0.0 (same on all hosts)."""
+
+    region_size: int
+    """Full shared CXL region size in bytes (same on all hosts)."""
+
+    subregion_offset: int
+    """Byte offset of this host's owned sub-region within the global region."""
+
+    subregion_size: int
+    """Size of this host's owned sub-region in bytes."""
+
+    serve_port: int = field(default=5300)
+    """ZMQ REP port for CxlRemoteController init/lookup messages."""
+
+    serve_unpin_port: int | None = field(default=None)
+    """ZMQ PULL port for unpin fire-and-forget messages.
+    Defaults to serve_port + 1 when None."""
+
+    peers: list[PeerConfig] = field(default_factory=list)
+    """Pre-configured CXL peers (peer_id, host, port) to connect to."""
+
+    tiering_policy: str = field(default="always_cxl")
+    """Tiering policy name: 'always_cxl' routes everything to CXL;
+    'size_threshold' routes only large tensors."""
+
+    align_bytes: int = field(default=0x1000)
+    """CXL allocator alignment in bytes."""
+
+    cxl_numa_node: int = field(default=-1)
+    """NUMA node of the CXL device (-1 to disable NUMA binding)."""
+
+
+@dataclass
 class StorageManagerConfig:
     """
     The configuration for the distributed storage manager.
@@ -103,6 +146,9 @@ class StorageManagerConfig:
 
     remote_controller_config: RemoteControllerConfig | None = None
     """ Optional remote controller config. None means no remote P2P/PD. """
+
+    cxl_config: CxlConfig | None = None
+    """Optional CXL shared memory tier config. None means CXL is disabled."""
 
 
 def add_storage_manager_args(
@@ -287,6 +333,76 @@ def add_storage_manager_args(
         help="Per-request ZMQ timeout in milliseconds. Default: 5000.",
     )
 
+    # CXL shared memory tier
+    cxl_group = parser.add_argument_group(
+        "CXL Tier",
+        "Shared CXL NUMA memory as an L2 cache tier.  "
+        "Omit --cxl-dax-device to disable.",
+    )
+    cxl_group.add_argument(
+        "--cxl-dax-device",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Linux DAX device path (same on all hosts), e.g. /dev/dax0.0. "
+        "A regular file works for testing (lmcache will mmap it). "
+        "Omit to disable the CXL tier.",
+    )
+    cxl_group.add_argument(
+        "--cxl-region-size-gb",
+        type=float,
+        default=4.0,
+        help="Full shared CXL region size in GiB (same on all hosts). Default: 4.",
+    )
+    cxl_group.add_argument(
+        "--cxl-subregion-offset-gb",
+        type=float,
+        default=0.0,
+        help="Byte offset (in GiB) of this host's owned sub-region. Default: 0.",
+    )
+    cxl_group.add_argument(
+        "--cxl-subregion-size-gb",
+        type=float,
+        default=2.0,
+        help="Size (in GiB) of this host's owned sub-region. Default: 2.",
+    )
+    cxl_group.add_argument(
+        "--cxl-serve-port",
+        type=int,
+        default=5300,
+        help="ZMQ REP port for CXL init/lookup requests. Default: 5300.",
+    )
+    cxl_group.add_argument(
+        "--cxl-serve-unpin-port",
+        type=int,
+        default=None,
+        help="ZMQ PULL port for CXL unpin messages. Default: --cxl-serve-port + 1.",
+    )
+    cxl_group.add_argument(
+        "--cxl-peer",
+        type=str,
+        action="append",
+        default=[],
+        metavar="ID:HOST:PORT",
+        help="Pre-configure a CXL peer. Format: peer_id:host:lookup_port. "
+        "The unpin port is derived as lookup_port + 1. Repeatable.",
+    )
+    cxl_group.add_argument(
+        "--cxl-tiering-policy",
+        type=str,
+        choices=["always_cxl", "size_threshold"],
+        default="always_cxl",
+        help="Tiering policy: 'always_cxl' routes every allocation to CXL; "
+        "'size_threshold' only routes large tensors. Default: always_cxl.",
+    )
+    cxl_group.add_argument(
+        "--cxl-numa-node",
+        type=int,
+        default=-1,
+        help="NUMA node of the CXL device for allocation affinity. -1 to disable. "
+        "Default: -1.",
+    )
+
     # Adapter config
     add_l2_adapters_args(parser)
     return parser
@@ -369,6 +485,38 @@ def parse_args_to_config(
             zmq_timeout_ms=getattr(args, "remote_zmq_timeout_ms", 5000),
         )
 
+    cxl_config: CxlConfig | None = None
+    if getattr(args, "cxl_dax_device", None) is not None:
+        cxl_serve_port: int = getattr(args, "cxl_serve_port", 5300)
+        cxl_serve_unpin_port: int = getattr(args, "cxl_serve_unpin_port", None) or (
+            cxl_serve_port + 1
+        )
+        cxl_peers: list[PeerConfig] = []
+        for peer_str in getattr(args, "cxl_peer", None) or []:
+            parts = peer_str.split(":", 2)
+            if len(parts) != 3:
+                raise ValueError(
+                    f"--cxl-peer must be 'peer_id:host:port', got {peer_str!r}"
+                )
+            peer_id, host, port_str = parts
+            port = int(port_str)
+            cxl_peers.append(
+                PeerConfig(peer_id=peer_id, host=host, port=port, unpin_port=port + 1)
+            )
+        cxl_config = CxlConfig(
+            dax_device_path=args.cxl_dax_device,
+            region_size=int(getattr(args, "cxl_region_size_gb", 4.0) * (1 << 30)),
+            subregion_offset=int(
+                getattr(args, "cxl_subregion_offset_gb", 0.0) * (1 << 30)
+            ),
+            subregion_size=int(getattr(args, "cxl_subregion_size_gb", 2.0) * (1 << 30)),
+            serve_port=cxl_serve_port,
+            serve_unpin_port=cxl_serve_unpin_port,
+            peers=cxl_peers,
+            tiering_policy=getattr(args, "cxl_tiering_policy", "always_cxl"),
+            cxl_numa_node=getattr(args, "cxl_numa_node", -1),
+        )
+
     return StorageManagerConfig(
         l1_manager_config=l1_manager_config,
         eviction_config=eviction_config,
@@ -377,6 +525,7 @@ def parse_args_to_config(
         prefetch_policy=args.l2_prefetch_policy,
         prefetch_max_in_flight=args.l2_prefetch_max_in_flight,
         remote_controller_config=remote_controller_config,
+        cxl_config=cxl_config,
     )
 
 

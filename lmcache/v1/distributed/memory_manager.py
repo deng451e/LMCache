@@ -105,7 +105,16 @@ class L1MemoryManager:
             L1Error: Error code indicating the result of the operation.
             It will be `L1Error.SUCCESS` if the operation succeeds.
         """
-        self._allocator.batched_free(mem_objs)
+        # First Party
+        from lmcache.v1.memory_management import MemoryFormat  # noqa: PLC0415
+
+        dram_objs = [
+            o
+            for o in mem_objs
+            if o.get_memory_format()
+            not in (MemoryFormat.CXL_SHADOW, MemoryFormat.REMOTE_CXL_SHADOW)
+        ]
+        self._allocator.batched_free(dram_objs)
         return L1Error.SUCCESS
 
     def get_memory_usage(self) -> tuple[int, int]:

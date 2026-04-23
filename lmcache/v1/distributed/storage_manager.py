@@ -156,6 +156,95 @@ class StorageManager:
                 config.remote_controller_config.serve_port,
             )
 
+        # CXL local tier + optional remote adapter
+        self._cxl_adaptor = None
+        self._cxl_remote_controller = None
+        self._cxl_remote_l2_adapter = None
+
+        if config.cxl_config is not None:
+            # Lazy imports keep CXL deps (zmq, ctypes mmap) optional
+            # First Party
+            from lmcache.v1.distributed.cxl.adaptor import (  # noqa: PLC0415
+                AlwaysCxlPolicy,
+                CxlAdaptor,
+                CxlAdaptorConfig,
+                SizeThresholdCxlPolicy,
+                TieringPolicy,
+            )
+            from lmcache.v1.distributed.cxl.controller import (  # noqa: PLC0415
+                CxlRemoteController,
+            )
+            from lmcache.v1.distributed.cxl.remote_l2_adapter import (  # noqa: PLC0415
+                CxlRemoteL2Adapter,
+            )
+
+            cxl_cfg = config.cxl_config
+            cxl_adaptor_config = CxlAdaptorConfig(
+                dax_device_path=cxl_cfg.dax_device_path,
+                region_size=cxl_cfg.region_size,
+                subregion_offset=cxl_cfg.subregion_offset,
+                subregion_size=cxl_cfg.subregion_size,
+                align_bytes=cxl_cfg.align_bytes,
+                cxl_numa_node=cxl_cfg.cxl_numa_node,
+            )
+            self._cxl_adaptor = CxlAdaptor(
+                config=cxl_adaptor_config,
+                l1_manager=self._l1_manager,
+            )
+
+            # Register CxlAdaptor as L1 listener (for eviction callbacks)
+            self._l1_manager.register_listener(self._cxl_adaptor)
+
+            # Inject CxlAdaptor + tiering policy into L1Manager.reserve_write
+            tiering_policy: TieringPolicy
+            if cxl_cfg.tiering_policy == "size_threshold":
+                tiering_policy = SizeThresholdCxlPolicy()
+            else:
+                tiering_policy = AlwaysCxlPolicy()
+            self._l1_manager.set_cxl_adaptor(self._cxl_adaptor, tiering_policy)
+
+            # CxlAdaptor is prefetch-only: allocation happens at reserve_write time
+            # (via cxl_allocate), so no separate L2 store step is needed.
+            # It is NOT added to self._l2_adapters / adapter_descriptors
+            # (store pipeline); only wired into the prefetch pipeline.
+            prefetch_adapters.append(self._cxl_adaptor)
+            prefetch_descriptors.append(
+                AdapterDescriptor(  # type: ignore[arg-type]
+                    index=len(prefetch_adapters) - 1,
+                    config=None,  # type: ignore[arg-type]
+                )
+            )
+
+            # CxlRemoteController — serve lookup requests from remote peers
+            if cxl_cfg.peers:
+                self._cxl_remote_controller = CxlRemoteController(
+                    config=cxl_cfg,
+                    cxl_adaptor=self._cxl_adaptor,
+                )
+                self._cxl_remote_controller.start()
+
+                self._cxl_remote_l2_adapter = CxlRemoteL2Adapter(
+                    config=cxl_cfg,
+                    local_region_va_base=self._cxl_adaptor.region_va_base,
+                    local_meta=self._cxl_adaptor.get_subregion_meta(),
+                )
+                prefetch_adapters.append(self._cxl_remote_l2_adapter)
+                prefetch_descriptors.append(
+                    AdapterDescriptor(  # type: ignore[arg-type]
+                        index=len(prefetch_adapters) - 1,
+                        config=None,  # type: ignore[arg-type]
+                    )
+                )
+
+            logger.info(
+                "CXL tier enabled: dax=%s region=%d subregion=[%d, %d) peers=%d",
+                cxl_cfg.dax_device_path,
+                cxl_cfg.region_size,
+                cxl_cfg.subregion_offset,
+                cxl_cfg.subregion_offset + cxl_cfg.subregion_size,
+                len(cxl_cfg.peers),
+            )
+
         # Used by schedule_prefetch to decide whether to invoke PrefetchController.
         # Includes the remote adapter (if configured), unlike self._l2_adapters.
         self._prefetch_adapters = prefetch_adapters
@@ -536,6 +625,13 @@ class StorageManager:
             self._remote_controller.stop()
         if self._remote_l2_adapter is not None:
             self._remote_l2_adapter.close()
+
+        if self._cxl_remote_controller is not None:
+            self._cxl_remote_controller.stop()
+        if self._cxl_remote_l2_adapter is not None:
+            self._cxl_remote_l2_adapter.close()
+        if self._cxl_adaptor is not None:
+            self._cxl_adaptor.close()
 
         for adapter in self._l2_adapters:
             adapter.close()

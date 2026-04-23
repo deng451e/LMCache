@@ -168,8 +168,8 @@ class CxlAdaptor(L1ManagerListener, L2AdapterInterface):
         """Decrement l2_lock_count; free if pending_free.
         Called by CxlRemoteController._handle_unpin()."""
 
-    def get_local_metadata(self) -> CxlRegionMeta:
-        """Return {dax_device_path, region_size, align_bytes}.
+    def get_subregion_meta(self) -> CxlSubregionMeta:
+        """Return {subregion_offset, subregion_size} for this host's owned sub-region.
         Called by CxlRemoteController during peer handshake."""
 
     # -----------------------------------------------------------------------
@@ -542,7 +542,7 @@ class PinCache:
 
 ```
 REP socket:
-  CxlInitRequest  → CxlInitResponse { server_region_meta = _cxl_adaptor.get_local_metadata() }
+  CxlInitRequest  → CxlInitResponse { server_meta = _cxl_adaptor.get_subregion_meta() }
   CxlLookupRequest → _handle_lookup() → CxlLookupResponse
   (unknown msgs)  → empty CxlLookupResponse
 
@@ -996,10 +996,10 @@ lmcache/v1/
         │                                       # register_l2_adapter_factory("cxl", ...)
         ├── controller.py                       # CxlRemoteController, CxlControllerConfig
         │                                       # reuses ZMQControlChannel (lazy-pirate) from remote_controller/
-        ├── protocol.py                         # CxlRegionMeta, CxlInitRequest/Response,
+        ├── protocol.py                         # CxlSubregionMeta, CxlInitRequest/Response,
         │                                       # CxlLookupRequest/Response, CxlUnpinRequest
         └── remote_l2_adapter.py                # CxlRemoteL2Adapter, CxlRemoteL2AdapterConfig
-                                                # CxlPeerRegion, CxlRemoteHandle
+                                                # CxlRemoteHandle
 
 tests/v1/distributed/cxl/
 ├── test_cxl_adaptor.py                         # alloc, store, lookup, shadow cycle
