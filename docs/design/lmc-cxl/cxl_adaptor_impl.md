@@ -15,13 +15,18 @@ allocator and `_index`.
 
 ### Config
 
+`CxlAdaptorConfig` extends `L2AdapterConfigBase` (from
+`distributed/l2_adapters/config.py`) so `StorageManager` can construct it
+from config files via the standard `from_dict` / `help` interface.
+
 ```python
-@dataclass
-class CxlAdaptorConfig:
-    dax_device_path: str  # e.g. "/dev/dax0.0"
-    region_size:     int  # mapped region size in bytes
-    align_bytes:     int  # allocation alignment; passed to TensorMemoryAllocator
-    cxl_numa_node:   int  # NUMA node ID of this host's CXL sub-region
+class CxlAdaptorConfig(L2AdapterConfigBase):
+    dax_device_path:   str  # e.g. "/dev/dax0.0" — same path on all hosts
+    region_size:       int  # full shared region size in bytes (same on all hosts)
+    subregion_offset:  int  # byte offset of this host's owned sub-region
+    subregion_size:    int  # size of this host's owned sub-region
+    align_bytes:       int  # allocation alignment; passed to TensorMemoryAllocator
+    cxl_numa_node:     int  # NUMA node ID of the CXL device on this host
 ```
 
 ### Internal index
@@ -484,11 +489,54 @@ class CxlControllerConfig:
     serve_unpin_port: int   = 5301
     peers:            list[PeerConfig] = field(default_factory=list)
     zmq_timeout_ms:   int   = 5000
-    remote_pin_ttl_s: int   = 60
+    remote_pin_ttl_s: int   = 60   # must exceed worst-case lookup→GPU-DMA-done latency
     reconnect_interval_s: int = 30
 ```
 
 Reuses `PeerConfig` from `remote_controller/config.py`.
+
+### `PinCache` — shared utility
+
+`ZMQRemoteController` already implements the same TTL dedup pattern
+(`_DeduplicatedEntry` + expiry logic in `_handle_lookup_request`).  Rather
+than duplicating it, extract a `PinCache` utility class into
+`distributed/remote_controller/pin_cache.py` and use it from both
+`ZMQRemoteController` and `CxlRemoteController`.
+
+```python
+# distributed/remote_controller/pin_cache.py
+
+@dataclass
+class PinEntry:
+    request_id: str
+    found_keys: list[WireObjectKey]
+    response:   Any              # caller stores whatever response type it needs
+    expires_at: float            # time.monotonic() + ttl_s
+
+class PinCache:
+    """Thread-safe TTL cache for pinned-key dedup.
+
+    Used by ZMQRemoteController and CxlRemoteController.
+    """
+
+    def __init__(self, ttl_s: int) -> None: ...
+
+    def get(self, request_id: str) -> PinEntry | None:
+        """Return entry if present and not yet expired."""
+
+    def put(self, entry: PinEntry) -> None:
+        """Insert or overwrite entry for request_id."""
+
+    def pop(self, request_id: str) -> PinEntry | None:
+        """Remove and return entry; None if missing."""
+
+    def sweep_expired(self) -> list[PinEntry]:
+        """Remove and return all entries whose expires_at <= now."""
+```
+
+`CxlRemoteController._pin_cache: PinCache` replaces the ad-hoc
+`dict[str, CxlPinEntry]`.  `_sweep_expired_pins` calls
+`_pin_cache.sweep_expired()` and then `server_unpin` for each returned entry.
 
 ### Server loop
 
@@ -506,27 +554,43 @@ PULL socket:
 
 ```python
 def _handle_lookup(self, msg: CxlLookupRequest) -> CxlLookupResponse:
-    # 1. Check dedup cache (same pattern as ZMQRemoteController).
+    # 1. Check _pin_cache; return cached response if present.
     # 2. Call _cxl_adaptor.server_lookup_and_lock(keys).
     # 3. Build found_positions, byte_offsets, byte_sizes from returned dict.
-    # 4. Store in dedup cache; return response.
+    # 4. Store CxlPinEntry(response, found_keys, expires_at) in _pin_cache; return response.
 ```
 
 ### `_handle_unpin`
 
 ```python
 def _handle_unpin(self, msg: CxlUnpinRequest) -> None:
-    # 1. Convert WireObjectKey → ObjectKey.
-    # 2. Call _cxl_adaptor.server_unpin(keys).
-    # 3. Remove from dedup cache.
+    # 1. Pop entry from _pin_cache by request_id; no-op if already expired+swept.
+    # 2. Convert entry.found_keys (WireObjectKey → ObjectKey).
+    # 3. Call _cxl_adaptor.server_unpin(keys).
 ```
+
+### `_sweep_expired_pins`
+
+Background thread started in `__init__`, stopped via `_stop_event` in `close()`.
+
+```python
+def _sweep_expired_pins(self) -> None:
+    while not self._stop_event.wait(timeout=self._config.remote_pin_ttl_s / 2):
+        expired = self._pin_cache.sweep_expired()  # thread-safe; acquires internal lock
+        for entry in expired:
+            keys = [wire_key_to_object_key(k) for k in entry.found_keys]
+            self._cxl_adaptor.server_unpin(keys)
+```
+
+`server_unpin` is called outside `PinCache`'s internal lock to avoid holding
+it during CXL index operations.
 
 ### Peer lifecycle
 
 `register_peer(config)`:
 1. Open ZMQ REQ channel to peer.
-2. Send `CxlInitRequest { get_local_metadata() }`, receive `CxlInitResponse`.
-3. Call `_remote_l2_adapter.connect_peer(peer_id, endpoint, unpin_endpoint, server_region_meta)`.
+2. Send `CxlInitRequest { local_meta=_cxl_adaptor.get_subregion_meta() }`, receive `CxlInitResponse`.
+3. Call `_remote_l2_adapter.connect_peer(peer_id, endpoint, unpin_endpoint, response.server_meta)`.
 4. Store `PeerState`.
 
 `unregister_peer(peer_id)`: calls `_remote_l2_adapter.disconnect_peer(peer_id)`.
@@ -542,7 +606,9 @@ not part of the interface.
 ## 6. `CxlRemoteL2Adapter`
 
 Implements `L2AdapterInterface` directly — no separate IO adapter layer.
-Owns ZMQ channels, peer DAX window mmaps, and the handle cache.
+Owns ZMQ channels and the handle cache.  Reads peer data directly from the
+shared region using the same VA base injected from `CxlAdaptor` — no
+per-peer mmap is needed.
 `CxlRemoteController` additionally calls peer lifecycle methods on a concrete
 reference; `PrefetchController` uses it only through `L2AdapterInterface`.
 
@@ -550,7 +616,7 @@ Supports two access modes via `CxlRemoteL2AdapterConfig.access_mode`:
 
 - **`dram_bounce`** (default): peer CXL → CPU `memcpy` → local DRAM → GPU.
   `requires_pre_allocation() = True`.
-- **`gpu_direct`**: peer CXL → GPU DMA directly from peer DAX window VA.
+- **`gpu_direct`**: peer CXL → GPU DMA directly from shared region VA.
   `requires_pre_allocation() = False`.  Also implements `L1ManagerListener`
   to defer `CxlUnpinRequest` until the L1 read lock is released (GPU done).
 
@@ -562,17 +628,13 @@ class CxlRemoteL2AdapterConfig:
     access_mode: Literal["dram_bounce", "gpu_direct"] = "dram_bounce"
 ```
 
+`CxlRemoteL2Adapter.__init__` receives `region_va_base: int` and
+`region_size: int` injected by `StorageManager` from `CxlAdaptor`'s mapped
+region — no DAX device path is needed here.
+
 ### Internal types
 
 ```python
-@dataclass
-class CxlPeerRegion:
-    peer_id:     str
-    va_base:     int   # mmap base VA of peer DAX device window
-    region_size: int
-    _mmap_obj:   mmap.mmap
-    _fd:         int
-
 @dataclass
 class CxlRemoteHandle:
     peer_id:     str
@@ -584,13 +646,18 @@ class CxlRemoteHandle:
 
 ```python
 class CxlRemoteL2Adapter(L2AdapterInterface):
-    """Client-side remote CXL adapter: ZMQ lookup fan-out + peer DAX access.
+    """Client-side remote CXL adapter: ZMQ lookup fan-out + shared region access.
 
     Implements L2AdapterInterface for PrefetchController.
     In gpu_direct mode also implements L1ManagerListener to defer remote
     unlock until the engine releases its L1 read lock (GPU DMA complete).
 
     Store operations raise NotImplementedError (remote peers are read-only).
+
+    Shared region access: _region_va_base and _region_size are injected from
+    CxlAdaptor at construction.  No per-peer mmap is needed — all peers'
+    data is accessible via the same VA base using the absolute byte_offset
+    returned by CxlLookupResponse.
 
     Handle cache lifecycle:
       _handle_cache[task_id] created by submit_lookup_and_lock_task,
@@ -608,28 +675,22 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         peer_id: str,
         endpoint: str,
         unpin_endpoint: str,
-        peer_meta: CxlRegionMeta,
+        peer_meta: CxlSubregionMeta,
     ) -> None:
-        """Open ZMQ channels and mmap peer DAX device window.
+        """Open ZMQ channels to peer; validate sub-region does not overlap ours.
 
-        In gpu_direct mode, also calls
-        cudaHostRegister(peer_region.va_base, peer_meta.region_size)
-        so the GPU can DMA directly from the peer CXL NUMA VA.
+        No mmap is performed — the shared region is already mapped and
+        cudaHostRegistered by CxlAdaptor at startup.
 
         Args:
             peer_id:        Logical peer ID.
             endpoint:       ZMQ REQ endpoint for lookup traffic.
             unpin_endpoint: ZMQ PUSH endpoint for fire-and-forget unpins.
-            peer_meta:      CxlRegionMeta from CxlInitResponse.
+            peer_meta:      CxlSubregionMeta from CxlInitResponse (for validation).
         """
-        # mmap peer's DAX device:
-        #   fd = os.open(peer_meta.dax_device_path, os.O_RDWR)
-        #   m  = mmap.mmap(fd, peer_meta.region_size, MAP_SHARED, PROT_READ)
-        # Store CxlPeerRegion.
-        # if gpu_direct: cudaHostRegister(peer_region.va_base, region_size)
 
     def disconnect_peer(self, peer_id: str) -> None:
-        """Close ZMQ channels; cudaHostUnregister + munmap peer DAX window.
+        """Close ZMQ channels for peer.
 
         In gpu_direct mode, also drains _pending_remote_unpin of any entries
         belonging to this peer (identified via CxlRemoteHandle.peer_id).
@@ -795,27 +856,28 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Close ZMQ sockets; cudaHostUnregister + munmap all peer DAX windows."""
+        """Close all peer ZMQ sockets. Shared region cleanup is owned by CxlAdaptor."""
 ```
 
 ### Peer address formula
 
 ```python
 # On server (CxlRemoteController._handle_lookup):
-byte_offset = obj.data_ptr() - _region_va_base
+byte_offset = obj.data_ptr() - _region_va_base   # absolute offset in global region
 byte_size   = obj.phy_size
 
 # On client — dram_bounce (submit_load_task):
-peer_va = peer_region.va_base + byte_offset
+peer_va = _region_va_base + byte_offset           # client's own VA base + same offset
 ctypes.memmove(objects[i].data_ptr(), peer_va, byte_size)
 
 # On client — gpu_direct (submit_load_task):
-peer_va = peer_region.va_base + byte_offset
+peer_va = _region_va_base + byte_offset
 # TensorMemoryObj wrapping peer_va with meta.fmt = REMOTE_CXL_SHADOW
 # GPU cudaMemcpy(gpu_dst ← peer_va) issued by PrefetchController / engine
 ```
 
-Both values are byte-granular; no page-size dependency.
+Both sides map the same physical CXL region so the absolute offset resolves
+to the correct physical address from either VA base.  No page-size dependency.
 
 ### `gpu_direct` internal state
 
@@ -848,6 +910,8 @@ callback thread (reader/drainer).
 | `distributed/l2_adapters/base.py` | Add `requires_pre_allocation() → bool` (default `True`) |
 | `distributed/storage_controllers/prefetch_controller.py` | Split `_transition_to_load_phase` to handle `requires_pre_allocation=False` adapters |
 | `distributed/storage_manager.py` | Construct and wire `CxlAdaptor` + `CxlRemoteL2Adapter`; register both as `L1ManagerListener` (see construction snippet below) |
+| `distributed/remote_controller/pin_cache.py` | **New**: `PinCache` utility extracted from `ZMQRemoteController`; shared with `CxlRemoteController` |
+| `distributed/remote_controller/controller.py` | Refactor to use `PinCache` (replaces inline `_DeduplicatedEntry` dict) |
 
 ### `StorageManager` construction and wiring
 
@@ -861,7 +925,12 @@ if config.cxl is not None:
 
     if config.cxl.remote is not None:
         l1_manager_ref = l1_manager if config.cxl.remote.access_mode == "gpu_direct" else None
-        remote_l2 = CxlRemoteL2Adapter(config.cxl.remote, l1_manager=l1_manager_ref)
+        remote_l2 = CxlRemoteL2Adapter(
+            config.cxl.remote,
+            region_va_base=cxl_adaptor.region_va_base,  # shared mmap; no second mmap
+            region_size=config.cxl.adaptor.region_size,
+            l1_manager=l1_manager_ref,
+        )
         cxl_controller = CxlRemoteController(
             config.cxl.controller,
             cxl_adaptor=cxl_adaptor,
@@ -878,11 +947,15 @@ if config.cxl is not None:
 def __init__(
     self,
     config: CxlRemoteL2AdapterConfig,
+    region_va_base: int,               # injected from CxlAdaptor; VA base of full shared region
+    region_size: int,                  # injected from CxlAdaptor; full region size in bytes
     l1_manager: L1Manager | None = None,  # required when access_mode == "gpu_direct"
 ) -> None:
     if config.access_mode == "gpu_direct" and l1_manager is None:
         raise ValueError("l1_manager is required for gpu_direct mode")
-    self._l1_manager = l1_manager
+    self._region_va_base = region_va_base
+    self._region_size    = region_size
+    self._l1_manager     = l1_manager
     ...
 ```
 
@@ -910,6 +983,8 @@ lmcache/v1/
     ├── memory_manager.py                       # modified: + CXL_SHADOW guard in free()
     ├── l2_adapters/
     │   └── base.py                             # modified: + requires_pre_allocation()
+    ├── remote_controller/
+    │   └── pin_cache.py                        # new: PinCache utility (shared by ZMQRemoteController + CxlRemoteController)
     │
     ├── storage_controllers/
     │   └── prefetch_controller.py              # modified: per-adapter pre_allocation check
@@ -918,8 +993,9 @@ lmcache/v1/
         ├── __init__.py
         ├── adaptor.py                          # CxlAdaptor, CxlAdaptorConfig,
         │                                       # CxlIndexEntry, TieringPolicy
+        │                                       # register_l2_adapter_factory("cxl", ...)
         ├── controller.py                       # CxlRemoteController, CxlControllerConfig
-        │                                       # ZMQCxlControlChannel (lazy-pirate)
+        │                                       # reuses ZMQControlChannel (lazy-pirate) from remote_controller/
         ├── protocol.py                         # CxlRegionMeta, CxlInitRequest/Response,
         │                                       # CxlLookupRequest/Response, CxlUnpinRequest
         └── remote_l2_adapter.py                # CxlRemoteL2Adapter, CxlRemoteL2AdapterConfig

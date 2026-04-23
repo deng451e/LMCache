@@ -22,28 +22,60 @@ multi-adapter fan-out already in place.  A key found locally is never
 fetched remotely — the existing `PrefetchPolicy` selects the winning adapter
 per key before issuing loads.
 
+### CXL shared memory model
+
+All hosts in the cluster map the **same full CXL shared memory region** using
+the Linux DAX device interface.  Each host is statically configured with a
+sub-region `(subregion_offset, subregion_size)` that it owns exclusively —
+only that host allocates into, evicts from, and writes to its sub-region.
+Any host may read any offset in the full region.
+
+```
+Physical CXL shared region (region_size bytes)
+┌──────────────┬──────────────┬──────────────┐
+│  host A owns │  host B owns │  host C owns │
+│  [0, S)      │  [S, 2S)     │  [2S, 3S)    │
+└──────────────┴──────────────┴──────────────┘
+  ↑ all hosts mmap the entire region
+  ↑ byte_offset in protocol = absolute offset within this region
+```
+
 ### CXL region setup
 
-Each host maps its CXL sub-region at startup via the Linux DAX device interface and
-wraps it as a `torch.Tensor` so `TensorMemoryAllocator` can manage suballocations:
+Each host maps the full shared region at startup and registers it with CUDA
+once.  `CxlRemoteL2Adapter` receives the same `(region_va_base, region_size)`
+from `CxlAdaptor` — no separate mmap per peer is needed.
 
 ```python
-# 1. Map the CXL sub-region from the DAX device.
+# 1. Map the full shared CXL region from the DAX device.
 fd = os.open(config.dax_device_path, os.O_RDWR)
 _mmap = mmap.mmap(fd, config.region_size, flags=mmap.MAP_SHARED,
                   prot=mmap.PROT_READ | mmap.PROT_WRITE)
 _region_va_base = ctypes.addressof(ctypes.c_char.from_buffer(_mmap))
 
-# 2. Wrap as a tensor so TensorMemoryAllocator can suballocate within it.
-_buf = (ctypes.c_uint8 * config.region_size).from_address(_region_va_base)
-_cxl_tensor = torch.frombuffer(_buf, dtype=torch.uint8)
+# 2. Wrap the owned sub-region as a tensor for TensorMemoryAllocator.
+_sub_buf = (ctypes.c_uint8 * config.subregion_size).from_address(
+    _region_va_base + config.subregion_offset)
+_cxl_tensor = torch.frombuffer(_sub_buf, dtype=torch.uint8)
 _allocator = TensorMemoryAllocator(_cxl_tensor, align_bytes=config.align_bytes)
 
-# 3. Register with CUDA so the GPU can DMA directly to/from CXL addresses.
+# 3. Register the full region with CUDA once (covers all peers' sub-regions).
 cudaHostRegister(_region_va_base, config.region_size, cudaHostRegisterDefault)
 ```
 
-`cudaHostRegister` is called once per region at startup.
+`cudaHostRegister` is bound via `ctypes` (no extra dependency):
+
+```python
+import ctypes
+
+_libcuda = ctypes.CDLL("libcuda.so")
+_cudaHostRegister   = _libcuda.cuMemHostRegister_v2   # CUresult(ptr, size, flags)
+_cudaHostUnregister = _libcuda.cuMemHostUnregister
+
+cudaHostRegisterDefault = 0x00
+```
+
+`cudaHostRegister` is called once at startup.
 `cudaHostUnregister`, `_mmap.close()`, and `os.close(fd)` run in `close()`.
 
 ### Components
@@ -52,7 +84,7 @@ cudaHostRegister(_region_va_base, config.region_size, cudaHostRegisterDefault)
 |---|---|---|
 | `CxlAdaptor` | `L1ManagerListener` + `L2AdapterInterface` | Local CXL: allocation, shadow registration, GPU transfer, local L2 lookup/load/store |
 | `CxlRemoteController` | — | ZMQ server: lookup requests from remote clients against local `CxlAdaptor._index` |
-| `CxlRemoteL2Adapter` | `L2AdapterInterface` (+ optionally `L1ManagerListener`) | Client-side: ZMQ lookup fan-out to peers, peer DAX window access, peer lifecycle. Two access modes: DRAM-bounce and GPU-direct. |
+| `CxlRemoteL2Adapter` | `L2AdapterInterface` (+ optionally `L1ManagerListener`) | Client-side: ZMQ lookup fan-out to peers, direct read from shared region VA, peer lifecycle. Two access modes: DRAM-bounce and GPU-direct. |
 
 `CxlRemoteL2Adapter` implements `L2AdapterInterface` directly — there is no
 separate IO adapter layer.  Unlike the NIXL split (`RemoteIOAdapter` +
@@ -344,16 +376,15 @@ PULL socket (serve_unpin_port): CxlUnpinRequest (no reply)
 ### Messages
 
 ```python
-class CxlRegionMeta(msgspec.Struct):
-    dax_device_path: str  # DAX device path peers use to mmap this host's window
-    region_size:     int  # bytes
-    align_bytes:     int  # allocation alignment (informational)
+class CxlSubregionMeta(msgspec.Struct):
+    subregion_offset: int  # byte offset of this host's owned sub-region within the global region
+    subregion_size:   int  # bytes; for validation / debugging only
 
 class CxlInitRequest(msgspec.Struct, tag=True):
-    local_region_meta: CxlRegionMeta
+    local_meta: CxlSubregionMeta
 
 class CxlInitResponse(msgspec.Struct, tag=True):
-    server_region_meta: CxlRegionMeta
+    server_meta: CxlSubregionMeta
 
 class CxlLookupRequest(msgspec.Struct, tag=True):
     request_id: str            # stable across retries; server dedup key
@@ -361,7 +392,7 @@ class CxlLookupRequest(msgspec.Struct, tag=True):
 
 class CxlLookupResponse(msgspec.Struct, tag=True):
     found_positions: list[int]  # indices into original keys list
-    byte_offsets:    list[int]  # offset within peer CXL region per found key
+    byte_offsets:    list[int]  # absolute byte offset within the global shared region
     byte_sizes:      list[int]  # object size in bytes per found key
 
 class CxlUnpinRequest(msgspec.Struct, tag=True):
@@ -372,27 +403,48 @@ class CxlUnpinRequest(msgspec.Struct, tag=True):
 ### Handshake sequence
 
 ```
-1. Client → CxlInitRequest { local_region_meta }
-2. Server → CxlInitResponse { server_region_meta }
-   (client mmaps server's DAX device at server_region_meta.dax_device_path)
+1. Client → CxlInitRequest { local_meta }
+2. Server → CxlInitResponse { server_meta }
 ```
 
-No `MemReg` round-trip is needed.
+No mmap exchange and no `MemReg` round-trip needed.  Both sides already have
+the full shared region mapped.  `CxlSubregionMeta` is exchanged for
+validation only (both sides can assert `region_size` matches and that the
+peer's sub-region does not overlap their own).
 
 ### Server-side dedup
 
-Identical to `ZMQRemoteController`: responses are cached by `request_id` for
-`remote_pin_ttl_s + 10` seconds.  `CxlUnpinRequest` clears the entry and calls
-`CxlAdaptor.server_unpin()`.
+Responses are cached by `request_id` in a `CxlPinEntry` table for
+`remote_pin_ttl_s` seconds.  Each entry stores `found_keys` alongside the
+response so the TTL sweeper can call `server_unpin` without needing the
+original request.
+
+| Event | Action |
+|---|---|
+| `CxlUnpinRequest` received | Call `server_unpin(found_keys)`; remove entry |
+| Entry TTL expires (no unpin received) | Call `server_unpin(found_keys)`; remove entry |
+
+A background sweep thread in `CxlRemoteController` wakes every
+`remote_pin_ttl_s / 2` seconds, finds all expired entries, calls
+`server_unpin` for each, and removes them.  This reclaims `l2_lock_count`
+increments left behind by crashed or disconnected clients.
+
+**`remote_pin_ttl_s` constraint**: must be set larger than the worst-case
+elapsed time between `CxlLookupRequest` and GPU DMA completion on the client
+(including `PrefetchController` queuing delay).  A client that holds a pin
+past TTL risks the server evicting the CXL page while the GPU is still
+reading it.
 
 ### Peer address formula
 
 ```python
-byte_offset = obj.data_ptr() - _region_va_base   # computed on server
+byte_offset = obj.data_ptr() - _region_va_base   # computed on server; absolute within global region
 byte_size   = obj.phy_size
 
-peer_va     = peer_region.va_base + byte_offset   # computed on client
+peer_va     = _region_va_base + byte_offset       # computed on client; same formula, client's own VA base
 ```
+
+Both sides map the same physical region so the offset is valid from either VA base.
 
 ---
 
