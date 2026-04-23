@@ -187,8 +187,12 @@ sequenceDiagram
     PC  ->> L1:  finish_write_and_reserve_read(keys)
     L1 -->> PC:  TensorMemoryObj(cxl_va, CXL_SHADOW) read-locked
 
-    PC  ->> GPU: cudaMemcpy(gpu_dst ← obj.data_ptr())
+    Note over PC: Engine / consumer calls CxlAdaptor.transfer_to_gpu(obj, gpu_dst)
+    PC  ->> CXL: transfer_to_gpu(obj, gpu_dst)
+    Note over CXL: async cudaMemcpy(gpu_dst ← cxl_va) via ThreadPoolExecutor
+    CXL -->> PC: Future; engine awaits completion
     Note over GPU: GPU DMA reads directly from CXL NUMA VA
+
     PC  ->> CXL: submit_unlock(keys, lookup_task_id)
     Note over CXL: decrement l2_lock_count; free if pending_free
 ```
@@ -435,14 +439,15 @@ callers (local and remote) increment/decrement under `_lock`.
 | Component | Change | Notes |
 |---|---|---|
 | `MemoryFormat` | Add `CXL_SHADOW`, `REMOTE_CXL_SHADOW` | Tags on `TensorMemoryObj.meta.fmt`; both skipped by `L1MemoryManager.free()` |
-| `L1Manager` | Add `register_shadow()` + TieringPolicy branch in `reserve_write` | ~40 lines |
-| `L1MemoryManager.free()` | Skip `CXL_SHADOW` objects | Freed by `CxlAdaptor._allocator` only |
+| `L1Manager` | Add `register_shadow()` (accepts `CXL_SHADOW` + `REMOTE_CXL_SHADOW`) + TieringPolicy branch in `reserve_write` | ~40 lines |
+| `L1MemoryManager.free()` | Skip `CXL_SHADOW` and `REMOTE_CXL_SHADOW` objects | Each adapter owns its own memory; L1 must not free it |
 | `L2AdapterInterface` | Add `requires_pre_allocation() → bool` (default `True`) | Non-breaking; existing adapters unchanged |
 | `PrefetchController` | Check `requires_pre_allocation()` per adapter in `_transition_to_load_phase` | Skip `reserve_write` + pass `objects=[]` for `False` adapters |
-| `CxlAdaptor` | New file | Local CXL L2 adapter + server-side index methods |
+| `CxlAdaptor` | New file; registered as `L1ManagerListener` by `StorageManager` | Local CXL L2 adapter + server-side index methods + LRU eviction |
 | `CxlRemoteController` | New file | ZMQ server; queries `CxlAdaptor` |
-| `CxlRemoteL2Adapter` | New file | Client-side `L2AdapterInterface` (+`L1ManagerListener` in `gpu_direct` mode): ZMQ lookup fan-out, peer DAX access, peer lifecycle, two access modes |
-| Engine / consumer | Check `CXL_SHADOW`, call `transfer_to_gpu` | Single dispatch point |
+| `CxlRemoteL2Adapter` | New file; registered as `L1ManagerListener` in `gpu_direct` mode by `StorageManager`; `l1_manager` injected at construction | Client-side `L2AdapterInterface`: ZMQ lookup fan-out, peer DAX access, peer lifecycle, two access modes |
+| `StorageManager` | Wire up `CxlAdaptor` + `CxlRemoteL2Adapter`; inject `l1_manager`; register listeners | See `cxl_adaptor_impl.md` §7 for construction snippet |
+| Engine / consumer | Detect `CXL_SHADOW`, call `CxlAdaptor.transfer_to_gpu(obj, gpu_dst)` | Single dispatch point; returns a `Future` |
 | `RemoteController` / `StoreController` | **unchanged** | Format-agnostic |
 
 See [cxl_adaptor_impl.md](cxl_adaptor_impl.md) for full interface definitions

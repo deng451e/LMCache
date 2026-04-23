@@ -240,6 +240,30 @@ class TieringPolicy(Protocol):
 Both `_cxl_adaptor` and `_tiering_policy` are `None` when CXL is not
 configured — existing path is completely unchanged.
 
+Two concrete implementations ship with the initial CXL integration:
+
+```python
+class AlwaysCxlPolicy:
+    """Route every allocation to CXL (useful for testing / all-CXL deployments)."""
+    def should_use_cxl(self, key: ObjectKey, layout: MemoryLayoutDesc) -> bool:
+        return True
+
+class SizeThresholdCxlPolicy:
+    """Route to CXL when the tensor byte-size exceeds a threshold.
+
+    Large KV tensors benefit from CXL's capacity; small tensors (e.g. metadata
+    chunks) stay in DRAM to avoid CXL-access latency on the hot path.
+
+    Args:
+        min_bytes: Minimum total byte size for CXL routing (default 1 MiB).
+    """
+    def __init__(self, min_bytes: int = 1 << 20) -> None:
+        self._min_bytes = min_bytes
+
+    def should_use_cxl(self, key: ObjectKey, layout: MemoryLayoutDesc) -> bool:
+        return layout.total_bytes() >= self._min_bytes
+```
+
 ---
 
 ### Eviction retry invariant
@@ -260,6 +284,40 @@ the first callback that observes both conditions satisfied:
 
 Lookups (`submit_lookup_and_lock_task`, `server_lookup_and_lock`) skip keys with
 `pending_free=True` so no new lock-holders are created for a draining entry.
+
+### Eviction policy
+
+Eviction is triggered lazily: `allocate_and_register_shadow` calls
+`_allocator.batched_allocate()`; if that raises `OutOfMemoryError`, the
+adaptor evicts candidate entries before retrying.
+
+**Candidate selection** — LRU order over `_index` entries where:
+- `l2_lock_count == 0` (no outstanding local or remote lock)
+- `pending_free == False` (not already being freed)
+
+**Eviction procedure** (repeated until enough space is reclaimed or no
+candidates remain):
+
+```python
+# Inside CxlAdaptor._evict_one() — called under _lock NOT held:
+with self._lock:
+    candidate = _pick_lru_candidate()        # None if all locked
+    if candidate is None:
+        raise OutOfMemoryError("CXL region full; all entries locked")
+    candidate.pending_free = True
+
+err = self._l1_manager.delete(candidate.key)
+with self._lock:
+    if err == L1Error.SUCCESS and candidate.l2_lock_count == 0:
+        self._allocator.batched_free([candidate.obj])
+        del self._index[candidate.key]
+    # else: leave pending_free=True; deferred-free thread or callbacks retry
+```
+
+**LRU tracking** — `CxlAdaptor` maintains an `OrderedDict` or a
+`deque`-based LRU keyed on `ObjectKey`, updated on every
+`submit_lookup_and_lock_task` hit and `server_lookup_and_lock` hit.
+Entries removed from `_index` are also removed from the LRU structure.
 
 ### Deferred-free background thread
 
@@ -331,11 +389,19 @@ def free(self, objs: list[MemoryObj]) -> None:
 def register_shadow(
     self,
     key: ObjectKey,
-    obj: TensorMemoryObj,   # meta.fmt == MemoryFormat.CXL_SHADOW
+    obj: TensorMemoryObj,   # meta.fmt must be CXL_SHADOW or REMOTE_CXL_SHADOW
     is_temporary: bool = False,
 ) -> L1Error:
-    """Register an externally-allocated CXL_SHADOW TensorMemoryObj without
+    """Register an externally-allocated shadow TensorMemoryObj without
     calling _memory_manager.allocate().  Entry is created write-locked.
+
+    Accepted formats:
+      CXL_SHADOW        — local CXL page; called by CxlAdaptor.
+      REMOTE_CXL_SHADOW — peer DAX window VA; called by CxlRemoteL2Adapter
+                          in gpu_direct mode.
+
+    Both formats are skipped by L1MemoryManager.free() — the caller owns
+    the underlying memory and is responsible for releasing it.
 
     Returns L1Error.EXIST if key is already present.
     """
@@ -563,7 +629,15 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         # if gpu_direct: cudaHostRegister(peer_region.va_base, region_size)
 
     def disconnect_peer(self, peer_id: str) -> None:
-        """Close ZMQ channels; cudaHostUnregister + munmap peer DAX window."""
+        """Close ZMQ channels; cudaHostUnregister + munmap peer DAX window.
+
+        In gpu_direct mode, also drains _pending_remote_unpin of any entries
+        belonging to this peer (identified via CxlRemoteHandle.peer_id).
+        For each drained key the corresponding _pending_task_key_count is
+        decremented; when it hits zero _handle_cache[task_id] is deleted.
+        No CxlUnpinRequest is sent — the peer is gone and the remote
+        l2_lock_count is irrelevant.
+        """
 
     def get_disconnected_peers(self) -> list[str]:
         """Return peers that timed out during lookup fan-out."""
@@ -693,6 +767,10 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         Must be fast and must NOT call any L1Manager method (deadlock).
         Sends CxlUnpinRequest via ZMQ PUSH socket (fire-and-forget).
 
+        After sending, decrements _pending_task_key_count for the originating
+        task_id.  When the count reaches zero all keys for that task have been
+        unlocked and _handle_cache[task_id] is deleted.
+
         Args:
             keys: Keys whose L1 read locks were just released.
         """
@@ -743,15 +821,20 @@ Both values are byte-granular; no page-size dependency.
 
 ```python
 # Added fields for gpu_direct mode:
-_l1_manager:            L1Manager           # injected; needed for register_shadow
-_pending_remote_unpin:  dict[ObjectKey, CxlRemoteHandle]
-_pending_unpin_lock:    threading.Lock
+_l1_manager:             L1Manager                                   # required; passed to __init__ when access_mode == "gpu_direct"
+_pending_remote_unpin:   dict[ObjectKey, tuple[L2TaskId, CxlRemoteHandle]]
+_pending_task_key_count: dict[L2TaskId, int]                         # ref-count; reaches 0 → delete _handle_cache[task_id]
+_pending_unpin_lock:     threading.Lock                              # guards both dicts above
 ```
 
-`_pending_remote_unpin` is populated in `submit_load_task` (one entry per
-loaded key) and drained in `on_l1_keys_read_finished`.  The lock guards
-concurrent access between the PrefetchController thread (writer) and the
-L1Manager callback thread (reader/drainer).
+`_pending_remote_unpin` maps each loaded key to `(lookup_task_id, handle)`.
+`submit_load_task` sets `_pending_task_key_count[task_id] = len(keys)` when
+it populates the map.  `on_l1_keys_read_finished` decrements the count for
+each drained key; when it reaches zero it also deletes
+`_handle_cache[task_id]`, closing the handle-cache leak that would otherwise
+accumulate in gpu_direct mode.  The lock guards both dicts against concurrent
+access between the PrefetchController thread (writer) and the L1Manager
+callback thread (reader/drainer).
 
 ---
 
@@ -760,11 +843,60 @@ L1Manager callback thread (reader/drainer).
 | Component | Change |
 |---|---|
 | `memory_management.py` | Add `MemoryFormat.CXL_SHADOW`, `MemoryFormat.REMOTE_CXL_SHADOW` |
-| `distributed/l1_manager.py` | Add `register_shadow()` + TieringPolicy hook in `reserve_write` |
+| `distributed/l1_manager.py` | Add `register_shadow()` (accepts both shadow formats) + TieringPolicy hook in `reserve_write` |
 | `distributed/memory_manager.py` | Skip `CXL_SHADOW` and `REMOTE_CXL_SHADOW` objects in `free()` |
 | `distributed/l2_adapters/base.py` | Add `requires_pre_allocation() → bool` (default `True`) |
 | `distributed/storage_controllers/prefetch_controller.py` | Split `_transition_to_load_phase` to handle `requires_pre_allocation=False` adapters |
-| `distributed/storage_manager.py` | Accept `CxlAdaptor` + `CxlRemoteL2Adapter` as optional L2 adapters; register `CxlRemoteL2Adapter` as `L1ManagerListener` when in `gpu_direct` mode |
+| `distributed/storage_manager.py` | Construct and wire `CxlAdaptor` + `CxlRemoteL2Adapter`; register both as `L1ManagerListener` (see construction snippet below) |
+
+### `StorageManager` construction and wiring
+
+```python
+# Inside StorageManager.__init__ (simplified):
+
+if config.cxl is not None:
+    cxl_adaptor = CxlAdaptor(config.cxl.adaptor, l1_manager=l1_manager)
+    l1_manager.register_listener(cxl_adaptor)       # eviction + deferred-free callbacks
+    l2_adapters.append(cxl_adaptor)
+
+    if config.cxl.remote is not None:
+        l1_manager_ref = l1_manager if config.cxl.remote.access_mode == "gpu_direct" else None
+        remote_l2 = CxlRemoteL2Adapter(config.cxl.remote, l1_manager=l1_manager_ref)
+        cxl_controller = CxlRemoteController(
+            config.cxl.controller,
+            cxl_adaptor=cxl_adaptor,
+            remote_l2_adapter=remote_l2,
+        )
+        if config.cxl.remote.access_mode == "gpu_direct":
+            l1_manager.register_listener(remote_l2)  # deferred CxlUnpinRequest callbacks
+        l2_adapters.append(remote_l2)
+```
+
+`CxlRemoteL2Adapter.__init__` signature:
+
+```python
+def __init__(
+    self,
+    config: CxlRemoteL2AdapterConfig,
+    l1_manager: L1Manager | None = None,  # required when access_mode == "gpu_direct"
+) -> None:
+    if config.access_mode == "gpu_direct" and l1_manager is None:
+        raise ValueError("l1_manager is required for gpu_direct mode")
+    self._l1_manager = l1_manager
+    ...
+```
+
+`CxlAdaptorConfig` + top-level CXL config schema:
+
+```python
+@dataclass
+class CxlConfig:
+    adaptor:    CxlAdaptorConfig
+    controller: CxlControllerConfig           = field(default_factory=CxlControllerConfig)
+    remote:     CxlRemoteL2AdapterConfig | None = None
+    tiering_policy: Literal["always", "size_threshold"] = "always"
+    tiering_min_bytes: int = 1 << 20          # used when tiering_policy == "size_threshold"
+```
 
 ---
 
