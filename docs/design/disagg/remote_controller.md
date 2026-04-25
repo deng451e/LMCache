@@ -100,7 +100,7 @@ REQ  → REP          serve_port  InitRequest             Exchange NIXL agent me
                                 LookupRequest           Which keys exist in remote L1?
                                   fields: request_id, keys
                                   request_id stable across retries (see impl §4)
-                                LookupResponse          bitmap + page_indices per found key
+                                LookupResponse          found_positions + (byte_offset, byte_size) per found key
 ────────────────────────────────────────────────────────────────────────────────
 PUSH → PULL         unpin_port  UnpinRequest            Release read locks (fire-and-forget)
                                   fields: request_id, found_keys
@@ -145,8 +145,8 @@ sequenceDiagram
     par fan-out ZMQ LookupRequest to all N peers
         RIA ->> RCA: LookupRequest(request_id, keys)
         RCA ->> L1A: reserve_read(keys)
-        L1A -->> RCA: found_keys + pages
-        RCA -->> RIA: LookupResponse(found_bitmap, pages)
+        L1A -->> RCA: found_keys + obj.meta.address+phy_size
+        RCA -->> RIA: LookupResponse(found_positions, byte_offsets, byte_sizes)
     end
     Note over RIA: apply lookup_policy; cache handles; build Bitmap; signal lookup_event_fd
     deactivate RIA
@@ -230,9 +230,9 @@ sequenceDiagram
     RIA ->> RCP: ZMQ LookupRequest(request_id, keys)
     activate RCP
     RCP ->> L1P: reserve_read(keys)
-    L1P -->> RCP: found_keys + pages
+    L1P -->> RCP: found_keys + obj.meta.address+phy_size
     RCP ->> RCP: dedup cache: store request_id
-    RCP -->> RIA: LookupResponse(found_bitmap, pages_per_found)
+    RCP -->> RIA: LookupResponse(found_positions, byte_offsets, byte_sizes)
     deactivate RCP
     Note over RIA: cache handles; build Bitmap; signal lookup_event_fd
     deactivate RIA

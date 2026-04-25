@@ -134,6 +134,50 @@ interface and §6.2 below for `NixlIOAdapter` internals.
 
 `ZMQRemoteController` has no `lookup()` or `unlock()` methods.
 
+### 3.1 Wire-compact LookupResponse (2026-04-25)
+
+`LookupResponse` carries one `(byte_offset, byte_size)` pair per found key,
+not a per-page list:
+
+```python
+class LookupResponse(msgspec.Struct, tag=True):
+    found_positions: list[int]   # indices into the original LookupRequest.keys
+    byte_offsets:    list[int]   # obj.meta.address per found key (offset within registered MR)
+    byte_sizes:      list[int]   # obj.meta.phy_size per found key
+```
+
+The client (`NixlIOAdapter`) reconstructs NIXL prep_xfer_dlist page indices on
+demand at `_run_load` time:
+
+```python
+remote_start = handle.byte_offset // align_bytes
+remote_num   = handle.byte_size  // align_bytes
+remote_pages = list(range(remote_start, remote_start + remote_num))
+```
+
+This collapses the previous `pages_per_found: list[list[int]]` (which shipped
+`N keys × pages_per_chunk` ints, e.g. 2048 ints per 8 MB chunk at 4 KB pages)
+to a single `(int, int)` pair per key — roughly **3000x smaller** wire payload
+in our 32 MB-chunk workloads, and proportional CPU savings on
+encode/decode. Measured impact: `cp_ms` 115 ms → 3 ms at 87 keys after the
+patch (see `p2p_lookup_patch_comparison.csv` in the cxl benchmark folder).
+
+`_RemoteKeyHandle` (in `nixl_backend.py`) is the cached form of one row of
+the response, keyed by `ObjectKey` so subsequent `submit_fetch_task` /
+`submit_unlock` can find it by value rather than position:
+
+```python
+@dataclass
+class _RemoteKeyHandle:
+    peer_id:        str
+    found_position: int
+    byte_offset:    int
+    byte_size:      int
+```
+
+The page-index reconstruction is a pure local computation; no extra round-trip
+or shared state is required.
+
 ---
 
 ## 4. Lookup Idempotency
@@ -352,8 +396,8 @@ class NixlIOAdapter(RemoteIOAdapter):
     _next_task_id:       int
     _lookup_lock:        threading.Lock
     _completed_lookups:  dict[IOTaskId, Bitmap]
-    _handle_cache:       dict[IOTaskId, dict[ObjectKey, tuple[str, list[int]]]]
-    # (peer_id, remote_pages) per key, for submit_fetch_task
+    _handle_cache:       dict[IOTaskId, dict[ObjectKey, _RemoteKeyHandle]]
+    # _RemoteKeyHandle = (peer_id, found_position, byte_offset, byte_size); pages reconstructed at xfer time using align_bytes
 
     _load_lock:          threading.Lock
     _pending_fetches:    dict[IOTaskId, list[tuple[ObjectKey, TransferHandle]]]
