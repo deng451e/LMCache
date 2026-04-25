@@ -135,8 +135,12 @@ def _cuda_host_register(va: int, size: int) -> None:
     _init_cuda_bindings()
     if _cudaHostRegister_fn is None:
         return
+    # CU_MEMHOSTREGISTER_PORTABLE (0x1) | CU_MEMHOSTREGISTER_DEVICEMAP (0x2)
+    # — DEVICEMAP makes the mapping usable as a GPU device pointer,
+    #   enabling GPU-Direct DMA between GPU KV and CXL memory.
+    flags = 0x1 | 0x2
     ret = _cudaHostRegister_fn(
-        ctypes.c_void_p(va), ctypes.c_size_t(size), ctypes.c_uint(0)
+        ctypes.c_void_p(va), ctypes.c_size_t(size), ctypes.c_uint(flags)
     )
     if ret != 0:
         logger.warning("cudaHostRegister returned %d for CXL region", ret)

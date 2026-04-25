@@ -34,7 +34,14 @@ import zmq
 # First Party
 from lmcache.logging import init_logger
 from lmcache.native_storage_ops import Bitmap
-from lmcache.v1.distributed.api import ObjectKey
+from lmcache.v1.distributed.api import ObjectKey, MemoryLayoutDesc
+from lmcache.v1.distributed.l1_manager import L1Manager
+from lmcache.v1.distributed.error import L1Error
+from lmcache.v1.memory_management import (
+    MemoryFormat,
+    MemoryObjMetadata,
+    TensorMemoryObj,
+)
 from lmcache.v1.distributed.cxl.protocol import (
     CxlInitRequest,
     CxlInitResponse,
@@ -246,10 +253,12 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         config: "CxlConfig",
         local_region_va_base: int,
         local_meta: CxlSubregionMeta,
+        l1_manager: L1Manager | None = None,
     ) -> None:
         super().__init__()
         self._region_va_base = local_region_va_base
         self._local_meta = local_meta
+        self._l1_manager = l1_manager
 
         self._zmq_ctx = zmq.Context()
         self._channels: list[_CxlPeerChannel] = []
@@ -293,6 +302,11 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
             thread_name_prefix="cxl-remote",
         )
 
+    def requires_pre_allocation(self) -> bool:
+        # Adapter manages its own L1 registration via REMOTE_CXL_SHADOW;
+        # no DRAM buffer should be pre-allocated by the PrefetchController.
+        return self._l1_manager is None
+
     # -------------------------------------------------------------------
     # L2AdapterInterface — event fds
     # -------------------------------------------------------------------
@@ -320,16 +334,6 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
             Load completion eventfd.
         """
         return self._load_efd
-
-    def requires_pre_allocation(self) -> bool:
-        """Return True — destination MemoryObj buffers must be pre-allocated.
-
-        The load step copies CXL NUMA VA data into the caller-supplied buffers.
-
-        Returns:
-            True.
-        """
-        return True
 
     # -------------------------------------------------------------------
     # Store (unsupported)
@@ -389,13 +393,8 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         request_id: str,
         keys: list[ObjectKey],
     ) -> None:
-        """Worker: fan out lookup to all peers and merge results.
-
-        Args:
-            task_id: Identifies this lookup task.
-            request_id: Stable UUID for server-side dedup.
-            keys: Keys to look up.
-        """
+        import time as _time
+        _cp_t0 = _time.monotonic()
         num_keys = len(keys)
         bitmap = Bitmap(num_keys)
         key_routing: dict[ObjectKey, tuple[int, int]] = {}
@@ -441,6 +440,12 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         with self._lock:
             self._completed_lookup_tasks[task_id] = bitmap
             self._lookup_states[task_id] = state
+        import time as _time2
+        _cp_ms = (_time2.monotonic() - _cp_t0) * 1000.0
+        logger.info(
+            "[CXL] lookup task %d complete: %d/%d keys cp_ms=%.2f",
+            task_id, bitmap.popcount(), num_keys, _cp_ms,
+        )
         os.eventfd_write(self._lookup_efd, 1)
 
     def query_lookup_and_lock_result(self, task_id: L2TaskId) -> Bitmap | None:
@@ -500,6 +505,7 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         keys: list[ObjectKey],
         objects: list[MemoryObj],
         lookup_task_id: L2TaskId | None = None,
+        layout_desc: MemoryLayoutDesc | None = None,
     ) -> L2TaskId:
         """Copy CXL NUMA data to destination buffers in a background thread.
 
@@ -526,6 +532,68 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
                 else None
             )
 
+        # Fast path: register REMOTE_CXL_SHADOW directly (no DRAM staging).
+        if self._l1_manager is not None and layout_desc is not None and not objects:
+            import time as _time
+            _dp_t0 = _time.monotonic()
+            bitmap = Bitmap(len(keys))
+            total_bytes = 0
+            if state is not None:
+                for i, key in enumerate(keys):
+                    routing = state.key_routing.get(key)
+                    if routing is None:
+                        continue
+                    peer_va, byte_size = routing
+                    # Build REMOTE_CXL_SHADOW TensorMemoryObj over peer's VA.
+                    # The region is already cudaHostRegister'd with DEVICEMAP
+                    # so subsequent gpu_tensor.copy_(raw) will GPU-Direct DMA.
+                    try:
+                        shapes = list(layout_desc.shapes)
+                        dtypes = list(layout_desc.dtypes)
+                        # Flat tensor view over peer_va
+                        total_elems = byte_size  # bytes
+                        src_buf = (ctypes.c_uint8 * byte_size).from_address(peer_va)
+                        raw = torch.frombuffer(src_buf, dtype=torch.uint8)
+                        logical_shape = shapes[0]
+                        logical_dtype = dtypes[0]
+                        meta = MemoryObjMetadata(
+                            shape=logical_shape,
+                            dtype=logical_dtype,
+                            address=peer_va,
+                            phy_size=byte_size,
+                            ref_count=1,
+                            pin_count=0,
+                            fmt=MemoryFormat.REMOTE_CXL_SHADOW,
+                            shapes=shapes,
+                            dtypes=dtypes,
+                        )
+                        obj = TensorMemoryObj(
+                            raw_data=raw,
+                            metadata=meta,
+                            parent_allocator=None,
+                        )
+                        err = self._l1_manager.register_shadow(
+                            key, obj, is_temporary=True
+                        )
+                        if err == L1Error.SUCCESS:
+                            bitmap.set(i)
+                            total_bytes += byte_size
+                    except Exception:
+                        logger.exception(
+                            "CxlRemoteL2Adapter: shadow registration failed for key %s",
+                            key,
+                        )
+            _dp_ms = (_time.monotonic() - _dp_t0) * 1000.0
+            logger.info(
+                "[CXL-shadow] load task %d done: %d/%d keys dp_ms=%.2f bytes=%d",
+                task_id, bitmap.popcount(), len(keys), _dp_ms, total_bytes,
+            )
+            with self._lock:
+                self._completed_load_tasks[task_id] = bitmap
+            os.eventfd_write(self._load_efd, 1)
+            return task_id
+
+        # Fallback: CPU-staged path (existing behavior)
         self._executor.submit(self._run_load, task_id, keys, objects, state)
         return task_id
 
@@ -536,14 +604,9 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
         objects: list[MemoryObj],
         state: _LookupState | None,
     ) -> None:
-        """Worker: copy each key's CXL data to its destination buffer.
-
-        Args:
-            task_id: Identifies this load task.
-            keys: Keys to load.
-            objects: Destination buffers (one per key).
-            state: Lookup state with per-key VA routing.
-        """
+        import time as _time
+        _dp_t0 = _time.monotonic()
+        _dp_bytes = 0
         bitmap = Bitmap(len(keys))
 
         if state is None:
@@ -559,9 +622,16 @@ class CxlRemoteL2Adapter(L2AdapterInterface):
                 try:
                     self._copy_cxl_to_obj(peer_va, byte_size, dst_obj)
                     bitmap.set(i)
+                    _dp_bytes += byte_size
                 except Exception:
                     logger.exception("CxlRemoteL2Adapter: copy failed for key %s", key)
 
+        import time as _time2
+        _dp_ms = (_time2.monotonic() - _dp_t0) * 1000.0
+        logger.info(
+            "[CXL] load task %d done: %d/%d keys dp_ms=%.2f bytes=%d",
+            task_id, bitmap.popcount(), len(keys), _dp_ms, _dp_bytes,
+        )
         with self._lock:
             self._completed_load_tasks[task_id] = bitmap
         os.eventfd_write(self._load_efd, 1)

@@ -133,7 +133,8 @@ class PeerState:
 @dataclass
 class _DeduplicatedEntry:
     found_positions: list[int]
-    pages_per_found: list[list[int]]
+    byte_offsets: list[int]
+    byte_sizes: list[int]
     expires_at: float  # monotonic
 
 
@@ -286,7 +287,21 @@ class ZMQRemoteController(RemoteController):
         except TimeoutError as err:
             channel.close()
             raise ConnectionError(
-                f"Handshake with {config.peer_id} at {endpoint} timed out"
+                f"Handshake with {config.peer_id} at {endpoint} timed out: {err}"
+            ) from err
+        except Exception as err:
+            import traceback
+            logger.error(
+                "[Remote] register_peer handshake failed: peer=%s endpoint=%s unpin=%s error=%s: %s\n%s",
+                config.peer_id, endpoint, unpin_endpoint,
+                type(err).__name__, err, traceback.format_exc(),
+            )
+            try:
+                channel.close()
+            except Exception:
+                pass
+            raise ConnectionError(
+                f"Handshake with {config.peer_id} at {endpoint} failed: {type(err).__name__}: {err}"
             ) from err
 
         with self._peers_lock:
@@ -330,21 +345,40 @@ class ZMQRemoteController(RemoteController):
         self._server_thread.start()
         self._reconnect_thread.start()
         for peer_config in self._config.peers:
+            endpoint = f"tcp://{peer_config.host}:{peer_config.port}"
+            unpin_endpoint = f"tcp://{peer_config.host}:{peer_config.unpin_port}"
+            logger.info(
+                "[Remote] attempting to register pre-configured peer %s at %s (unpin=%s)",
+                peer_config.peer_id, endpoint, unpin_endpoint,
+            )
             try:
                 self.register_peer(peer_config)
-            except ConnectionError:
+            except ConnectionError as err:
                 logger.warning(
-                    "Could not connect to pre-configured peer %s; "
+                    "[Remote] FAILED to register peer %s at %s: %s; "
                     "reconnect thread will retry",
-                    peer_config.peer_id,
+                    peer_config.peer_id, endpoint, err,
                 )
                 with self._peers_lock:
                     self._peers[peer_config.peer_id] = PeerState(
                         config=peer_config,
                         zmq_channel=ZMQControlChannel(
-                            self._zmq_ctx,
-                            f"tcp://{peer_config.host}:{peer_config.port}",
-                            self._config.zmq_timeout_ms,
+                            self._zmq_ctx, endpoint, self._config.zmq_timeout_ms,
+                        ),
+                        status=PeerStatus.DISCONNECTED,
+                    )
+            except Exception as err:
+                import traceback
+                logger.error(
+                    "[Remote] UNEXPECTED error registering peer %s at %s: %s: %s\n%s",
+                    peer_config.peer_id, endpoint,
+                    type(err).__name__, err, traceback.format_exc(),
+                )
+                with self._peers_lock:
+                    self._peers[peer_config.peer_id] = PeerState(
+                        config=peer_config,
+                        zmq_channel=ZMQControlChannel(
+                            self._zmq_ctx, endpoint, self._config.zmq_timeout_ms,
                         ),
                         status=PeerStatus.DISCONNECTED,
                     )
@@ -436,7 +470,7 @@ class ZMQRemoteController(RemoteController):
         if isinstance(msg, LookupRequest):
             return self._handle_lookup(msg)
         logger.warning("Unexpected REP message type: %s", type(msg))
-        return LookupResponse(found_positions=[], pages_per_found=[])
+        return LookupResponse(found_positions=[], byte_offsets=[], byte_sizes=[])
 
     def _handle_lookup(self, msg: LookupRequest) -> LookupResponse:
         """Handle an incoming LookupRequest with server-side dedup.
@@ -445,7 +479,10 @@ class ZMQRemoteController(RemoteController):
             msg: Decoded LookupRequest.
 
         Returns:
-            LookupResponse with found positions and page indices.
+            LookupResponse with found positions, byte offsets and sizes.
+            Wire format ships only (offset, size) per key; page indices are
+            reconstructed client-side using align_bytes (~3000x smaller than
+            the prior pages_per_found list-of-lists encoding).
         """
         now = time.monotonic()
         with self._dedup_lock:
@@ -457,14 +494,16 @@ class ZMQRemoteController(RemoteController):
             if cached is not None:
                 return LookupResponse(
                     found_positions=cached.found_positions,
-                    pages_per_found=cached.pages_per_found,
+                    byte_offsets=cached.byte_offsets,
+                    byte_sizes=cached.byte_sizes,
                 )
 
         keys = [ObjectKey(w.chunk_hash, w.model_name, w.kv_rank) for w in msg.keys]
         results = self._l1_manager.reserve_read(keys)
 
         found_positions: list[int] = []
-        pages_per_found: list[list[int]] = []
+        byte_offsets: list[int] = []
+        byte_sizes: list[int] = []
         for i, key in enumerate(keys):
             entry = results.get(key)
             if entry is None:
@@ -473,9 +512,8 @@ class ZMQRemoteController(RemoteController):
             if err != L1Error.SUCCESS or obj is None:
                 continue
             found_positions.append(i)
-            start_page = obj.meta.address // self._align_bytes
-            num_pages = obj.meta.phy_size // self._align_bytes
-            pages_per_found.append(list(range(start_page, start_page + num_pages)))
+            byte_offsets.append(obj.meta.address)
+            byte_sizes.append(obj.meta.phy_size)
 
         logger.info(
             "[Remote] lookup: found %d/%d keys in local L1 (request_id=%s)",
@@ -488,13 +526,15 @@ class ZMQRemoteController(RemoteController):
         with self._dedup_lock:
             self._dedup[msg.request_id] = _DeduplicatedEntry(
                 found_positions=found_positions,
-                pages_per_found=pages_per_found,
+                byte_offsets=byte_offsets,
+                byte_sizes=byte_sizes,
                 expires_at=expires_at,
             )
 
         return LookupResponse(
             found_positions=found_positions,
-            pages_per_found=pages_per_found,
+            byte_offsets=byte_offsets,
+            byte_sizes=byte_sizes,
         )
 
     def _handle_unpin(self, msg: UnpinRequest) -> None:

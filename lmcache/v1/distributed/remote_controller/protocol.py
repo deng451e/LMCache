@@ -64,14 +64,18 @@ class LookupRequest(msgspec.Struct, tag=True):
 
 
 class LookupResponse(msgspec.Struct, tag=True):
-    """Server -> client: which keys were found and their page indices.
+    """Server -> client: which keys were found, with compact addr/size.
 
     found_positions[i] is the index into the original keys list.
-    pages_per_found[i] are the remote page indices for that key.
+    byte_offsets[i] is the remote address (offset within the registered L1 MR)
+    of that key's payload; byte_sizes[i] is its size. The client converts
+    these to NIXL prep_xfer_dlist page indices on demand using its known
+    align_bytes (no per-page list shipped on the wire).
     """
 
     found_positions: list[int]
-    pages_per_found: list[list[int]]
+    byte_offsets: list[int]
+    byte_sizes: list[int]
 
 
 class UnpinRequest(msgspec.Struct, tag=True):

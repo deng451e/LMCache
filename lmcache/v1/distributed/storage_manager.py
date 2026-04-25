@@ -227,6 +227,7 @@ class StorageManager:
                     config=cxl_cfg,
                     local_region_va_base=self._cxl_adaptor.region_va_base,
                     local_meta=self._cxl_adaptor.get_subregion_meta(),
+                    l1_manager=self._l1_manager,
                 )
                 prefetch_adapters.append(self._cxl_remote_l2_adapter)
                 prefetch_descriptors.append(

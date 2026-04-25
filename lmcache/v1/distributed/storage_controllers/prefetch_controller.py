@@ -651,11 +651,20 @@ class PrefetchController(StorageControllerInterface):
                 ]
             else:
                 per_adapter_objs = []
-            task_id = adapter.submit_load_task(
-                per_adapter_keys,
-                per_adapter_objs,
-                lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
-            )
+            try:
+                task_id = adapter.submit_load_task(
+                    per_adapter_keys,
+                    per_adapter_objs,
+                    lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+                    layout_desc=request.layout_desc,
+                )
+            except TypeError:
+                # Adapter doesn't accept layout_desc kwarg (legacy)
+                task_id = adapter.submit_load_task(
+                    per_adapter_keys,
+                    per_adapter_objs,
+                    lookup_task_id=request.completed_lookup_task_ids.get(adapter_idx),
+                )
             request.pending_load_tasks[adapter_idx] = task_id
 
         ## Step 8: update the lookup result based on the final load plan

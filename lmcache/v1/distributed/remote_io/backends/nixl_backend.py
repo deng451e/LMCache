@@ -50,11 +50,18 @@ logger = init_logger(__name__)
 
 @dataclass
 class _RemoteKeyHandle:
-    """Cached result for one found key from one lookup task."""
+    """Cached result for one found key from one lookup task.
+
+    Stores the compact (byte_offset, byte_size) form received in the
+    LookupResponse. NIXL prep_xfer_dlist page indices are computed on demand
+    in _run_load using align_bytes; this avoids shipping per-page lists on
+    the wire (~3000x smaller LookupResponse for 33 MB chunks at 4 KB pages).
+    """
 
     peer_id: str
     found_position: int
-    pages: list[int]
+    byte_offset: int
+    byte_size: int
 
 
 # ---------------------------------------------------------------------------
@@ -477,6 +484,8 @@ class NixlIOAdapter(RemoteIOAdapter):
 
     def _lookup_worker(self, task_id: IOTaskId, keys: list[ObjectKey]) -> None:
         """Background: fan-out lookup to all peers and populate handle cache."""
+        import time as _time
+        _lookup_t0 = _time.monotonic()
         wire_keys = [
             WireObjectKey(
                 chunk_hash=k.chunk_hash,
@@ -514,8 +523,11 @@ class NixlIOAdapter(RemoteIOAdapter):
                     peer_hits,
                     num_keys,
                 )
-                for pos, pages in zip(
-                    resp.found_positions, resp.pages_per_found, strict=False
+                for pos, byte_offset, byte_size in zip(
+                    resp.found_positions,
+                    resp.byte_offsets,
+                    resp.byte_sizes,
+                    strict=False,
                 ):
                     key = keys[pos]
                     if key in entry.handles:
@@ -531,7 +543,8 @@ class NixlIOAdapter(RemoteIOAdapter):
                     entry.handles[key] = _RemoteKeyHandle(
                         peer_id=state.peer_id,
                         found_position=pos,
-                        pages=pages,
+                        byte_offset=byte_offset,
+                        byte_size=byte_size,
                     )
                     merged_bitmap.set(pos)
             except Exception:
@@ -540,12 +553,14 @@ class NixlIOAdapter(RemoteIOAdapter):
                     self._disconnected_peers.add(state.peer_id)
 
         total_hits = merged_bitmap.popcount()
+        _cp_ms = (_time.monotonic() - _lookup_t0) * 1000.0
         logger.info(
-            "[Remote] lookup task %d complete: %d/%d keys found across %d peer(s)",
+            "[Remote] lookup task %d complete: %d/%d keys found across %d peer(s) cp_ms=%.2f",
             task_id,
             total_hits,
             num_keys,
             len(peers),
+            _cp_ms,
         )
 
         with self._handle_cache_lock:
@@ -686,7 +701,11 @@ class NixlIOAdapter(RemoteIOAdapter):
             local_start = local_obj.meta.address // align_bytes
             local_num = local_obj.meta.phy_size // align_bytes
             local_pages = list(range(local_start, local_start + local_num))
-            remote_pages = handle.pages
+            # Reconstruct remote page indices on demand from compact (offset, size).
+            # This used to be shipped on the wire as pages_per_found[i].
+            remote_start = handle.byte_offset // align_bytes
+            remote_num = handle.byte_size // align_bytes
+            remote_pages = list(range(remote_start, remote_start + remote_num))
 
             if len(local_pages) != len(remote_pages):
                 logger.warning(
@@ -726,6 +745,7 @@ class NixlIOAdapter(RemoteIOAdapter):
             with state.rdma_cv:
                 state.rdma_inflight += 1
             try:
+                _dp_t0 = __import__("time").monotonic()
                 xfer_handle = nixl_agent.make_prepped_xfer(
                     "READ",
                     xfer_handler,
@@ -743,12 +763,16 @@ class NixlIOAdapter(RemoteIOAdapter):
                     for ki in per_peer_key_idxs[peer_id]:
                         result_bitmap.set(ki)
                     total_success += len(per_peer_key_idxs[peer_id])
+                    _dp_ms = (__import__("time").monotonic() - _dp_t0) * 1000.0
+                    _dp_bytes = len(local_indices) * align_bytes
                     logger.info(
                         "[Remote] fetch task %d: peer %s RDMA READ done — "
-                        "%d keys transferred",
+                        "%d keys transferred dp_ms=%.2f bytes=%d",
                         task_id,
                         peer_id,
                         len(per_peer_key_idxs[peer_id]),
+                        _dp_ms,
+                        _dp_bytes,
                     )
                 else:
                     logger.error(
