@@ -27,6 +27,7 @@ jobs:
             registry-1.docker.io:443
             index.docker.io:443
             production.cloudflare.docker.com:443
+            production.cloudfront.docker.com:443
             auth.docker.io:443
             azure.archive.ubuntu.com:80
             pypi.org:443
@@ -143,6 +144,7 @@ jobs:
               github.com:443
               registry-1.docker.io:443
               production.cloudflare.docker.com:443
+              production.cloudfront.docker.com:443
               auth.docker.io:443
               azure.archive.ubuntu.com:80
               pypi.org:443
