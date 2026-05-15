@@ -132,10 +132,10 @@ ARG LMCACHE_VERSION
 RUN . /opt/venv/bin/activate && \
     CUDA_TAG=cu$(echo ${CUDA_VERSION} | tr -d '.') && \
     VER=$(echo ${LMCACHE_VERSION} | sed 's/^v//') && \
-    uv pip install --prerelease=allow \
-        vllm[runai,tensorizer,flashinfer] \
-        --extra-index-url https://download.pytorch.org/whl/${CUDA_TAG} \
-        --index-strategy unsafe-best-match && \
+    uv pip install 'setuptools>=77.0.3,<81.0.0' 'packaging>=24.2' && \
+    uv pip install vllm \
+        --extra-index-url https://wheels.vllm.ai/0.20.2/cu129 \
+        --extra-index-url https://download.pytorch.org/whl/cu129 && \
     uv pip install lmcache==${VER} \
         --extra-index-url https://download.pytorch.org/whl/${CUDA_TAG} \
         --find-links https://github.com/LMCache/LMCache/releases/expanded_assets/v${VER}-cu129 \
