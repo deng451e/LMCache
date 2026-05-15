@@ -33,22 +33,17 @@ Install LMCache
 
                     .. tab-item:: CUDA 12.9
 
-                        The CUDA 12.9 wheel is published to a dedicated
-                        `GitHub Release <https://github.com/LMCache/LMCache/releases>`__ rather than PyPI.
-
                         .. code-block:: bash
 
                             uv venv --python 3.12
                             source .venv/bin/activate
-                            VERSION=0.4.3  # replace with target release
-                            uv pip install lmcache==${VERSION} \
-                                --extra-index-url https://download.pytorch.org/whl/cu129 \
-                                --find-links https://github.com/LMCache/LMCache/releases/expanded_assets/v${VERSION}-cu129 \
-                                --index-strategy unsafe-best-match
+                            uv pip install lmcache \
+                                --index-url https://download.pytorch.org/whl/cu129 \
+                                --extra-index-url https://pypi.org/simple
 
                         .. note::
 
-                            ``--extra-index-url https://download.pytorch.org/whl/cu129`` ensures the CUDA 12.9
+                            ``--index-url https://download.pytorch.org/whl/cu129`` ensures the CUDA 12.9
                             build of PyTorch is resolved. Without it, pip may select a mismatched CUDA variant.
 
             .. tab-item:: Nightly
