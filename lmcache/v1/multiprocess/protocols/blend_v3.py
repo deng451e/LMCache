@@ -15,6 +15,7 @@ REQUEST_NAMES = [
     "CB_UNREGISTER_ROPE_V3",
     "CB_RETRIEVE_PRE_COMPUTED_V3",
     "CB_UNIFIED_LOOKUP",
+    "CB_INDEX_RETRIEVE_V3",
 ]
 
 
@@ -64,6 +65,22 @@ def get_protocol_definitions() -> dict[str, ProtocolDefinition]:
             # Nullable: handler returns None to defer until both the prefix and
             # the sparse chunks are in L1 (mirrors dense QUERY_PREFETCH_STATUS).
             response_class=CBUnifiedLookupResult | None,
+            handler_type=HandlerType.BLOCKING,
+        ),
+        # M3 index side-cache scatter: reserve the matched chunks by content
+        # hash (the index has no lookup of its own), then run the standard
+        # pre-computed scatter + key-only re-RoPE on the index pseudo-instance.
+        # Payload mirrors CB_RETRIEVE_PRE_COMPUTED_V3.
+        # Returns: (event_ipc_handle: bytes, success: bool).
+        "CB_INDEX_RETRIEVE_V3": ProtocolDefinition(
+            payload_classes=[
+                IPCCacheServerKey,
+                list[CBMatchResult],
+                list[int],
+                int,
+                bytes,
+            ],
+            response_class=tuple[bytes, bool],
             handler_type=HandlerType.BLOCKING,
         ),
     }

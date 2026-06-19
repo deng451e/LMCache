@@ -89,6 +89,10 @@ class RequestType(enum.Enum):
     P2P_QUERY_LOOKUP_RESULTS = enum.auto()
     P2P_UNLOCK_OBJECTS = enum.auto()
 
+    # M3 index side-cache scatter (reserve-by-hash then cb_retrieve_pre_computed).
+    # Appended last so existing auto() values stay stable.
+    CB_INDEX_RETRIEVE_V3 = enum.auto()
+
 
 @dataclass
 class ProtocolDefinition:

@@ -409,6 +409,11 @@ class BlendV3Module(InstanceLivenessTarget):
                 self.cb_retrieve_pre_computed,
                 ThreadPoolType.AFFINITY,
             ),
+            HandlerSpec(
+                RequestType.CB_INDEX_RETRIEVE_V3,
+                self.cb_index_retrieve,
+                ThreadPoolType.AFFINITY,
+            ),
         ]
 
     def report_status(self) -> dict:
@@ -1402,10 +1407,13 @@ class BlendV3Module(InstanceLivenessTarget):
                 gpu_context.get_temp_kernel_group_buffer(slot_idx, group_idx)
                 for slot_idx in range(batch_len)
             ]
-            if all_slots[0].shape[0] != 2:
+            # kv_size 2 = main K/V; kv_size 1 = M3 key-only index side cache.
+            # Either way only the K plane (tmp[0]) is re-RoPE'd below, so both
+            # are supported; reject anything else (compressed/true-MLA).
+            if all_slots[0].shape[0] not in (1, 2):
                 raise RuntimeError(
                     f"CB v3: group {group_idx} has kv_size={all_slots[0].shape[0]}; "
-                    "MLA layouts unsupported."
+                    "only K/V (2) and key-only (1) layouts are supported."
                 )
             num_layers, slots, hidden_dim = all_slots[0].shape[1:]
             n_heads = hidden_dim // rope_state.head_size
@@ -1748,3 +1756,66 @@ class BlendV3Module(InstanceLivenessTarget):
             ),
         )
         return event.ipc_handle(), True
+
+    def cb_index_retrieve(
+        self,
+        key: IPCCacheServerKey,
+        cb_match_result: list[CBMatchResult],
+        gpu_block_ids: list[int],
+        instance_id: int,
+        event_ipc_handle: bytes,
+    ) -> tuple[bytes, bool]:
+        """Scatter matched M3 index-key chunks into the index pseudo-instance.
+
+        The index side cache has no unified lookup of its own, so its objects
+        are never reserve-read by the main request's lookup. Reserve the matched
+        chunks here -- by the same content hashes / per-worker key that
+        ``cb_retrieve_pre_computed`` will read -- then delegate the scatter and
+        key-only re-RoPE to it. L1 reserve is synchronous, so the delegate can
+        read immediately.
+
+        Args mirror ``cb_retrieve_pre_computed``: ``key`` is the ``::cb_index``
+        request key (worker_id set), ``cb_match_result`` the matched ranges,
+        ``gpu_block_ids`` the index group's blocks, ``instance_id`` the index
+        pseudo-instance.
+
+        Returns:
+            tuple[bytes, bool]: scatter-complete event handle + whether it ran.
+
+        Raises:
+            ValueError: If the index instance has no registered KV cache.
+        """
+        if not cb_match_result:
+            return event_ipc_handle, True
+        entry = self._transfer_module.get_and_touch_context_entry(instance_id)
+        if entry is None:
+            raise ValueError(
+                f"Instance {instance_id} not registered for paged KV cache"
+            )
+        layout_desc = self._ctx.layout_desc_registry.find(
+            entry.model_name, key.world_size
+        )
+        if layout_desc is None:
+            logger.error(
+                "CB index retrieve: no layout desc for model %s ws %d; skipping.",
+                entry.model_name,
+                key.world_size,
+            )
+            return event_ipc_handle, False
+        obj_keys = ipc_key_to_object_keys(key, [r.hash for r in cb_match_result], [0])[
+            0
+        ]
+        # Reserve_read (SPARSE: every matched chunk, gap-tolerant). The key is
+        # per-worker (one reader) so extra_count=0; read_prefetched_results in
+        # the delegate releases the locks. NOTE: L1 reserve is synchronous; an
+        # L2-resident index chunk would need polling (not handled here).
+        self._ctx.storage_manager.submit_prefetch_task(
+            obj_keys,
+            layout_desc,
+            extra_count=0,
+            external_request_id=key.request_id,
+            policy=TrimPolicy.SPARSE,
+        )
+        return self.cb_retrieve_pre_computed(
+            key, cb_match_result, gpu_block_ids, instance_id, event_ipc_handle
+        )
