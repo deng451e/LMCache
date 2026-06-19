@@ -162,7 +162,17 @@ def create_engine_group_infos_from_vllm(
             # per chunk is discovered later from the registered tensors.
             group_tokens_per_block[engine_group_id] = group.kv_cache_spec.block_size
             for name in group.layer_names:
-                per_layer_group_idx[layer_to_idx[name]] = engine_group_id
+                # A KV connector may register only a subset of a model's caches:
+                # e.g. CacheBlend manages MiniMax-M3's key-only index side cache
+                # out-of-band and omits it from the registered tensors. Such a
+                # layer appears in a vLLM group but has no entry in
+                # ``layer_to_idx``; skip it so the remaining (registered) layers
+                # still group correctly. No-op for models that register every
+                # layer (every group name is present), so existing paths are
+                # unchanged.
+                idx = layer_to_idx.get(name)
+                if idx is not None:
+                    per_layer_group_idx[idx] = engine_group_id
         per_layer_sw_size = _resolve_per_layer_sw_sizes(
             vllm_groups, layer_to_idx, num_layers
         )
