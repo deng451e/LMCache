@@ -16,6 +16,7 @@ from lmcache.utils import (
     EngineType,
     _lmcache_nvtx_annotate,
 )
+from lmcache.v1.common.buffer_registration import CompositeBufferRegistration
 from lmcache.v1.common.custom_types import IPCCacheServerKey, KVEventProfile
 from lmcache.v1.common.group_view import EngineGroupInfo
 from lmcache.v1.common.logging import init_logger
@@ -28,6 +29,9 @@ from lmcache.v1.distributed.api import (
     ShardReplicationDesc,
 )
 from lmcache.v1.distributed.storage_manager import L1WriteCompletion, l1_owners_of
+from lmcache.v1.distributed.transfer_channel import (
+    TransferChannelStagingRegistration,
+)
 from lmcache.v1.gpu_connector.gds_context import GDSBufferRegistration
 from lmcache.v1.kv_layer_groups import ObjectGroupInfo
 from lmcache.v1.memory_management import MemoryObj
@@ -1110,7 +1114,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             separate_object_groups=self._ctx.separate_object_groups,
             full_sw_kv=self._ctx.full_sw_kv,
             object_group_transfer=transfer_kv_per_object_group,
-            buffer_registration=GDSBufferRegistration(),
+            # GDS reads and, under GPU-direct borrowing, peer reads land in
+            # the staging buffer; each registration is a no-op when unused.
+            buffer_registration=CompositeBufferRegistration(
+                [GDSBufferRegistration(), TransferChannelStagingRegistration()]
+            ),
         )
 
     @request_handler(
