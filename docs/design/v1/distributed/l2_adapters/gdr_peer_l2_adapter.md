@@ -88,6 +88,15 @@ consecutive batches do not overlap, and the retrieve holds its affinity thread
 while reads run. Per-engine staging lanes with a deferred retrieve reply are
 the follow-up.
 
+## Peer clients
+
+The transfer channel keeps one client per peer URL. A GDR adapter whose
+removal waits for its leases (see Failures) can still hold that client when
+the controller adds a new adapter for the same peer. Adapters therefore take
+the client with `acquire_transfer_channel_client` and give it back with
+`release_transfer_channel_client`; the client is removed only when its last
+user releases it.
+
 ## Failures
 
 | Failure | Behavior |

@@ -347,3 +347,14 @@ def test_gdr_mode_adds_a_dram_shadow_l1_once() -> None:
     assert with_shadow_l1(shadowed, MemorySegment.DRAM) is shadowed
     assert [c.tag for c in config.l1_manager_configs] == ["_default"]
 
+
+def test_two_adapters_of_one_peer_share_its_client_until_both_close() -> None:
+    """A removal deferred by a live lease must not close the client that a
+    re-added adapter for the same peer is using."""
+    tc_ctx = MagicMock()
+    tc_ctx.get_transfer_channel_client.return_value = MagicMock()
+    with _adapter(tc_ctx=tc_ctx):
+        with _adapter(tc_ctx=tc_ctx):
+            pass
+        tc_ctx.remove_transfer_channel_client.assert_not_called()
+    tc_ctx.remove_transfer_channel_client.assert_called_once_with("peer:7600")
