@@ -296,7 +296,7 @@ def test_a_staging_buffer_that_cannot_be_created_fails_the_retrieve(h) -> None:
 
 
 def _drain(h) -> threading.Thread:
-    thread = threading.Thread(target=h.engine.drain, args=(h.cc,), daemon=True)
+    thread = threading.Thread(target=h.engine.drain, args=(h.cc, 30), daemon=True)
     thread.start()
     thread.join(0.1)
     return thread
@@ -313,6 +313,17 @@ def test_drain_waits_until_the_contexts_retrieves_completed(h) -> None:
     h.poller.poll()
     drain.join(5)
     assert not drain.is_alive() and len(_kernels(h.log)) == 1
+
+
+def test_drain_gives_up_after_its_timeout(h) -> None:
+    """The caller then leaves the context open; a read that lands later
+    still finds its slots and queues its kernels."""
+    assert h.engine.drain(h.cc, 0.05) is True  # nothing to wait for
+    _, outcome = h.retrieve("ab")
+    assert h.engine.drain(h.cc, 0.05) is False
+    h.p.reads[0].finished = True
+    h.poller.poll()
+    assert outcome == [True] and len(_kernels(h.log)) == 1
 
 
 def test_drain_does_not_wait_after_close(h) -> None:

@@ -21,6 +21,9 @@ from unittest.mock import MagicMock
 import time
 import weakref
 
+# Third Party
+import pytest
+
 # First Party
 from lmcache.v1.multiprocess.modules.lmcache_driven_transfer import (
     LMCacheDrivenTransferModule,
@@ -112,13 +115,17 @@ def test_unregister_reclaims_ipc_memory(monkeypatch) -> None:
     assert module.context_entries_snapshot() == {}
 
 
-def test_unregister_drains_peer_reads_before_closing_the_context(monkeypatch) -> None:
+@pytest.mark.parametrize("drained", [True, False])
+def test_unregister_drains_peer_reads_before_closing_the_context(
+    monkeypatch, drained
+) -> None:
     """Reads of objects a peer owns land outside the stream, so the stream
-    synchronize in close() does not wait for them."""
+    synchronize in close() does not wait for them. A context whose reads do
+    not stop in time stays open: they may still write to its slots."""
     order: list = []
     engine = MagicMock()
-    engine.drain.side_effect = lambda cache_context: order.append(
-        ("drain", cache_context)
+    engine.drain.side_effect = lambda cache_context, timeout_s: (
+        order.append(("drain", cache_context)) or drained
     )
     monkeypatch.setattr(gpu_mod, "NicDmaEngine", lambda: engine)
     monkeypatch.setattr(gpu_mod, "torch_dev", _FakeTorchDev())
@@ -128,7 +135,7 @@ def test_unregister_drains_peer_reads_before_closing_the_context(monkeypatch) ->
 
     module.unregister_kv_cache(7)
 
-    assert order == [("drain", ctx), "close"]
+    assert order == [("drain", ctx), "close"][: 1 + drained]
 
 
 def test_unregister_unknown_instance_does_not_reclaim(monkeypatch) -> None:

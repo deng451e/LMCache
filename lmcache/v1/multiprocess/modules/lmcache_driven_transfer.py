@@ -244,6 +244,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
     module_name = "lmcache_driven_transfer"
     _host_event_waiter: HostEventWaiter | None = None
+    # How long releasing an instance waits for its peer reads to stop.
+    _peer_read_drain_s: float = 31.0
 
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
@@ -258,6 +260,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         module._host_event_waiter = create_host_event_waiter(
             build_ctx.mp_config.rocm_host_event_wait
         )
+        module._peer_read_drain_s = build_ctx.mp_config.p2p_config.load_timeout + 1
         return module
 
     def __init__(self, ctx: MPCacheServerContext, fd_socket_path: str = "") -> None:
@@ -481,8 +484,15 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             return
         for entry in entries:
             # Peer reads land outside the stream, which close() waits for.
-            self._nic_dma.drain(entry.cache_context)
-            entry.cache_context.close()
+            if self._nic_dma.drain(entry.cache_context, self._peer_read_drain_s):
+                entry.cache_context.close()
+            else:
+                logger.error(
+                    "Peer reads of %s did not stop in %.0f s: its cache context "
+                    "stays open, since they may still write to its slots",
+                    entry.model_name,
+                    self._peer_read_drain_s,
+                )
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
             )

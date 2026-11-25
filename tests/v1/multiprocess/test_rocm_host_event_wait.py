@@ -142,6 +142,7 @@ def _build(
         mp_config=SimpleNamespace(
             supported_transfer_mode="lmcache_driven",
             rocm_host_event_wait=enabled,
+            p2p_config=SimpleNamespace(load_timeout=30.0),
             port=0,
         ),
         engine_context=server_context,

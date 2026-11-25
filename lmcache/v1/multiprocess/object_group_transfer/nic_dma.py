@@ -265,8 +265,11 @@ class NicDmaEngine:
         self._poller = poller
         self._closed = False
         self._lock = threading.Lock()
-        # By id(context); drain() removes a context's entry before it closes.
+        # By id(context); drain() removes a context's entry before the
+        # context can be freed and its id reused.
         self._staging: dict[int, _NicStaging] = {}
+        # Buffers of contexts whose reads did not stop in time: never freed.
+        self._undrained: list[_NicStaging] = []
 
     def read(
         self,
@@ -307,7 +310,7 @@ class NicDmaEngine:
             staging.active += 1
         return _Retrieve(cache_context, staging, poller, runs, finish).response
 
-    def drain(self, cache_context: BaseCacheContext) -> None:
+    def drain(self, cache_context: BaseCacheContext, timeout_s: float) -> bool:
         """Wait until every retrieve of ``cache_context`` completed. Call
         before closing the context, and not on its affinity worker: closing
         deregisters the slots reads land in and unmaps the KV cache their
@@ -315,13 +318,23 @@ class NicDmaEngine:
 
         Args:
             cache_context: The context about to be closed.
+            timeout_s: How long to wait.
+
+        Returns:
+            False if a retrieve is still running after ``timeout_s``: the
+            context must then stay open. Its NIC staging buffer is kept
+            for good, since a read may still write to it.
         """
-        staging = self._staging.get(id(cache_context))
+        staging = self._staging.pop(id(cache_context), None)
         if staging is None:
-            return
+            return True
         with staging.idle:
-            staging.idle.wait_for(lambda: staging.active == 0 or self._closed)
-        del self._staging[id(cache_context)]
+            drained = staging.idle.wait_for(
+                lambda: staging.active == 0 or self._closed, timeout_s
+            )
+        if not drained:
+            self._undrained.append(staging)
+        return drained
 
     def close(self) -> None:
         """Stop the poller; reads in flight are abandoned."""
@@ -330,9 +343,6 @@ class NicDmaEngine:
         if poller is not None:
             poller.stop()
         self._closed = True
-        for staging in list(self._staging.values()):
-            with staging.idle:
-                staging.idle.notify_all()
 
     def _create(self, cache_context: BaseCacheContext) -> _NicStaging:
         groups = range(cache_context.kv_layer_groups_manager.num_object_groups)
