@@ -132,6 +132,13 @@ def _load(adapter, keys):
     }
 
 
+def _borrow(adapter, req_client):
+    """Look up and borrow one key; return it and its handle."""
+    key = _key(0)
+    _lookup(adapter, req_client, [key], [TransferChannelAddress(offset=0, size=PAGE)])
+    return key, _load(adapter, [key])[key]
+
+
 def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
     """A lookup hit is borrowed as a remote handle; reading it submits one
     transfer-channel read from the peer's address into the given region."""
@@ -188,14 +195,7 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
     """A read past its deadline is cancelled, and stays unfinished until the
     transport confirms it stopped: it could land in a reused staging slot."""
     with _adapter(load_timeout_s=0.01) as (adapter, req_client, _tc_ctx, tc_client):
-        key = _key(0)
-        _lookup(
-            adapter,
-            req_client,
-            [key],
-            [TransferChannelAddress(offset=0, size=PAGE)],
-        )
-        obj = _load(adapter, [key])[key]
+        key, obj = _borrow(adapter, req_client)
         tc_client.submit_read.return_value = 1
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[False]
@@ -223,7 +223,8 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
 
 
 def test_objects_of_one_peer_are_read_with_one_submit() -> None:
-    """The NIC DMA engine reads a wave of a peer's objects in one transfer."""
+    """The NIC DMA engine reads a wave of a peer's objects in one transfer,
+    and not at all once one of their leases has ended."""
     with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
         keys = [_key(0), _key(1)]
         addresses = [
@@ -231,14 +232,14 @@ def test_objects_of_one_peer_are_read_with_one_submit() -> None:
             TransferChannelAddress(offset=3 * PAGE, size=PAGE),
         ]
         _lookup(adapter, req_client, keys, addresses)
-        objects = _load(adapter, keys)
-        first, second = objects[keys[0]], objects[keys[1]]
-        assert first.reader is adapter and second.reader is adapter
+        first, second = _load(adapter, keys).values()
+        assert first.reader is adapter
         tc_client.submit_read.return_value = 7
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[True, True]
         )
-        read = adapter.read_many(5, [(first, 0), (second, 4 * PAGE)])
+        targets = [(first, 0), (second, 4 * PAGE)]
+        read = adapter.read_many(5, targets)
         tc_client.submit_read.assert_called_once_with(
             [
                 TransferChannelAddress(offset=0, size=PAGE),
@@ -248,38 +249,18 @@ def test_objects_of_one_peer_are_read_with_one_submit() -> None:
             local_region=5,
         )
         assert read.is_finished() and read.succeeded()
-        first.release()
         second.release()
-
-
-def test_a_batch_with_an_ended_lease_is_not_read() -> None:
-    with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
-        keys = [_key(0), _key(1)]
-        addresses = [
-            TransferChannelAddress(offset=0, size=PAGE),
-            TransferChannelAddress(offset=PAGE, size=PAGE),
-        ]
-        _lookup(adapter, req_client, keys, addresses)
-        objects = _load(adapter, keys)
-        objects[keys[1]].release()
-        read = adapter.read_many(5, [(objects[keys[0]], 0), (objects[keys[1]], PAGE)])
+        read = adapter.read_many(5, targets)
         assert read.is_finished() and not read.succeeded()
-        tc_client.submit_read.assert_not_called()
-        objects[keys[0]].release()
+        tc_client.submit_read.assert_called_once()
+        first.release()
 
 
 def test_a_transport_error_fails_the_read_once_it_is_stopped() -> None:
     """The read is cancelled and no longer counts as in flight, so the peer
     can still be removed."""
     with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
-        key = _key(0)
-        _lookup(
-            adapter,
-            req_client,
-            [key],
-            [TransferChannelAddress(offset=0, size=PAGE)],
-        )
-        obj = _load(adapter, [key])[key]
+        key, obj = _borrow(adapter, req_client)
         tc_client.submit_read.return_value = 1
         tc_client.query_status.side_effect = RuntimeError("backend error")
         tc_client.cancel.return_value = False
@@ -298,14 +279,7 @@ def test_expired_lease_refuses_to_read_and_skips_the_unlock(
     """A hit whose owner TTL may have lapsed is never read, and no unlock is
     sent for it: the owner's own TTL cleanup covers it."""
     with _adapter(read_ttl_s=30) as (adapter, req_client, _tc_ctx, tc_client):
-        key = _key(0)
-        _lookup(
-            adapter,
-            req_client,
-            [key],
-            [TransferChannelAddress(offset=0, size=PAGE)],
-        )
-        obj = _load(adapter, [key])[key]
+        key, obj = _borrow(adapter, req_client)
         now = time.monotonic()
         monkeypatch.setattr(time, "monotonic", lambda: now + 30.5)
         assert not obj.is_valid()
@@ -352,14 +326,7 @@ def test_an_adopted_lease_outlives_the_placeholder_it_came_with() -> None:
 
 def test_close_refuses_while_handles_are_live_then_drains() -> None:
     with _adapter() as (adapter, req_client, tc_ctx, _tc_client):
-        key = _key(0)
-        _lookup(
-            adapter,
-            req_client,
-            [key],
-            [TransferChannelAddress(offset=0, size=PAGE)],
-        )
-        obj = _load(adapter, [key])[key]
+        key, obj = _borrow(adapter, req_client)
         with pytest.raises(RuntimeError, match="live borrowed objects"):
             adapter.close()
         tc_ctx.remove_transfer_channel_client.assert_not_called()

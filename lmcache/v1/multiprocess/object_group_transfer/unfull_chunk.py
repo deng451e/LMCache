@@ -3,7 +3,7 @@
 
 # Standard
 from itertools import accumulate
-from typing import Sequence
+from typing import Sequence, cast
 
 # Third Party
 import torch
@@ -182,14 +182,13 @@ def get_unfull_chunk_staging_buffer(
     Args:
         cache_context: The GPU cache context containing the KV cache information.
         object_group_id: Index of the object group being copied.
-        staging: The staging buffer; None means the context's own.
-        slot: The slot the object starts in.
+        staging: Another staging buffer, e.g. the NIC one.
+        slot: The slot in ``staging`` the object starts in.
 
     Returns:
-        The object group's region of ``slot`` when no kernel group has a
-        lead block. Otherwise the start of ``slot`` (of the staging buffer
-        for the context's own), sized to the object; None when the object
-        does not fit there.
+        The object group's region of the first slot when no kernel group has
+        a lead block. Otherwise the start of that slot (of the buffer, for the
+        context's own), sized to the object; None when it does not fit.
 
     Notes:
         An object with lead-block regions is larger than one slot, so it
@@ -220,8 +219,6 @@ def get_unfull_chunk_staging_buffer(
         staging.get_temp_object_group_buffer(slot, 0).data_ptr()
         - staging.buffer.data_ptr()
     )
-    if start + num_bytes > staging.buffer.numel():
-        return None
     return staging.buffer[start : start + num_bytes]
 
 
@@ -249,21 +246,18 @@ def transfer_unfull_chunk(
         object_buffer: The object's staging region, from
             :func:`get_unfull_chunk_staging_buffer`.
         direction: H2D (retrieve) or D2H (store).
-        staging: A staging buffer the object's bytes already landed in, at
-            ``slot``; None stages them in the context's own buffer.
+        staging: A buffer the object already landed in, at ``slot``.
         slot: The object's slot in ``staging``.
 
     Returns:
-        On retrieve of an object a peer owns into the context's own buffer,
-        the run for the NIC DMA engine (nothing is queued); else None.
+        For an object a peer owns on retrieve without ``staging``, the run
+        for the NIC DMA engine (nothing is queued); else None.
 
     Raises:
         ValueError: If a store targets an object a peer owns.
 
     Notes:
-        Staged by the engine ``memory_obj`` selects, except an object a peer
-        owns: the NIC DMA engine reads it into its own buffer and calls back
-        with ``staging``.
+        Staged by the engine ``memory_obj`` selects.
     """
     kernel_group_ids = cache_context.kv_layer_groups_manager.object_groups[
         object_group_id
@@ -271,14 +265,30 @@ def transfer_unfull_chunk(
     is_h2d = direction == lmcache_native.TransferDirection.H2D
     engine = select_engine(memory_obj)
     if engine is TransferEngine.NIC_DMA and is_h2d and staging is None:
-        return _defer_peer_unfull_chunk(
-            cache_context,
-            block_ids_gpu,
-            skip_blocks,
-            lead_blocks,
-            memory_obj,
-            object_group_id,
-        )
+        # The NIC DMA engine reads it into its spare rows and calls back.
+        block_ids = [ids.clone() for ids in block_ids_gpu]
+
+        def targets(nic: StagingBuffer, slots: Sequence[int]) -> list[torch.Tensor]:
+            region = get_unfull_chunk_staging_buffer(
+                cache_context, object_group_id, nic, slots[0]
+            )
+            return [cast(torch.Tensor, region)]
+
+        def launch(nic: StagingBuffer, slots: Sequence[int]) -> None:
+            transfer_unfull_chunk(
+                cache_context,
+                block_ids,
+                skip_blocks,
+                lead_blocks,
+                memory_obj,
+                object_group_id,
+                targets(nic, slots)[0],
+                direction,
+                nic,
+                slots[0],
+            )
+
+        return DeferredNicRun([memory_obj], targets, launch, spans_slots=True)
     lead_group_ids = [
         kernel_group_id
         for kernel_group_id in kernel_group_ids
@@ -351,44 +361,6 @@ def transfer_unfull_chunk(
     if not is_h2d:
         stage(engine, [memory_obj], [object_buffer], direction)
     return None
-
-
-def _defer_peer_unfull_chunk(
-    cache_context: BaseCacheContext,
-    block_ids_gpu: list[torch.Tensor],
-    skip_blocks: list[int],
-    lead_blocks: list[int],
-    memory_obj: MemoryObj,
-    object_group_id: int,
-) -> DeferredNicRun:
-    """The run that reads a peer's unfull-chunk object, then copies it in."""
-    # Stream-ordered copy, queued before a later transfer restages the
-    # shared block-id buffer.
-    block_ids = [ids.clone() for ids in block_ids_gpu]
-
-    def targets(staging: StagingBuffer, slots: Sequence[int]) -> list[torch.Tensor]:
-        region = get_unfull_chunk_staging_buffer(
-            cache_context, object_group_id, staging, slots[0]
-        )
-        if region is None:
-            raise ValueError("The unfull chunk does not fit the NIC staging buffer")
-        return [region]
-
-    def launch(staging: StagingBuffer, slots: Sequence[int]) -> None:
-        transfer_unfull_chunk(
-            cache_context,
-            block_ids,
-            skip_blocks,
-            lead_blocks,
-            memory_obj,
-            object_group_id,
-            targets(staging, slots)[0],
-            lmcache_native.TransferDirection.H2D,
-            staging=staging,
-            slot=slots[0],
-        )
-
-    return DeferredNicRun([memory_obj], targets, launch, spans_slots=True)
 
 
 def split_unfull_chunk_block_ids(

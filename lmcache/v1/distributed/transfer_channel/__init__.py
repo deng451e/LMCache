@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 # Standard
-from dataclasses import dataclass
 from typing import TYPE_CHECKING
 import threading
 
@@ -42,11 +41,9 @@ __all__ = [
     "initialize_transfer_channel_context",
     "get_transfer_channel_context",
     "delete_transfer_channel_context",
-    "StagingRegion",
     "TransferChannelStagingRegistration",
     "enable_staging_buffers",
     "disable_staging_buffers",
-    "find_staging_region",
     "staging_alignment",
     "acquire_transfer_channel_client",
     "release_transfer_channel_client",
@@ -128,67 +125,32 @@ def delete_transfer_channel_context() -> None:
             del _client_users[key]
 
 
-# GPU-direct borrowing state, guarded by ``_context_lock``:
-# - the staging target and its alignment: enabled by the P2P controller once
-#   the context exists, disabled when it closes; read when the NIC DMA engine
-#   registers a NIC staging buffer (TransferChannelStagingRegistration).
-# - the staging regions: one per registered staging buffer, keyed by base
-#   address; read by the NIC DMA engine on every borrowed retrieve.
+# Where NIC staging buffers register, and their slot alignment: set by the
+# P2P controller under GPU-direct borrowing; guarded by ``_context_lock``.
 _staging_target: TransferChannelContext | None = None
 _staging_align_bytes = 1
 
 
-@dataclass(frozen=True)
-class StagingRegion:
-    """A NIC staging buffer as a transfer-channel region.
-
-    Attributes:
-        context: The transfer channel context the buffer is registered with.
-        region_id: The context's region id.
-        base_ptr: Start address.
-        size: Size in bytes.
-    """
-
-    context: TransferChannelContext
-    region_id: int
-    base_ptr: int
-    size: int
-
-
-_staging_regions: dict[int, StagingRegion] = {}
-
-
 def enable_staging_buffers(context: TransferChannelContext, align_bytes: int) -> None:
-    """Let NIC staging buffers register with ``context``, with slots aligned
-    to ``align_bytes``.
-
-    Only a GPU-direct borrowing reader calls this: its peers' objects are read
-    straight into its NIC staging slots. Copy mode never registers GPU memory,
-    so its hosts need no GPUDirect support.
-
-    Args:
-        context: The transfer channel context to register with.
-        align_bytes: The alignment its regions need, the L1 alignment.
+    """Let NIC staging buffers register with ``context``, slots aligned to
+    ``align_bytes`` (the L1 alignment). Only a GPU-direct borrowing reader
+    calls this, so copy mode never registers GPU memory.
 
     Raises:
         ValueError: If ``align_bytes`` is not a positive power of two.
     """
     if align_bytes < 1 or align_bytes & (align_bytes - 1):
-        raise ValueError(
-            f"Staging slot alignment must be a power of two, got {align_bytes}"
-        )
+        raise ValueError(f"Alignment must be a power of two, got {align_bytes}")
     global _staging_target, _staging_align_bytes
     with _context_lock:
-        _staging_target = context
-        _staging_align_bytes = align_bytes
+        _staging_target, _staging_align_bytes = context, align_bytes
 
 
 def disable_staging_buffers() -> None:
     """Stop NIC staging buffers from registering."""
     global _staging_target, _staging_align_bytes
     with _context_lock:
-        _staging_target = None
-        _staging_align_bytes = 1
+        _staging_target, _staging_align_bytes = None, 1
 
 
 def staging_alignment() -> int:
@@ -198,79 +160,49 @@ def staging_alignment() -> int:
 
 
 class TransferChannelStagingRegistration(BufferRegistration):
-    """Register a NIC staging buffer with the transfer channel, so the NIC
-    DMA engine can read a peer's objects straight into its slots.
+    """Registers one NIC staging buffer as a transfer-channel region, so
+    peers' objects can be read straight into its slots. Needs
+    :func:`enable_staging_buffers`."""
 
-    Pass it to :meth:`BaseCacheContext.create_staging_buffer`; it needs
-    :func:`enable_staging_buffers`.
-    """
+    def __init__(self) -> None:
+        self._context: TransferChannelContext | None = None
+        self.region_id = -1
 
     def register(self, buffer: torch.Tensor) -> None:
-        """Register ``buffer`` as one transfer-channel region.
-
-        Args:
-            buffer: The NIC staging buffer.
+        """Register ``buffer``; :attr:`region_id` is then its region.
 
         Raises:
             RuntimeError: If staging buffers are not enabled (no
-                ``--p2p-load-mode gdr``), the buffer does not start and end on
-                the staging alignment, or the transfer channel refuses the
-                region.
+                ``--p2p-load-mode gdr``), ``buffer`` is not aligned, or the
+                transfer channel refuses it.
         """
         with _context_lock:
-            target = _staging_target
-            align = _staging_align_bytes
+            target, align = _staging_target, _staging_align_bytes
         if target is None:
             raise RuntimeError(
                 "Reading objects a peer owns into GPU memory needs --p2p-load-mode gdr"
             )
         ptr = buffer.data_ptr()
         if ptr % align or buffer.nbytes % align:
-            raise RuntimeError(
-                f"The staging buffer ({buffer.nbytes} bytes at {ptr:#x}) is not "
-                f"aligned to {align} bytes; GPU-direct borrowing cannot read "
-                "into it"
-            )
+            raise RuntimeError(f"The staging buffer at {ptr:#x} is not {align}-aligned")
         try:
-            region_id = target.register_memory_region(
+            self.region_id = target.register_memory_region(
                 ptr, buffer.nbytes, buffer.device.index
             )
         except ValueError as error:
-            raise RuntimeError(
-                "The transfer channel refused the staging buffer"
-            ) from error
-        with _context_lock:
-            _staging_regions[ptr] = StagingRegion(target, region_id, ptr, buffer.nbytes)
+            raise RuntimeError("The transfer channel refused the buffer") from error
+        self._context = target
 
     def deregister(self, buffer: torch.Tensor) -> None:
-        """Forget ``buffer``'s region and release it; a buffer that was not
-        registered is ignored.
-
-        Args:
-            buffer: The buffer previously passed to :meth:`register`.
-        """
-        with _context_lock:
-            region = _staging_regions.pop(buffer.data_ptr(), None)
-        if region is None:
+        """Release the region; nothing to do if :meth:`register` failed."""
+        if self._context is None:
             return
         try:
-            region.context.deregister_memory_region(region.region_id)
+            self._context.deregister_memory_region(self.region_id)
         except KeyError:
             # The context was closed first, which released every region.
-            logger.debug("Staging region %d was already released", region.region_id)
-
-
-def find_staging_region(ptr: int) -> StagingRegion | None:
-    """Return the registered staging region containing ``ptr``, if any.
-
-    Args:
-        ptr: An address inside a staging buffer.
-    """
-    with _context_lock:
-        for region in _staging_regions.values():
-            if region.base_ptr <= ptr < region.base_ptr + region.size:
-                return region
-    return None
+            logger.debug("Staging region %d was already released", self.region_id)
+        self._context = None
 
 
 # Peer clients shared by several adapters of the same peer (a removal can be

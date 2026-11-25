@@ -21,7 +21,6 @@ from lmcache.v1.distributed.transfer_channel import (  # noqa: E402
     TransferChannelStagingRegistration,
     disable_staging_buffers,
     enable_staging_buffers,
-    find_staging_region,
 )
 from lmcache.v1.platform.devices.cuda.cache_context import (  # noqa: E402
     GPUCacheContext,
@@ -69,39 +68,32 @@ def _context() -> GPUCacheContext:
 
 def test_nic_staging_buffer_is_aligned_registered_and_released_on_close() -> None:
     context = _enabled_context()
+    registration = TransferChannelStagingRegistration()
     try:
         ctx = _context()
-        staging = ctx.create_staging_buffer(
-            6, _ALIGN, TransferChannelStagingRegistration()
-        )
-        try:
-            assert staging.max_batch_size == 6
-            (call_,) = context.register_memory_region.call_args_list
-            ptr, size, device_index = call_.args
-            assert ptr == staging.buffer.data_ptr() and size == staging.buffer.nbytes
-            assert ptr % _ALIGN == 0 and size % _ALIGN == 0 and device_index == 0
-            # Every slot a peer's object is read into starts on the alignment,
-            # has the context's layout, and is found by address.
-            for slot in range(staging.max_batch_size):
-                buffer = staging.get_temp_object_group_buffer(slot, 0)
-                offset = buffer.data_ptr() - ptr
-                assert offset % _ALIGN == 0 and offset + buffer.nbytes <= size
-                assert buffer.nbytes == ctx.get_temp_object_group_buffer(0, 0).nbytes
-                assert (
-                    staging.get_temp_kernel_group_buffer(slot, 0).shape
-                    == ctx.get_temp_kernel_group_buffer(0, 0).shape
-                )
-                region = find_staging_region(buffer.data_ptr())
-                assert region is not None and region.region_id == 1
-            # The buffer the context's own transfers share is not registered.
-            shared = ctx.get_temp_object_group_buffer(0, 0).data_ptr()
-            assert find_staging_region(shared) is None
-        finally:
-            ctx.close()
+        staging = ctx.create_staging_buffer(6, _ALIGN, registration)
+        assert staging.max_batch_size == 6 and registration.region_id == 1
+        (call_,) = context.register_memory_region.call_args_list
+        ptr, size, device_index = call_.args
+        assert (ptr, size) == (staging.buffer.data_ptr(), staging.buffer.nbytes)
+        assert ptr % _ALIGN == 0 and size % _ALIGN == 0 and device_index == 0
+        # Every slot starts on the alignment and has the context's layout.
+        for slot in range(6):
+            buffer = staging.get_temp_object_group_buffer(slot, 0)
+            offset = buffer.data_ptr() - ptr
+            assert offset % _ALIGN == 0 and offset + buffer.nbytes <= size
+            assert buffer.nbytes == ctx.get_temp_object_group_buffer(0, 0).nbytes
+            assert (
+                staging.get_temp_kernel_group_buffer(slot, 0).shape
+                == ctx.get_temp_kernel_group_buffer(0, 0).shape
+            )
+        # At shutdown the transfer channel may close first, which already
+        # released the region.
+        context.deregister_memory_region.side_effect = KeyError(1)
+        ctx.close()
     finally:
         disable_staging_buffers()
     context.deregister_memory_region.assert_called_once_with(1)
-    assert find_staging_region(ptr) is None
 
 
 def test_a_nic_staging_buffer_needs_gdr() -> None:
@@ -111,17 +103,3 @@ def test_a_nic_staging_buffer_needs_gdr() -> None:
             ctx.create_staging_buffer(2, _ALIGN, TransferChannelStagingRegistration())
     finally:
         ctx.close()
-
-
-def test_close_tolerates_a_transfer_channel_that_closed_first() -> None:
-    """At shutdown the P2P controller may close the transfer channel, which
-    releases every region, before the cache context deregisters its own."""
-    context = _enabled_context()
-    context.deregister_memory_region.side_effect = KeyError(1)
-    try:
-        ctx = _context()
-        ctx.create_staging_buffer(2, _ALIGN, TransferChannelStagingRegistration())
-    finally:
-        disable_staging_buffers()
-    ctx.close()
-    context.deregister_memory_region.assert_called_once_with(1)

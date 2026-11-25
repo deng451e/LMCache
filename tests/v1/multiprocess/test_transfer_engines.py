@@ -88,17 +88,11 @@ def test_chunks_split_into_consecutive_same_engine_runs(pattern, expected):
     assert split_into_runs(_objects(pattern)) == expected
 
 
-def _transfer(
-    monkeypatch, pattern: str, returned: list | None = None
-) -> list[tuple[str, tuple[int, int]]]:
+def _transfer(monkeypatch, pattern: str) -> list[tuple[str, tuple[int, int]]]:
     """Run the dispatcher with the copy paths stubbed and no direct copy;
-    return each run's path and chunk range, in call order."""
+    return each run's path and chunk range, in call order. What the staged
+    loop returns for NIC runs must come back from the dispatcher."""
     calls: list[tuple[str, tuple[int, int]]] = []
-    monkeypatch.setattr(
-        dispatch,
-        "defer_peer_run",
-        lambda *a: calls.append(("deferred", a[-1])) or [a[-1]],
-    )
     monkeypatch.setattr(dispatch, "batch_memcpy_available", lambda: False)
     monkeypatch.setattr(dispatch, "native_plan_available", lambda: True)
     monkeypatch.setattr(
@@ -109,9 +103,12 @@ def _transfer(
     monkeypatch.setattr(
         dispatch,
         "run_staged_loop",
-        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])),
+        lambda *a, **k: (
+            calls.append((k["engine"].value, k["chunk_range"]))
+            or [k["chunk_range"]] * (k["engine"] is NIC)
+        ),
     )
-    result = transfer_kv_per_object_group(
+    returned = transfer_kv_per_object_group(
         MagicMock(),
         block_ids_gpu=[MagicMock()],
         memory_objs=_objects(pattern),
@@ -122,8 +119,7 @@ def _transfer(
         transfer_key="test",
         block_ids_host=[[1, 2]],
     )
-    if returned is not None:
-        returned.append(result)
+    assert returned == ([r for e, r in calls if e == "nic_dma"] or None)
     return calls
 
 
@@ -136,24 +132,14 @@ def test_empty_group_runs_no_copy_path(monkeypatch):
 
 
 def test_each_run_goes_to_its_engine_in_chunk_order(monkeypatch):
-    """Only host memory may use the native plan; storage-backed objects are
-    staged one batch at a time; runs of objects a peer owns are returned for
-    the NIC DMA engine."""
-    returned: list = []
-    assert _transfer(monkeypatch, "hhpppshp", returned) == [
+    """Only host memory may use the native plan; the other engines stage one
+    batch at a time."""
+    assert _transfer(monkeypatch, "hhpppsh") == [
         ("plan", (0, 2)),
-        ("deferred", (2, 5)),
+        ("nic_dma", (2, 5)),
         ("nvme_dma", (5, 6)),
         ("plan", (6, 7)),
-        ("deferred", (7, 8)),
     ]
-    assert returned == [[(2, 5), (7, 8)]]
-
-
-def test_a_retrieve_without_peer_objects_returns_none(monkeypatch):
-    returned: list = []
-    _transfer(monkeypatch, "hhs", returned)
-    assert returned == [None]
 
 
 def test_host_memory_stages_per_batch_without_the_native_plan(monkeypatch):
@@ -163,7 +149,7 @@ def test_host_memory_stages_per_batch_without_the_native_plan(monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "run_staged_loop",
-        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])),
+        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])) or [],
     )
     transfer_kv_per_object_group(
         MagicMock(),

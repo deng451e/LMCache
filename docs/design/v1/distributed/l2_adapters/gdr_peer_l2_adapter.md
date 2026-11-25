@@ -79,43 +79,34 @@ after the last wave's kernels are queued (on the worker):
 Why it is built this way:
 
 - **A NIC staging buffer.** The shared staging buffer (GPU DMA, NVMe) is
-  reused by every copy queued on the stream, so a read into it must first
-  wait for the stream. The NIC staging buffer is written only by peer reads
-  and read only by the kernels queued after them, so a read never waits for
-  stream work. `BaseCacheContext.create_staging_buffer` allocates it on a
-  context's first peer read, with the shared buffer's slot layout, aligned
-  to the L1 alignment and registered as one transfer-channel region
-  (`TransferChannelStagingRegistration`, found by address with
-  `find_staging_region`); the context deregisters it at `close`. Size:
-  `NIC_STAGING_BYTES` = 512 MiB of slots (at least two kernel batches), plus
-  two rows at the end for an unfull chunk, whose object can extend past one
-  slot. In a module benchmark over a 400 Gb/s link, 512 MiB in waves of half
-  the slots ran at 47.9–48.5 GB/s for 6 MiB and 80 MiB chunks; a one-slot
-  pool, which cannot overlap a read with the previous copy, ran at 40 GB/s.
-- **One read per peer per wave.** `BorrowedMemoryObj` is bound to a
-  `BorrowedReader` (the adapter), so a wave's objects of one peer go in one
-  `submit_read`. Per-object submits gave the same bandwidth but 10x the
-  poller CPU and up to 13 ms tail delay before the kernels were queued.
+  reused by every copy queued on the stream, so a read into it would first
+  wait for the stream. The NIC buffer is written only by peer reads and read
+  only by the kernels queued after them. `create_staging_buffer` allocates
+  it on a context's first peer read with the shared buffer's slot layout,
+  aligned to the L1 alignment and registered as one transfer-channel region
+  (`TransferChannelStagingRegistration`); the context deregisters it at
+  `close`. Size: `NIC_STAGING_BYTES` = 512 MiB of slots (at least two kernel
+  batches) plus two rows for an unfull chunk, whose object can extend past
+  one slot. Over a 400 Gb/s link, waves of half the slots ran at 47.9–48.5
+  GB/s for 6 MiB and 80 MiB chunks; a one-slot pool ran at 40 GB/s.
+- **One read per peer per wave** (`BorrowedReader.read_many`). Per-object
+  submits gave the same bandwidth but 10x the poller CPU and up to 13 ms
+  tail delay before the kernels were queued.
 - **The host orders the work; no stream waits on a host-written value.** A
   stream parked on `cuStreamWaitValue32` blocks every first-time kernel
   launch in the process and deadlocks if the releasing thread launches one
-  (measured on H200, driver 580; the hang behind PR #6687). The poller
-  (`lmcache/v1/multiprocess/host_poller.py`) only checks reads and events,
-  backing off from 50 µs to 1 ms, and hands every step back to the
-  instance's affinity worker, which owns the slot pools.
+  (the hang behind PR #6687). The poller only checks reads and events,
+  backing off from 50 µs to 1 ms, and hands every step to the instance's
+  affinity worker, which owns the slot pools.
 - **Own block ids.** The staged block ids live in a buffer the next transfer
-  restages, so each deferred run clones them on the stream when it is made.
+  restages, so each run clones them on the stream when it is made.
 
-Under `--rocm-host-event-wait` the waiter runs the handler deferred already;
-it completes the request from the handler's `DeferredResponse`.
-
-The P2P controller enables the registration under `gdr` with
-`enable_staging_buffers(context, alignment)`. Copy mode never creates a NIC
-staging buffer, so it needs no GPUDirect support.
-
-Each DMA engine getting its own staging buffer and CUDA stream (GPU DMA and
-NVMe still share one) is a planned follow-up, needed once mixed DRAM + GDS
-retrieves are supported.
+Under `--rocm-host-event-wait` the waiter completes the request from the
+handler's `DeferredResponse`. The P2P controller enables the registration
+under `gdr` (`enable_staging_buffers`); copy mode never creates a NIC
+staging buffer, so it needs no GPUDirect support. Separate staging buffers
+and CUDA streams for GPU DMA and NVMe are a planned follow-up, needed once
+mixed DRAM + GDS retrieves are supported.
 
 ## Peer clients
 

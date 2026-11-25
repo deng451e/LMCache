@@ -1,14 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
-"""One thread that watches host-side completions without blocking a worker.
-
-A handler that starts work completing outside the stream (a transfer-channel
-read, a recorded event) hands a non-blocking ``check`` to :class:`HostPoller`
-and returns. The poller calls each ``check`` in turn, backing off from 50 us
-to 1 ms while nothing completes and sleeping while it watches nothing. When a
-check passes, ``on_ready`` runs on the affinity worker that called
-:meth:`HostPoller.watch`, so per-instance state is only touched on that
-worker; outside a worker it runs on the poller thread.
-"""
+"""One thread that watches host-side completions (transfer-channel reads,
+recorded events) so no worker blocks on them. It backs off from 50 us to 1 ms
+while nothing completes, sleeps while it watches nothing, and runs each
+callback on the affinity worker that asked (else on its own thread)."""
 
 # Standard
 from dataclasses import dataclass
@@ -33,20 +27,15 @@ class _Job:
     on_abandon: Callable[[], None]
     post: Callable[[Callable[[], None]], None] | None
 
-
-def _deliver(job: _Job, callback: Callable[[], None]) -> None:
-    if job.post is not None:
-        job.post(callback)
-    else:
-        callback()
+    def deliver(self, callback: Callable[[], None]) -> None:
+        if self.post is not None:
+            self.post(callback)
+        else:
+            callback()
 
 
 class HostPoller:
-    """Watches host-side completions on one thread.
-
-    Args:
-        name: Name of the poller thread.
-    """
+    """Watches host-side completions on one thread named ``name``."""
 
     def __init__(self, name: str = "lmcache-host-poller") -> None:
         self._cond = threading.Condition()
@@ -61,27 +50,16 @@ class HostPoller:
         on_ready: Callable[[], None],
         on_abandon: Callable[[], None],
     ) -> None:
-        """Run ``on_ready`` once ``check()`` returns True.
-
-        Args:
-            check: Non-blocking; True once the work completed (successfully
-                or not). Called on the poller thread.
-            on_ready: Runs once, after ``check`` returned True.
-            on_abandon: Runs instead of ``on_ready`` if ``check`` raises or
-                the poller stops first.
-
-        Both callbacks run on the affinity worker that called ``watch``, or
-        on the poller thread when called outside a worker; they must handle
-        their own exceptions. After :meth:`stop`, ``on_abandon`` is posted at
-        once.
-        """
+        """Run ``on_ready`` once the non-blocking ``check()`` returns True, or
+        ``on_abandon`` instead if it raises or the poller stops first. Both
+        run on the calling affinity worker and handle their own exceptions."""
         job = _Job(check, on_ready, on_abandon, current_worker_poster())
         with self._cond:
             if not self._stopped:
                 self._jobs.append(job)
                 self._cond.notify()
                 return
-        _deliver(job, job.on_abandon)
+        job.deliver(on_abandon)
 
     def stop(self) -> None:
         """Abandon every watched job and stop the thread; idempotent."""
@@ -90,7 +68,7 @@ class HostPoller:
             jobs, self._jobs = self._jobs, []
             self._cond.notify()
         for job in jobs:
-            _deliver(job, job.on_abandon)
+            job.deliver(job.on_abandon)
         if self._thread is not threading.current_thread():
             self._thread.join()
 
@@ -107,19 +85,17 @@ class HostPoller:
             progressed = False
             for job in jobs:
                 try:
-                    ready = job.check()
+                    if not job.check():
+                        continue
+                    callback = job.on_ready
                 except Exception:
                     logger.exception("Completion check failed; abandoning the job")
                     callback = job.on_abandon
-                else:
-                    if not ready:
-                        continue
-                    callback = job.on_ready
                 with self._cond:
                     if job not in self._jobs:
                         continue  # abandoned by stop()
                     self._jobs.remove(job)
-                _deliver(job, callback)
+                job.deliver(callback)
                 progressed = True
             if progressed:
                 delay = POLL_MIN_S

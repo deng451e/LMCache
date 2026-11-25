@@ -19,7 +19,6 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     split_into_runs,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import defer_peer_run
 from lmcache.v1.multiprocess.object_group_transfer.staged import (
     native_plan_available,
     run_object_group_transfer_plan,
@@ -46,9 +45,8 @@ def transfer_kv_per_object_group(
     selects. Runs are issued in chunk order on the context's stream.
 
     Host-memory runs take the direct copy if usable, else the native plan if
-    the extension has it; on retrieve, runs of objects a peer owns are
-    returned for the NIC DMA engine; every other run is staged one batch at
-    a time.
+    the extension has it; every other run is staged one batch at a time,
+    except that on retrieve the batches of objects a peer owns are returned.
 
     Args:
         cache_context: Cache context of the KV cache.
@@ -79,19 +77,6 @@ def transfer_kv_per_object_group(
         chunk_range = (start, end)
         is_host_memory = engine is TransferEngine.GPU_DMA
         if (
-            engine is TransferEngine.NIC_DMA
-            and direction == lmcache_native.TransferDirection.H2D
-        ):
-            deferred += defer_peer_run(
-                cache_context,
-                block_ids_gpu,
-                memory_objs,
-                object_group_id,
-                batch_size,
-                skip_first_n_tokens,
-                chunk_range,
-            )
-        elif (
             is_host_memory
             and batch_memcpy_available()
             and direct_transfer_supported(
@@ -120,7 +105,7 @@ def transfer_kv_per_object_group(
                 chunk_range=chunk_range,
             )
         else:
-            run_staged_loop(
+            deferred += run_staged_loop(
                 cache_context,
                 block_ids_gpu,
                 memory_objs,

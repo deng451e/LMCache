@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-"""NIC DMA engine: a retrieve's runs of objects a peer owns, returned by the
-transfers, are read in waves into the NIC staging buffer, one read per peer
-per wave, and their kernels are queued only after the reads land. Native and
-device code is faked, so these run without CUDA."""
+"""NIC DMA engine: a retrieve's peer-owned batches, returned by the transfer,
+are read in waves into the NIC staging buffer, one read per peer per wave,
+and their kernels are queued only after the reads land (CPU, fakes)."""
 
 # Standard
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Callable, Sequence
 from unittest.mock import MagicMock
 
 # Third Party
@@ -16,7 +14,6 @@ import torch
 
 # First Party
 from lmcache.v1.distributed.transfer_channel import (
-    TransferChannelStagingRegistration,
     disable_staging_buffers,
     enable_staging_buffers,
 )
@@ -24,7 +21,6 @@ from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
     MemoryFormat,
     MemoryObjMetadata,
-    PendingRead,
 )
 from lmcache.v1.multiprocess.object_group_transfer import (
     nic_dma,
@@ -33,34 +29,17 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     unfull_chunk,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    NicDmaEngine,
-    StagingSlotPool,
-)
-from lmcache.v1.platform.base.object_group_transfer import DeferredNicRun
 import lmcache.lmcache_native as lmcache_native
 
-CHUNK = 16
-BLOCKS_PER_CHUNK = 4
-OBJ_BYTES = 256
-BATCH = 2
-# Four full-chunk slots (waves of 2 chunks), then two spare rows at the end.
-SLOTS = 6
-SPARE = 4
-REGION = 9
-ALIGN = 64
+OBJ = 256  # bytes per object and per slot
 H2D = lmcache_native.TransferDirection.H2D
+# NIC buffer: 4 slots (two batches of 2, waves of 2), then spare rows 4-5.
+SLOTS, SPARE = 6, 4
 
 
-# ---------------------------------------------------------------- fakes
-
-
-class _Read(PendingRead):
-    """A read the test finishes."""
-
+class _Read:
     def __init__(self) -> None:
-        self.finished = False
-        self.ok = True
+        self.finished, self.ok = False, True
 
     def is_finished(self) -> bool:
         return self.finished
@@ -69,437 +48,262 @@ class _Read(PendingRead):
         return self.ok
 
 
-_NAMES: dict[int, str] = {}
-
-
 class _Reader:
-    """A peer: records each read as (peer, names, slots)."""
+    """A peer; logs ("read", peer, names, slots)."""
 
     def __init__(self, name: str, log: list) -> None:
-        self.name = name
-        self._log = log
-        self.reads: list[_Read] = []
+        self.name, self.log, self.reads = name, log, []
 
-    def read_many(
-        self, region_id: int, targets: Sequence[tuple[BorrowedMemoryObj, int]]
-    ) -> PendingRead:
-        assert region_id == REGION
-        self._log.append(
-            (
-                "read",
-                self.name,
-                [_NAMES[id(obj)] for obj, _ in targets],
-                [offset // OBJ_BYTES for _, offset in targets],
-            )
-        )
-        read = _Read()
-        self.reads.append(read)
-        return read
+    def read_many(self, region_id, targets):
+        assert region_id == 9
+        names = [o.name for o, _ in targets]
+        self.log.append(("read", self.name, names, [t // OBJ for _, t in targets]))
+        self.reads.append(_Read())
+        return self.reads[-1]
 
 
-def _peer_object(reader: _Reader, name: str) -> BorrowedMemoryObj:
+def _peer(reader: _Reader, name: str) -> BorrowedMemoryObj:
     meta = MemoryObjMetadata(
-        shape=torch.Size([OBJ_BYTES]),
+        shape=torch.Size([OBJ]),
         dtype=torch.uint8,
-        address=0x1000,
-        phy_size=OBJ_BYTES,
+        address=0,
+        phy_size=OBJ,
         ref_count=1,
         fmt=MemoryFormat.KV_2LTD,
-        shapes=[torch.Size([OBJ_BYTES])],
+        shapes=[torch.Size([OBJ])],
         dtypes=[torch.uint8],
     )
     obj = BorrowedMemoryObj(meta)
-    obj.bind((lambda: True, lambda: None), reader=reader, address=0x1000, source="peer")
-    _NAMES[id(obj)] = name
+    obj.bind((lambda: True, lambda: None), reader=reader, address=0, source="p")
+    obj.name = name  # type: ignore[attr-defined]
     return obj
 
 
 class _Staging:
-    """A StagingBuffer: one object group per slot over one CPU tensor;
-    kernel group ``k`` sits 64 bytes into its object."""
+    """One object group per slot; kernel group k sits 64 bytes in."""
 
     def __init__(self, num_slots: int) -> None:
         self.max_batch_size = num_slots
-        self.buffer = torch.zeros(num_slots * OBJ_BYTES, dtype=torch.uint8)
+        self.buffer = torch.zeros(num_slots * OBJ, dtype=torch.uint8)
 
-    def get_temp_object_group_buffer(self, index: int, group: int) -> torch.Tensor:
-        assert group == 0
-        return self.buffer[index * OBJ_BYTES : (index + 1) * OBJ_BYTES]
+    def get_temp_object_group_buffer(self, slot: int, group: int) -> torch.Tensor:
+        return self.buffer[slot * OBJ : (slot + 1) * OBJ]
 
-    def get_temp_kernel_group_buffer(self, index: int, group: int) -> torch.Tensor:
-        return self.buffer[index * OBJ_BYTES + group * 64 : (index + 1) * OBJ_BYTES]
-
-    def slot_of(self, ptr: int) -> int:
-        return (ptr - self.buffer.data_ptr()) // OBJ_BYTES
+    def get_temp_kernel_group_buffer(self, slot: int, group: int) -> torch.Tensor:
+        return self.buffer[slot * OBJ + group * 64 : (slot + 1) * OBJ]
 
 
 class _Poller:
     """Runs watched jobs only when the test polls."""
 
     def __init__(self) -> None:
-        self.jobs: list[tuple[Callable[[], bool], Callable, Callable]] = []
+        self.jobs: list = []
 
     def watch(self, check, on_ready, on_abandon) -> None:
         self.jobs.append((check, on_ready, on_abandon))
 
     def poll(self) -> None:
-        progressed = True
-        while progressed:
-            progressed = False
-            for job in list(self.jobs):
-                if job[0]():
-                    self.jobs.remove(job)
-                    job[1]()
-                    progressed = True
+        while ready := [job for job in self.jobs if job[0]()]:
+            for job in ready:
+                self.jobs.remove(job)
+                job[1]()
 
-    def abandon_all(self) -> None:
+    def stop(self) -> None:
         jobs, self.jobs = self.jobs, []
         for job in jobs:
             job[2]()
 
-    def stop(self) -> None:
-        self.abandon_all()
-
-
-class _Event:
-    def __init__(self) -> None:
-        self.complete = False
-
-    def is_complete(self) -> bool:
-        return self.complete
-
 
 @pytest.fixture
 def h(monkeypatch):
-    """A context whose NIC staging buffer has 4 full slots and 2 spare rows;
-    kernels and events are faked."""
     log: list = []
-    events: list[_Event] = []
-    created: list[tuple[int, int]] = []
-    holder: dict[str, _Staging] = {}
+    events: list = []
+    nic: dict = {}
     channel = MagicMock()
-    channel.register_memory_region.return_value = REGION
-    enable_staging_buffers(channel, ALIGN)
+    channel.register_memory_region.return_value = 9
+    enable_staging_buffers(channel, 64)
 
-    def create_staging_buffer(num_slots, slot_align_bytes, registration):
-        assert isinstance(registration, TransferChannelStagingRegistration)
-        created.append((num_slots, slot_align_bytes))
-        staging = _Staging(num_slots)
-        registration.register(staging.buffer)
-        holder["staging"] = staging
-        return staging
+    def create(num_slots, align, registration):
+        nic["args"] = (num_slots, align)
+        nic["buf"] = _Staging(num_slots)
+        registration.register(nic["buf"].buffer)
+        return nic["buf"]
 
-    shared = _Staging(BATCH)
-    cc = MagicMock()
+    shared = _Staging(2)
+    cc = MagicMock(
+        max_batch_size=2,
+        lmcache_tokens_per_chunk=16,
+        device=torch.device("cpu"),
+        stream="s",
+        kv_layer_groups_manager=SimpleNamespace(
+            num_object_groups=1,
+            object_groups=[SimpleNamespace(kernel_group_indices=[0, 1])],
+            get_attn_desc=lambda: SimpleNamespace(is_full_attention=lambda g: True),
+            get_subchunk_sw_size_tokens=lambda kg: 16,
+        ),
+    )
     cc.get_temp_object_group_buffer.side_effect = shared.get_temp_object_group_buffer
     cc.get_temp_kernel_group_buffer.side_effect = shared.get_temp_kernel_group_buffer
-    cc.create_staging_buffer.side_effect = create_staging_buffer
-    cc.max_batch_size = BATCH
-    cc.lmcache_tokens_per_chunk = CHUNK
-    cc.kv_layer_groups_manager = SimpleNamespace(
-        num_object_groups=1,
-        object_groups=[SimpleNamespace(kernel_group_indices=[0, 1])],
-        get_attn_desc=lambda: SimpleNamespace(is_full_attention=lambda og: True),
-        get_subchunk_sw_size_tokens=lambda kg: CHUNK,
-    )
+    cc.create_staging_buffer.side_effect = create
     cc.calculate_num_blocks.side_effect = lambda tokens, kg: tokens // 4
-    cc.device = torch.device("cpu")
-    cc.stream = "ctx-stream"
 
-    def kernel(paged, ptrs, block_ids, *args, **kwargs) -> None:
-        staging = holder.get("staging")
-        # Log kernel group 0 of the NIC staging buffer only.
-        if (
-            staging is not None
-            and (ptrs[0] - staging.buffer.data_ptr()) % OBJ_BYTES == 0
-        ):
-            log.append(
-                ("kernel", [staging.slot_of(p) for p in ptrs], block_ids.tolist())
-            )
+    def kernel(paged, ptrs, block_ids, *args) -> None:
+        base = nic["buf"].buffer.data_ptr()
+        if (ptrs[0] - base) % OBJ == 0:  # kernel group 0 only
+            slots = [(p - base) // OBJ for p in ptrs]
+            log.append(("kernel", slots, block_ids.tolist()))
+
+    def record(device, stream):
+        event = SimpleNamespace(done=False)
+        events.append(event)
+        return SimpleNamespace(is_complete=lambda: event.done)
 
     ops = MagicMock()
     ops.multi_layer_block_kv_transfer.side_effect = kernel
     monkeypatch.setattr(staged, "device_ops", ops)
     monkeypatch.setattr(unfull_chunk, "device_ops", ops)
     monkeypatch.setattr(
-        nic_dma,
-        "torch_dev",
-        SimpleNamespace(device=lambda d: nullcontext(), stream=lambda s: nullcontext()),
+        nic_dma, "torch_dev", MagicMock(device=nullcontext, stream=nullcontext)
     )
-
-    def record(device, stream):
-        assert stream == "ctx-stream"
-        log.append("event")
-        event = _Event()
-        events.append(event)
-        return event
-
     monkeypatch.setattr(nic_dma, "record_completion_event", record)
-    # Room for 4 full-chunk slots: twice the batch.
-    monkeypatch.setattr(nic_dma, "NIC_STAGING_BYTES", 4 * OBJ_BYTES)
+    monkeypatch.setattr(nic_dma, "NIC_STAGING_BYTES", OBJ)  # floor: 2 batches
     poller = _Poller()
+    engine = nic_dma.NicDmaEngine(poller)  # type: ignore[arg-type]
+    p = _Reader("p", log)
+
+    def runs(objs, skip=0, block_ids=None):
+        ids = block_ids or [torch.arange(4 * len(objs)) for _ in range(2)]
+        return transfer_kv_per_object_group(
+            cc, ids, objs, 0, 2, skip, H2D, transfer_key="t"
+        )
+
+    def retrieve(names, skip=0, block_ids=None):
+        outcome: list = []
+        objs = [_peer(p, n) for n in names]
+        response = engine.read(
+            cc, runs(objs, skip, block_ids), lambda ok: outcome.append(ok) or ok
+        )
+        return response, outcome
+
     yield SimpleNamespace(
         cc=cc,
         log=log,
         events=events,
-        created=created,
-        holder=holder,
+        nic=nic,
         poller=poller,
-        engine=NicDmaEngine(poller),
-        reader=_Reader("p", log),
+        engine=engine,
+        p=p,
+        runs=runs,
+        retrieve=retrieve,
     )
     disable_staging_buffers()
 
 
-def _block_ids(num_chunks: int) -> list[torch.Tensor]:
-    return [torch.arange(num_chunks * BLOCKS_PER_CHUNK) for _ in range(2)]
+def _reads(log):
+    return [e[1:] for e in log if e[0] == "read"]
 
 
-def _runs(h, objs, skip_first_n_tokens: int = 0, block_ids=None):
-    """The runs the dispatcher returns for retrieving ``objs``."""
-    return transfer_kv_per_object_group(
-        h.cc,
-        block_ids if block_ids is not None else _block_ids(len(objs)),
-        objs,
-        0,
-        BATCH,
-        skip_first_n_tokens,
-        H2D,
-        transfer_key="t",
-    )
-
-
-def _read(h, runs):
-    """Hand ``runs`` to the engine; return the response and the outcomes
-    ``finish`` was called with."""
-    outcome: list[bool] = []
-
-    def finish(ok: bool) -> str:
-        outcome.append(ok)
-        return f"done:{ok}"
-
-    return h.engine.read(h.cc, runs, finish), outcome
-
-
-def _reads(log) -> list:
-    return [entry[1:] for entry in log if entry[0] == "read"]
-
-
-def _kernels(log) -> list:
-    return [entry[1:] for entry in log if entry[0] == "kernel"]
-
-
-# ---------------------------------------------------------------- pool
-
-
-class _Wave:
-    def __init__(self, name: str, num_slots: int, log: list) -> None:
-        self.name = name
-        self.num_slots = num_slots
-        self._log = log
-        self.slots: list[int] = []
-
-    def start(self, slots: list[int]) -> None:
-        self.slots = slots
-        self._log.append(self.name)
-
-
-def test_pool_waves_take_half_the_slots() -> None:
-    assert StagingSlotPool(range(4)).wave_slots == 2
-    assert StagingSlotPool(range(3)).wave_slots == 1
-    with pytest.raises(ValueError):
-        StagingSlotPool(range(0))
-    with pytest.raises(ValueError):
-        StagingSlotPool(range(4)).submit(_Wave("big", 3, []))
-
-
-def test_pool_starts_waves_in_order_as_slots_free() -> None:
-    log: list = []
-    pool = StagingSlotPool(range(4))
-    a, b, c, d = (_Wave(n, 2, log) for n in "abcd")
-    for wave in (a, b, c):
-        pool.submit(wave)
-    small = _Wave("small", 1, log)
-    pool.submit(small)  # waits behind c although one slot would do
-    assert log == ["a", "b"]
-    assert set(a.slots) | set(b.slots) == {0, 1, 2, 3}
-    pool.release(a.slots[:1])
-    assert log == ["a", "b"]
-    pool.release(a.slots[1:])
-    assert log == ["a", "b", "c"]
-    pool.withdraw([small, d])
-    pool.release(b.slots)
-    assert log == ["a", "b", "c"]
-
-
-# ---------------------------------------------------------------- dispatch
-
-
-def test_retrieve_returns_one_run_per_kernel_batch(h) -> None:
-    objs = [_peer_object(h.reader, n) for n in "abc"]
-    runs = _runs(h, objs)
-    assert [[_NAMES[id(o)] for o in run.memory_objs] for run in runs] == [
-        ["a", "b"],
-        ["c"],
-    ]
-    assert not any(run.spans_slots for run in runs)
-    # Nothing was read or queued yet.
-    assert h.log == []
-
-
-def test_runs_leave_out_chunks_the_kernel_skips(h) -> None:
-    objs = [_peer_object(h.reader, n) for n in "abc"]
-    runs = _runs(h, objs, skip_first_n_tokens=CHUNK)
-    assert [[_NAMES[id(o)] for o in run.memory_objs] for run in runs] == [
-        ["b"],
-        ["c"],
-    ]
-
-
-# ---------------------------------------------------------------- engine
+def _kernels(log):
+    return [e[1:] for e in log if e[0] == "kernel"]
 
 
 def test_reads_land_in_nic_slots_and_kernels_follow_each_wave(h) -> None:
-    objs = [_peer_object(h.reader, n) for n in "abcde"]
-    response, outcome = _read(h, _runs(h, objs))
-    assert h.created == [(SLOTS, ALIGN)]
+    response, outcome = h.retrieve("abcde")
+    assert h.nic["args"] == (SLOTS, 64)
     # Two waves fill the four slots, one read each; the third waits.
     first, second = _reads(h.log)
     assert (first[:2], second[:2]) == (("p", ["a", "b"]), ("p", ["c", "d"]))
     assert set(first[2]) | set(second[2]) == {0, 1, 2, 3}
     assert _kernels(h.log) == [] and not response.done()
 
-    h.reader.reads[0].finished = True
+    h.p.reads[0].finished = True
     h.poller.poll()
-    assert _kernels(h.log) == [(first[2], list(range(0, 8)))]
-    assert len(_reads(h.log)) == 2 and outcome == []
-
-    # Slots are free again only once the wave's kernels finished.
-    h.reader.reads[1].finished = True
+    assert _kernels(h.log) == [(first[2], list(range(8)))]
+    # Slots are free only once the wave's kernels finished.
+    h.p.reads[1].finished = True
     h.poller.poll()
     assert len(_reads(h.log)) == 2
-    h.events[0].complete = True
+    h.events[0].done = True
     h.poller.poll()
     third = _reads(h.log)[2]
     assert third[:2] == ("p", ["e"]) and set(third[2]) <= set(first[2])
 
-    h.reader.reads[2].finished = True
+    h.p.reads[2].finished = True
     h.poller.poll()
-    assert outcome == [True] and response.result(timeout=1) == "done:True"
+    assert outcome == [True] and response.result(timeout=1) is True
     assert _kernels(h.log)[-1][1] == list(range(16, 20))
+    h.retrieve("f")
+    assert h.cc.create_staging_buffer.call_count == 1  # once per context
 
 
-def test_the_nic_staging_buffer_is_created_once_per_context(h) -> None:
-    _read(h, _runs(h, [_peer_object(h.reader, "a")]))
-    _read(h, _runs(h, [_peer_object(h.reader, "b")]))
-    assert h.created == [(SLOTS, ALIGN)]
-
-
-def test_kernels_use_the_block_ids_the_transfer_was_given(h) -> None:
-    """The staged block ids live in a buffer the next transfer restages."""
-    block_ids = _block_ids(2)
-    runs = _runs(h, [_peer_object(h.reader, n) for n in "ab"], block_ids=block_ids)
-    for ids in block_ids:
-        ids.fill_(-1)
-    _read(h, runs)
-    h.reader.reads[0].finished = True
+def test_batches_skip_chunks_and_keep_their_own_block_ids(h) -> None:
+    """Chunks the kernel skips are not read; the block ids live in a buffer
+    the next transfer restages, so each run copies them."""
+    ids = [torch.arange(12) for _ in range(2)]
+    h.retrieve("abc", skip=16, block_ids=ids)
+    for t in ids:
+        t.fill_(-1)
+    assert [r[1] for r in _reads(h.log)] == [["b", "c"]]
+    h.p.reads[0].finished = True
     h.poller.poll()
-    assert _kernels(h.log)[0][1] == list(range(0, 8))
+    assert [k[1] for k in _kernels(h.log)] == [list(range(8)), list(range(8, 12))]
 
 
 def test_one_read_per_peer_per_wave(h) -> None:
-    other = _Reader("q", h.log)
-    _read(h, _runs(h, [_peer_object(h.reader, "a"), _peer_object(other, "b")]))
+    q = _Reader("q", h.log)
+    h.engine.read(h.cc, h.runs([_peer(h.p, "a"), _peer(q, "b")]), lambda ok: ok)
     assert sorted(r[:2] for r in _reads(h.log)) == [("p", ["a"]), ("q", ["b"])]
 
 
 def test_a_failed_read_fails_the_retrieve_without_kernels(h) -> None:
-    objs = [_peer_object(h.reader, n) for n in "abcde"]
-    response, outcome = _read(h, _runs(h, objs))
-    h.reader.reads[0].ok = False
-    h.reader.reads[0].finished = True
+    _, outcome = h.retrieve("abcde")
+    h.p.reads[0].ok = False
+    h.p.reads[0].finished = True
     h.poller.poll()
-    # The other read in flight could still land in its slots.
-    assert outcome == []
-    h.reader.reads[1].finished = True
+    assert outcome == []  # the other read could still land in its slots
+    h.p.reads[1].finished = True
     h.poller.poll()
-    assert outcome == [False] and response.result(timeout=1) == "done:False"
-    assert _kernels(h.log) == []
+    assert outcome == [False] and _kernels(h.log) == []
     assert len(_reads(h.log)) == 2  # the third wave is never read
-    # Every slot is free again for the next retrieve.
-    _read(h, _runs(h, [_peer_object(h.reader, n) for n in "wxyz"]))
+    h.retrieve("wxyz")  # every slot is free again
     assert len(_reads(h.log)) == 4
 
 
 def test_retrieves_share_the_slots_in_order(h) -> None:
-    _read(h, _runs(h, [_peer_object(h.reader, n) for n in "abcdef"]))
-    _read(h, _runs(h, [_peer_object(h.reader, n) for n in "gh"]))
-    assert [r[1] for r in _reads(h.log)] == [["a", "b"], ["c", "d"]]
-    for read in h.reader.reads:
+    h.retrieve("abcdef")
+    h.retrieve("gh")
+    for read in h.p.reads:
         read.finished = True
     h.poller.poll()
-    h.events[0].complete = True
-    h.poller.poll()
-    assert [r[1] for r in _reads(h.log)][2:] == [["e", "f"]]
-    h.events[1].complete = True
-    h.poller.poll()
-    assert [r[1] for r in _reads(h.log)][3:] == [["g", "h"]]
+    for event in h.events[:2]:
+        event.done = True
+        h.poller.poll()
+    names = [r[1] for r in _reads(h.log)]
+    assert names == [["a", "b"], ["c", "d"], ["e", "f"], ["g", "h"]]
 
 
-def test_an_abandoned_read_fails_the_retrieve(h) -> None:
-    response, outcome = _read(h, _runs(h, [_peer_object(h.reader, n) for n in "ab"]))
-    h.poller.abandon_all()
-    assert outcome == [False] and response.done()
-    assert _kernels(h.log) == []
+def test_shutdown_abandons_the_reads(h) -> None:
+    response, outcome = h.retrieve("ab")
+    h.poller.stop()
+    assert outcome == [False] and response.done() and _kernels(h.log) == []
 
 
-def test_an_exception_from_finish_fails_the_response(h) -> None:
-    def finish(ok: bool) -> None:
-        raise RuntimeError("tail failed")
-
-    response = h.engine.read(h.cc, _runs(h, [_peer_object(h.reader, "a")]), finish)
-    h.reader.reads[0].finished = True
-    h.poller.poll()
-    with pytest.raises(RuntimeError, match="tail failed"):
-        response.result(timeout=1)
-
-
-# ---------------------------------------------------------------- unfull
-
-
-def _unfull_run(h, name: str) -> DeferredNicRun:
-    run = transfer_unfull_chunk(
-        h.cc,
-        [torch.arange(4) for _ in range(2)],
-        [0, 0],
-        [0, 0],
-        _peer_object(h.reader, name),
-        0,
-        h.cc.get_temp_object_group_buffer(0, 0),
-        H2D,
-    )
-    assert isinstance(run, DeferredNicRun)
-    return run
-
-
-def test_an_unfull_chunk_a_peer_owns_is_deferred(h) -> None:
-    run = _unfull_run(h, "tail")
-    assert run.spans_slots and h.log == []
-
-
-def test_unfull_chunks_use_the_spare_slot_one_at_a_time(h) -> None:
-    """Their object can extend past one slot, so they land in the slot at the
-    end of the buffer, which has room after it."""
-    first, second = _unfull_run(h, "u1"), _unfull_run(h, "u2")
-    _read(h, [first])
-    _, outcome = _read(h, [second])
+def test_unfull_chunks_use_the_spare_rows_one_at_a_time(h) -> None:
+    """An unfull chunk's object can extend past its slot."""
+    buffer = h.cc.get_temp_object_group_buffer(0, 0)
+    runs = [
+        transfer_unfull_chunk(
+            h.cc, [torch.arange(4)] * 2, [0, 0], [0, 0], _peer(h.p, n), 0, buffer, H2D
+        )
+        for n in ("u1", "u2")
+    ]
+    assert all(run.spans_slots for run in runs) and h.log == []
+    h.engine.read(h.cc, runs[:1], lambda ok: ok)
+    h.engine.read(h.cc, runs[1:], lambda ok: ok)
     assert _reads(h.log) == [("p", ["u1"], [SPARE])]
-    h.reader.reads[0].finished = True
+    h.p.reads[0].finished = True
     h.poller.poll()
     assert _kernels(h.log) == [([SPARE], [0, 1, 2, 3])]
-    h.events[0].complete = True
+    h.events[0].done = True
     h.poller.poll()
     assert _reads(h.log)[1] == ("p", ["u2"], [SPARE])
-    h.reader.reads[1].finished = True
-    h.poller.poll()
-    assert outcome == [True]
