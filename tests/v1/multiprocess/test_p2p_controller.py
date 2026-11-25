@@ -830,12 +830,8 @@ def _start_controller(p2p_config: P2PConfig) -> P2PController:
     )
     dram.config.read_ttl_seconds = _READ_TTL
     ctx.storage_manager.get_l1_manager_by_tags.return_value = dram
-    tc_context = MagicMock()
     with (
         patch.object(p2p_controller, "initialize_transfer_channel_context"),
-        patch.object(
-            p2p_controller, "get_transfer_channel_context", return_value=tc_context
-        ),
         patch.object(p2p_controller, "delete_transfer_channel_context"),
         patch.object(
             p2p_controller, "create_periodic_thread", return_value=MagicMock()

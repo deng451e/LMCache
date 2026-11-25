@@ -470,6 +470,11 @@ class NixlTransferChannelContext(TransferChannelContext):
             out.append(TransferChannelAddress(offset=offset, size=obj_size))
         return out
 
+    @property
+    def align_bytes(self) -> int:
+        """The L1 alignment; see the base class."""
+        return self._align
+
     def register_memory_region(
         self, ptr: int, size: int, device_id: int | None = None
     ) -> int:

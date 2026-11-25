@@ -22,7 +22,7 @@ from lmcache import torch_dev
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.transfer_channel import (
     TransferChannelStagingRegistration,
-    staging_alignment,
+    get_transfer_channel_context,
 )
 from lmcache.v1.memory_management import BorrowedMemoryObj, PendingRead
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
@@ -283,7 +283,9 @@ class NicDmaEngine:
         num_slots = max(2 * cache_context.max_batch_size, NIC_STAGING_BYTES // row)
         registration = TransferChannelStagingRegistration()
         buffer = cache_context.create_staging_buffer(
-            num_slots + _SPARE_ROWS, staging_alignment(), registration
+            num_slots + _SPARE_ROWS,
+            get_transfer_channel_context().align_bytes,
+            registration,
         )
         logger.info(
             "NIC staging buffer: %d slots, %d MiB on %s",

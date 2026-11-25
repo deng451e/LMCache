@@ -42,9 +42,6 @@ __all__ = [
     "get_transfer_channel_context",
     "delete_transfer_channel_context",
     "TransferChannelStagingRegistration",
-    "enable_staging_buffers",
-    "disable_staging_buffers",
-    "staging_alignment",
     "acquire_transfer_channel_client",
     "release_transfer_channel_client",
 ]
@@ -125,44 +122,9 @@ def delete_transfer_channel_context() -> None:
             del _client_users[key]
 
 
-# Where NIC staging buffers register, and their slot alignment: set by the
-# P2P controller under GPU-direct borrowing; guarded by ``_context_lock``.
-_staging_target: TransferChannelContext | None = None
-_staging_align_bytes = 1
-
-
-def enable_staging_buffers(context: TransferChannelContext, align_bytes: int) -> None:
-    """Let NIC staging buffers register with ``context``, slots aligned to
-    ``align_bytes`` (the L1 alignment). Only a GPU-direct borrowing reader
-    calls this, so copy mode never registers GPU memory.
-
-    Raises:
-        ValueError: If ``align_bytes`` is not a positive power of two.
-    """
-    if align_bytes < 1 or align_bytes & (align_bytes - 1):
-        raise ValueError(f"Alignment must be a power of two, got {align_bytes}")
-    global _staging_target, _staging_align_bytes
-    with _context_lock:
-        _staging_target, _staging_align_bytes = context, align_bytes
-
-
-def disable_staging_buffers() -> None:
-    """Stop NIC staging buffers from registering."""
-    global _staging_target, _staging_align_bytes
-    with _context_lock:
-        _staging_target, _staging_align_bytes = None, 1
-
-
-def staging_alignment() -> int:
-    """Return the slot alignment NIC staging buffers need (1 when disabled)."""
-    with _context_lock:
-        return _staging_align_bytes
-
-
 class TransferChannelStagingRegistration(BufferRegistration):
-    """Registers one NIC staging buffer as a transfer-channel region, so
-    peers' objects can be read straight into its slots. Needs
-    :func:`enable_staging_buffers`."""
+    """Registers one NIC staging buffer as a region of the global transfer
+    channel context, so peers' objects can be read straight into its slots."""
 
     def __init__(self) -> None:
         self._context: TransferChannelContext | None = None
@@ -172,16 +134,11 @@ class TransferChannelStagingRegistration(BufferRegistration):
         """Register ``buffer``; :attr:`region_id` is then its region.
 
         Raises:
-            RuntimeError: If staging buffers are not enabled (no
-                ``--p2p-load-mode gdr``), ``buffer`` is not aligned, or the
-                transfer channel refuses it.
+            RuntimeError: If there is no transfer channel context, ``buffer``
+                is not aligned to its ``align_bytes``, or it refuses the region.
         """
-        with _context_lock:
-            target, align = _staging_target, _staging_align_bytes
-        if target is None:
-            raise RuntimeError(
-                "Reading objects a peer owns into GPU memory needs --p2p-load-mode gdr"
-            )
+        target = get_transfer_channel_context()
+        align = target.align_bytes
         ptr = buffer.data_ptr()
         if ptr % align or buffer.nbytes % align:
             raise RuntimeError(f"The staging buffer at {ptr:#x} is not {align}-aligned")

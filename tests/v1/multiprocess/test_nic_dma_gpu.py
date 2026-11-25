@@ -14,9 +14,6 @@ pytest.importorskip("cupy", reason="GPU cache context tests require cupy")
 pytest.importorskip("lmcache.cuda_ops", reason="Requires lmcache.cuda_ops")
 
 # First Party
-from lmcache.v1.distributed.transfer_channel import (  # noqa: E402
-    disable_staging_buffers,
-)
 from lmcache.v1.memory_management import (  # noqa: E402
     BorrowedMemoryObj,
     MemoryFormat,
@@ -33,8 +30,8 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (  # noqa: E40
     TransferEngine,
 )
 from tests.v1.platform.devices.cuda.test_gdr_staging_region import (  # noqa: E402
+    _channel,
     _context,
-    _enabled_context,
 )
 import lmcache.lmcache_native as lmcache_native  # noqa: E402
 
@@ -72,7 +69,7 @@ class _CopyReader:
 
 
 def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> None:
-    _enabled_context()
+    _channel(monkeypatch)
     nic_ctx, ref_ctx = _context(), _context()
     row = nic_ctx.get_temp_object_group_buffer(0, 0).nbytes
     payloads = [
@@ -134,4 +131,3 @@ def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> No
         engine.close()
         nic_ctx.close()
         ref_ctx.close()
-        disable_staging_buffers()

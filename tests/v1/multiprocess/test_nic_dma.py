@@ -13,10 +13,7 @@ import pytest
 import torch
 
 # First Party
-from lmcache.v1.distributed.transfer_channel import (
-    disable_staging_buffers,
-    enable_staging_buffers,
-)
+from lmcache.v1.distributed import transfer_channel
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
     MemoryFormat,
@@ -119,9 +116,10 @@ def h(monkeypatch):
     log: list = []
     events: list = []
     nic: dict = {}
-    channel = MagicMock()
+    channel = MagicMock(align_bytes=64)
     channel.register_memory_region.return_value = 9
-    enable_staging_buffers(channel, 64)
+    for module in (transfer_channel, nic_dma):
+        monkeypatch.setattr(module, "get_transfer_channel_context", lambda: channel)
 
     def create(num_slots, align, registration):
         nic["args"] = (num_slots, align)
@@ -196,7 +194,6 @@ def h(monkeypatch):
         runs=runs,
         retrieve=retrieve,
     )
-    disable_staging_buffers()
 
 
 def _reads(log):

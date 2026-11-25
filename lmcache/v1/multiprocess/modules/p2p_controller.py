@@ -35,9 +35,6 @@ from lmcache.v1.distributed.error import L1Error
 from lmcache.v1.distributed.internal_api import L1ManagerInterface
 from lmcache.v1.distributed.transfer_channel import (
     delete_transfer_channel_context,
-    disable_staging_buffers,
-    enable_staging_buffers,
-    get_transfer_channel_context,
     initialize_transfer_channel_context,
 )
 from lmcache.v1.mp_observability.event import Event, EventType
@@ -279,10 +276,6 @@ class P2PController(DiscoverableModule):
                     read_ttl,
                     self._p2p_config.load_timeout,
                 )
-            # The NIC DMA engine registers its staging buffers with it.
-            enable_staging_buffers(
-                get_transfer_channel_context(), l1_memory_desc.align_bytes
-            )
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
         timeout = max(1.0, coordinator_config.heartbeat_interval)
         self._http_client = httpx.Client(timeout=timeout)
@@ -332,7 +325,6 @@ class P2PController(DiscoverableModule):
             self._http_client = None
 
         if self._p2p_config.enabled:
-            disable_staging_buffers()
             if self._pending_removals:
                 # Those adapters may still be reading; closing the channel
                 # would release their transfers under them.

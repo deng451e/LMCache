@@ -213,6 +213,12 @@ class TransferChannelContext(metaclass=abc.ABCMeta):
         """
         raise NotImplementedError
 
+    @property
+    def align_bytes(self) -> int:
+        """Alignment a region registered with :meth:`register_memory_region`
+        must start and end on (the L1 alignment)."""
+        raise NotImplementedError
+
     def register_memory_region(
         self, ptr: int, size: int, device_id: int | None = None
     ) -> int:

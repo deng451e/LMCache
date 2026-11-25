@@ -102,9 +102,9 @@ Why it is built this way:
   restages, so each run clones them on the stream when it is made.
 
 Under `--rocm-host-event-wait` the waiter completes the request from the
-handler's `DeferredResponse`. The P2P controller enables the registration
-under `gdr` (`enable_staging_buffers`); copy mode never creates a NIC
-staging buffer, so it needs no GPUDirect support. Separate staging buffers
+handler's `DeferredResponse`. Only a retrieve of a borrowed object creates
+a NIC staging buffer, so copy mode never registers GPU memory and needs no
+GPUDirect support. Separate staging buffers
 and CUDA streams for GPU DMA and NVMe are a planned follow-up, needed once
 mixed DRAM + GDS retrieves are supported.
 
