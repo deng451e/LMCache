@@ -54,6 +54,12 @@ class _Entry(SimpleNamespace):
     """A registry entry stand-in; unlike SimpleNamespace it is weakly referable."""
 
 
+class _CacheContext(SimpleNamespace):
+    """Hashable and weak-referenceable, as a cache context is."""
+
+    __hash__ = object.__hash__
+
+
 class _Clock:
     def __init__(self) -> None:
         self.now = 0.0
@@ -154,7 +160,7 @@ def _build(
     waiter = module._host_event_waiter
 
     def make_entry(backend: _Backend) -> Any:
-        cache_context = SimpleNamespace(
+        cache_context = _CacheContext(
             device=torch.device("cpu"),
             stream="transfer-stream",
             cupy_stream="cupy-stream",

@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 import threading
+import weakref
 
 # First Party
 from lmcache import torch_dev
@@ -114,7 +115,7 @@ class _Wave:
         self.retrieve.start_wave(self, slots)
 
 
-@dataclass
+@dataclass(eq=False)
 class _NicStaging:
     buffer: StagingBuffer
     registration: TransferChannelStagingRegistration
@@ -123,6 +124,9 @@ class _NicStaging:
     # Retrieves not completed yet; drain() waits on the condition for zero.
     active: int = 0
     idle: threading.Condition = field(default_factory=threading.Condition)
+    # Set by drain(): waves not started yet fail, so the wait covers only the
+    # reads in flight.
+    released: bool = False
 
 
 class _Retrieve:
@@ -160,12 +164,15 @@ class _Retrieve:
                 wave.pool.submit(wave)
 
     def start_wave(self, wave: _Wave, slots: list[int]) -> None:
-        try:
-            reads = self._submit_reads(wave, slots)
-        except Exception:
-            # Transport errors have many types; nothing was started that
-            # could land in the slots.
-            logger.exception("Cannot start reading objects a peer owns")
+        reads = None
+        if not self._staging.released:
+            try:
+                reads = self._submit_reads(wave, slots)
+            except Exception:
+                # Transport errors have many types; nothing was started
+                # that could land in the slots.
+                logger.exception("Cannot start reading objects a peer owns")
+        if reads is None:
             self._fail()
             wave.pool.release(slots)
             self._settle()
@@ -268,8 +275,11 @@ class NicDmaEngine:
         # By id(context); drain() removes a context's entry before the
         # context can be freed and its id reused.
         self._staging: dict[int, _NicStaging] = {}
-        # Buffers of contexts whose reads did not stop in time: never freed.
-        self._undrained: list[_NicStaging] = []
+        # Contexts drain() was called for: a later read fails.
+        self._released: weakref.WeakSet[BaseCacheContext] = weakref.WeakSet()
+        # Buffers being drained, for close() to wake the wait. One whose
+        # reads did not stop in time stays: it is never freed.
+        self._draining: list[_NicStaging] = []
 
     def read(
         self,
@@ -287,7 +297,8 @@ class NicDmaEngine:
                 and stream: True after the last run's
                 kernels are queued; False once a read failed or was abandoned
                 and every started read stopped (later runs are not read), or
-                at once if the NIC staging buffer cannot be created.
+                at once if the NIC staging buffer cannot be created or
+                :meth:`drain` was called for the context.
 
         Returns:
             A response completed with ``finish``'s result or exception.
@@ -296,25 +307,33 @@ class NicDmaEngine:
             if self._poller is None:
                 self._poller = HostPoller("lmcache-nic-dma")
             poller = self._poller
-        try:
-            staging = self._staging.get(id(cache_context)) or self._create(
-                cache_context
-            )
-        except Exception:
-            # Allocation and transport registration errors have many types.
-            logger.exception("Cannot create the NIC staging buffer")
+            # Under the lock, so that drain() either counts this retrieve or
+            # makes it fail.
+            staging = None
+            if cache_context not in self._released:
+                try:
+                    staging = self._staging.get(id(cache_context)) or self._create(
+                        cache_context
+                    )
+                except Exception:
+                    # Allocation and registration errors have many types.
+                    logger.exception("Cannot create the NIC staging buffer")
+                else:
+                    with staging.idle:
+                        staging.active += 1
+        if staging is None:
             response = DeferredResponse()
             _complete(cache_context, response, finish, False)
             return response
-        with staging.idle:
-            staging.active += 1
         return _Retrieve(cache_context, staging, poller, runs, finish).response
 
     def drain(self, cache_context: BaseCacheContext, timeout_s: float) -> bool:
         """Wait until every retrieve of ``cache_context`` completed. Call
         before closing the context, and not on its affinity worker: closing
         deregisters the slots reads land in and unmaps the KV cache their
-        kernels fill. Returns at once after :meth:`close`.
+        kernels fill. From this call on, a read of the context fails and its
+        waves that have not started are dropped, so the wait covers only the
+        reads in flight. Returns at once after :meth:`close`.
 
         Args:
             cache_context: The context about to be closed.
@@ -325,15 +344,20 @@ class NicDmaEngine:
             context must then stay open. Its NIC staging buffer is kept
             for good, since a read may still write to it.
         """
-        staging = self._staging.pop(id(cache_context), None)
-        if staging is None:
-            return True
+        with self._lock:
+            self._released.add(cache_context)
+            staging = self._staging.pop(id(cache_context), None)
+            if staging is None:
+                return True
+            staging.released = True
+            self._draining.append(staging)
         with staging.idle:
             drained = staging.idle.wait_for(
                 lambda: staging.active == 0 or self._closed, timeout_s
             )
-        if not drained:
-            self._undrained.append(staging)
+        if drained:
+            with self._lock:
+                self._draining.remove(staging)
         return drained
 
     def close(self) -> None:
@@ -343,6 +367,11 @@ class NicDmaEngine:
         if poller is not None:
             poller.stop()
         self._closed = True
+        with self._lock:
+            draining = list(self._draining)
+        for staging in draining:
+            with staging.idle:
+                staging.idle.notify_all()
 
     def _create(self, cache_context: BaseCacheContext) -> _NicStaging:
         groups = range(cache_context.kv_layer_groups_manager.num_object_groups)

@@ -305,7 +305,6 @@ def _drain(h) -> threading.Thread:
 def test_drain_waits_until_the_contexts_retrieves_completed(h) -> None:
     """A context is closed only after its reads landed and their kernels
     were queued: closing deregisters the slots and unmaps the KV cache."""
-    assert not _drain(h).is_alive()  # nothing was read for this context
     h.retrieve("ab")
     drain = _drain(h)
     assert drain.is_alive()
@@ -318,7 +317,6 @@ def test_drain_waits_until_the_contexts_retrieves_completed(h) -> None:
 def test_drain_gives_up_after_its_timeout(h) -> None:
     """The caller then leaves the context open; a read that lands later
     still finds its slots and queues its kernels."""
-    assert h.engine.drain(h.cc, 0.05) is True  # nothing to wait for
     _, outcome = h.retrieve("ab")
     assert h.engine.drain(h.cc, 0.05) is False
     h.p.reads[0].finished = True
@@ -326,13 +324,47 @@ def test_drain_gives_up_after_its_timeout(h) -> None:
     assert outcome == [True] and len(_kernels(h.log)) == 1
 
 
-def test_drain_does_not_wait_after_close(h) -> None:
+@pytest.mark.parametrize("close_first", [True, False])
+def test_drain_does_not_wait_once_the_engine_closed(h, close_first) -> None:
     """At shutdown the workers may be gone, so abandoned retrieves never
-    complete."""
+    complete; a drain already waiting is woken."""
     h.retrieve("ab")
     h.poller.stop = lambda: None
-    h.engine.close()
-    assert not _drain(h).is_alive()
+    if close_first:
+        h.engine.close()
+    drain = _drain(h)
+    if not close_first:
+        assert drain.is_alive()
+        h.engine.close()
+        drain.join(5)
+    assert not drain.is_alive()
+
+
+def test_a_read_of_a_released_context_fails_without_a_buffer(h) -> None:
+    """A retrieve that looked its context up before the instance was
+    unregistered reads after drain(): it must not create a buffer the drain
+    does not know, on a context that may be closed."""
+    assert h.engine.drain(h.cc, 0.05) is True  # nothing to wait for
+    response, outcome = h.retrieve("ab")
+    assert outcome == [False] and response.result(timeout=1) is False
+    assert _reads(h.log) == [] and h.cc.create_staging_buffer.call_count == 0
+
+
+def test_drain_fails_the_waves_that_have_not_started(h) -> None:
+    """The timeout bounds reads in flight; waves still waiting for slots
+    would each add a read's timeout to the wait."""
+    _, first = h.retrieve("abcde")  # two waves in flight, the third waits
+    _, second = h.retrieve("gh")
+    drain = _drain(h)
+    for read in h.p.reads:
+        read.finished = True
+    h.poller.poll()
+    for event in h.events:
+        event.done = True
+    h.poller.poll()
+    drain.join(5)
+    assert not drain.is_alive() and (first, second) == ([False], [False])
+    assert len(_reads(h.log)) == 2
 
 
 def test_unfull_chunks_use_the_spare_rows_one_at_a_time(h) -> None:

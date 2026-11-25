@@ -115,9 +115,11 @@ def test_unregister_reclaims_ipc_memory(monkeypatch) -> None:
     assert module.context_entries_snapshot() == {}
 
 
-@pytest.mark.parametrize("drained", [True, False])
+@pytest.mark.parametrize(
+    "drained, expected", [(True, ["drain", "close"]), (False, ["drain"])]
+)
 def test_unregister_drains_peer_reads_before_closing_the_context(
-    monkeypatch, drained
+    monkeypatch, drained, expected
 ) -> None:
     """Reads of objects a peer owns land outside the stream, so the stream
     synchronize in close() does not wait for them. A context whose reads do
@@ -125,7 +127,7 @@ def test_unregister_drains_peer_reads_before_closing_the_context(
     order: list = []
     engine = MagicMock()
     engine.drain.side_effect = lambda cache_context, timeout_s: (
-        order.append(("drain", cache_context)) or drained
+        order.append("drain") or drained
     )
     monkeypatch.setattr(gpu_mod, "NicDmaEngine", lambda: engine)
     monkeypatch.setattr(gpu_mod, "torch_dev", _FakeTorchDev())
@@ -135,7 +137,8 @@ def test_unregister_drains_peer_reads_before_closing_the_context(
 
     module.unregister_kv_cache(7)
 
-    assert order == [("drain", ctx), "close"][: 1 + drained]
+    assert order == expected
+    assert engine.drain.call_args.args[0] is ctx
 
 
 def test_unregister_unknown_instance_does_not_reclaim(monkeypatch) -> None:
