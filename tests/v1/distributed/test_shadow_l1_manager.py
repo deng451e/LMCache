@@ -164,7 +164,7 @@ def test_placeholder_is_invalid_until_bound_once() -> None:
         obj.bind(Lease().pair, reader=_Read(), address=-1, source="peer")
     lease = Lease()
     _bind(obj, lease)
-    assert obj.is_bound and obj.is_valid() and obj.is_remote
+    assert obj.is_bound and obj.is_valid()
     with pytest.raises(RuntimeError, match="already bound"):
         _bind(obj, Lease())
     obj.release()
@@ -186,17 +186,14 @@ def test_a_borrowed_object_reads_into_a_region_and_has_no_local_bytes() -> None:
     same.bind(Lease().pair, reader=_Read(), address=0x1000, source="a")
     other.bind(Lease().pair, reader=_Read(), address=0x2000, source="a")
     other_peer.bind(Lease().pair, reader=_Read(), address=0x1000, source="b")
-    assert first.read_into(3, 64) is read and read.started == [(3, 64)]
     assert first.reader is read
     assert first.same_bytes(same) and not first.same_bytes(other)
     assert not first.same_bytes(other_peer)  # same offset, another peer
     (unbound,) = _placeholders(1)
     assert not first.same_bytes(unbound) and not unbound.same_bytes(first)
     with pytest.raises(RuntimeError, match="not bound"):
-        unbound.read_into(0, 0)
-    with pytest.raises(RuntimeError, match="not bound"):
         _ = unbound.reader
-    # A SHADOW object carries no tensor: every reader goes through read_into.
+    # A SHADOW object carries no tensor: its bytes are read through its reader.
     assert first.raw_tensor is None and first.tensor is None
     with pytest.raises(RuntimeError, match="no local bytes"):
         _ = first.data_ptr

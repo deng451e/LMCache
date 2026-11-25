@@ -42,7 +42,7 @@ the server adds one (`shadow.dram`) when none is configured. `gdr` excludes
 
 A lease lasts until `lookup start + read TTL - margin`, with
 `margin = min(1 s, TTL / 10)`, and must have `load_timeout_s` left for a read
-to start. After that the object is invalid, `read_into` refuses, and the key
+to start. After that the object is invalid, a read of it is refused, and the key
 is a miss. An expired reservation is not unlocked; the owner's TTL reclaims it.
 
 The TTL is not sent over the wire: **every node must use the same
@@ -125,7 +125,7 @@ user releases it.
 | Read exceeds `load_timeout_s` | It is cancelled (`TransferChannelClient.cancel`) and fails once the transport confirms it stopped. Until then its slots stay taken: a read still running could land in them. |
 | Server shuts down with reads in flight | The poller abandons them: the retrieve fails and their slots are never reused. |
 | Read TTL not above `--p2p-load-timeout` + 1 s | The server refuses to start in `gdr` mode. |
-| Lease expired | The key is a miss; a held object refuses `read_into`. |
+| Lease expired | The key is a miss; a read of a held object is refused. |
 | Owner unreachable for unlocks | The unlock is lost; the owner's TTL reclaims the locks. |
 | Peer removed with live leases or a read in flight | `close()` raises; the controller retries each cycle. |
 

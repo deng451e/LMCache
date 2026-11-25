@@ -28,11 +28,6 @@ class StagingBuffer(Protocol):
     """
 
     @property
-    def max_batch_size(self) -> int:
-        """Number of slots."""
-        ...
-
-    @property
     def buffer(self) -> torch.Tensor:
         """The flat buffer every slot lies in."""
         ...

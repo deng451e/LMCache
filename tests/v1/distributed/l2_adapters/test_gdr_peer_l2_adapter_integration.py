@@ -252,8 +252,8 @@ def test_gdr_borrow_reads_owner_bytes_straight_into_gpu() -> None:
         # Read each borrowed object straight into a GPU landing slot.
         for i, key in enumerate(keys):
             handle = results[key][1]
-            assert isinstance(handle, BorrowedMemoryObj) and handle.is_remote
-            read = handle.read_into(region_id, i * _PAGE)
+            assert isinstance(handle, BorrowedMemoryObj)
+            read = handle.reader.read_many(region_id, [(handle, i * _PAGE)])
             _wait_until(read.is_finished)
             assert read.succeeded()
             slot = landing[i * _PAGE : (i + 1) * _PAGE]

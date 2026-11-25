@@ -132,6 +132,10 @@ def _load(adapter, keys):
     }
 
 
+def _read(obj, region_id: int, offset: int):
+    return obj.reader.read_many(region_id, [(obj, offset)])
+
+
 def _borrow(adapter, req_client):
     """Look up and borrow one key; return it and its handle."""
     key = _key(0)
@@ -154,7 +158,7 @@ def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
         objects = _load(adapter, keys)
         assert list(objects) == [keys[0]]
         obj = objects[keys[0]]
-        assert isinstance(obj, BorrowedMemoryObj) and obj.is_remote
+        assert isinstance(obj, BorrowedMemoryObj)
         assert obj.is_valid()
         assert obj.get_size() == PAGE
         assert obj.get_shapes() == LAYOUT.shapes
@@ -168,7 +172,7 @@ def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=False
         )
-        read = obj.read_into(3, 2 * PAGE)
+        read = _read(obj, 3, 2 * PAGE)
         tc_client.submit_read.assert_called_once_with(
             [TransferChannelAddress(offset=2 * PAGE, size=PAGE)],
             [addresses[0]],
@@ -200,14 +204,14 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[False]
         )
-        read = obj.read_into(1, 0)
+        read = _read(obj, 1, 0)
         assert read.is_finished() and not read.succeeded()
 
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=False
         )
         tc_client.cancel.return_value = False
-        read = obj.read_into(1, 0)
+        read = _read(obj, 1, 0)
         assert not read.is_finished()
         tc_client.cancel.assert_not_called()
         time.sleep(0.02)
@@ -264,7 +268,7 @@ def test_a_transport_error_fails_the_read_once_it_is_stopped() -> None:
         tc_client.submit_read.return_value = 1
         tc_client.query_status.side_effect = RuntimeError("backend error")
         tc_client.cancel.return_value = False
-        read = obj.read_into(1, 0)
+        read = _read(obj, 1, 0)
         assert not read.is_finished()
         tc_client.cancel.return_value = True
         assert read.is_finished() and not read.succeeded()
@@ -283,7 +287,7 @@ def test_expired_lease_refuses_to_read_and_skips_the_unlock(
         now = time.monotonic()
         monkeypatch.setattr(time, "monotonic", lambda: now + 30.5)
         assert not obj.is_valid()
-        read = obj.read_into(1, 0)
+        read = _read(obj, 1, 0)
         assert read.is_finished() and not read.succeeded()
         tc_client.submit_read.assert_not_called()
         obj.release()
@@ -315,7 +319,7 @@ def test_an_adopted_lease_outlives_the_placeholder_it_came_with() -> None:
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[True]
         )
-        assert resident.read_into(3, 0).is_finished()
+        assert _read(resident, 3, 0).is_finished()
         tc_client.submit_read.assert_called_once()
         assert adapter.get_local_borrow_count() == 1
         resident.release()
