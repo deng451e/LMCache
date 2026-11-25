@@ -43,8 +43,8 @@ def _storage() -> MemoryObj:
     return MagicMock(spec=GDSMemoryObject)
 
 
-def _peer() -> MemoryObj:
-    return MagicMock(spec=BorrowedMemoryObj)
+def _peer(is_local: bool = False) -> MemoryObj:
+    return MagicMock(spec=BorrowedMemoryObj, is_local=is_local)
 
 
 def _objects(pattern: str) -> list[MemoryObj | None]:
@@ -58,6 +58,8 @@ def test_engine_follows_the_object_type():
     assert select_engine(_host()) is GPU
     assert select_engine(_storage()) is NVME
     assert select_engine(_peer()) is NIC
+    # A borrowed object mapped into this process is host memory.
+    assert select_engine(_peer(is_local=True)) is GPU
 
 
 def test_storing_into_an_object_a_peer_owns_is_rejected():

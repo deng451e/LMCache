@@ -27,12 +27,13 @@ class TransferEngine(enum.Enum):
     """How an L1 object's bytes travel to or from GPU memory."""
 
     GPU_DMA = "gpu_dma"
-    """Host memory (DRAM, DevDAX): a host/GPU copy."""
+    """Host memory (DRAM, DevDAX, a borrowed object bound to a local view):
+    a host/GPU copy."""
     NVME_DMA = "nvme_dma"
     """Storage-backed object: a file read or write against GPU memory."""
     NIC_DMA = "nic_dma"
-    """Object a peer owns: a transfer-channel read into GPU memory, retrieve
-    only. Not staged here: the transfer hands its runs to the NIC DMA engine
+    """Borrowed object bound to a reader: its bytes are not mapped locally
+    and are read into GPU memory through the reader, retrieve only. Not staged here: the transfer hands its runs to the NIC DMA engine
     (``nic_dma.py``), which reads them without blocking."""
 
 
@@ -47,7 +48,7 @@ def select_engine(memory_obj: MemoryObj) -> TransferEngine:
     """
     if isinstance(memory_obj, GDSMemoryObject):
         return TransferEngine.NVME_DMA
-    if isinstance(memory_obj, BorrowedMemoryObj):
+    if isinstance(memory_obj, BorrowedMemoryObj) and not memory_obj.is_local:
         return TransferEngine.NIC_DMA
     return TransferEngine.GPU_DMA
 
