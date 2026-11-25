@@ -179,7 +179,10 @@ rows and the kpool indexer at 32 under a 1152-token block).
 `validate_kv_cache_groups` (called at connector init and again at
 registration) rejects group specs the transfer path cannot serve correctly,
 with one aggregated error: `CrossAttentionSpec`, and Mamba with
-`mamba_cache_mode != "align"` (no reusable snapshots). Declared slot
+`mamba_cache_mode != "align"` (no reusable snapshots). vLLM without
+`mamba_cache_mode` (vllm-project/vllm#63830) declares the Mamba manager's
+`enable_prefix_caching` instead; `group_mamba_cache_mode` reads it as `"align"`
+or `"none"`. Declared slot
 compression (`compress_ratio > 1` / `tq_slot_size > 0`, e.g. DeepSeek-V4) is
 *not* rejected — those groups are served by the compression path in
 `lmcache/v1/kv_layer_groups.py` and only skipped by the edits here. Note the

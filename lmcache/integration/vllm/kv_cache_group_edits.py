@@ -188,7 +188,8 @@ def validate_kv_cache_groups(kv_cache_config: KVCacheConfig | None) -> None:
                 unsupported.append(
                     f"group {group_idx}: MambaSpec with mamba_cache_mode="
                     f"'{mamba_cache_mode}' "
-                    f"(only 'align' and 'all' keep reusable state snapshots)"
+                    f"(only 'align' and 'all' keep reusable state snapshots; "
+                    f"enable vLLM prefix caching)"
                 )
     if unsupported:
         raise ValueError(

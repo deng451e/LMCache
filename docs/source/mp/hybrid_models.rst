@@ -266,6 +266,9 @@ cannot serve correctly (``validate_kv_cache_groups`` in
 - **Encoder-decoder cross-attention caches** (``CrossAttentionSpec``).
 - **Mamba groups in** ``none`` **mode** (``mamba_cache_mode`` other than
   ``"align"`` or ``"all"``): they keep no reusable per-block state snapshots.
+  vLLM selects ``align`` when prefix caching is enabled; vLLM versions without
+  ``mamba_cache_mode`` (vllm-project/vllm#63830) declare it per Mamba group as
+  ``enable_prefix_caching``, which LMCache reads as ``align``.
 
 DeepSeek-V4-style **compressed / indexer caches are supported** — specs that
 declare slot compression (``compress_ratio > 1`` / ``tq_slot_size > 0``) are

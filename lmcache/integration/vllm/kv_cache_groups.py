@@ -202,11 +202,49 @@ def _is_mamba_spec(spec: Any) -> bool:
 
 
 def group_mamba_cache_mode(group: Any, spec: Any) -> str:
-    """Return the Mamba cache mode set for one layer, ``"none"`` if unset."""
+    """Return the Mamba cache mode set for one layer, ``"none"`` if unset.
+
+    vLLM with vllm-project/vllm#63830 replaced the manager's
+    ``mamba_cache_mode`` with ``enable_prefix_caching``, which snapshots the
+    state at block boundaries as ``"align"`` did; it maps to ``"align"`` or
+    ``"none"``.
+
+    Args:
+        group: A vLLM KV cache group.
+        spec: The layer's KV cache spec.
+
+    Returns:
+        ``"align"``, ``"all"`` or ``"none"``.
+    """
     config = _manager_config(group)
     if config is not None:
-        return getattr(config.params, "mamba_cache_mode", "none")
+        params = config.params
+        if hasattr(params, "mamba_cache_mode"):
+            return params.mamba_cache_mode
+        return "align" if getattr(params, "enable_prefix_caching", False) else "none"
     return getattr(spec, "mamba_cache_mode", "none")
+
+
+def resolve_mamba_cache_mode(cache_config: Any, kv_cache_config: Any) -> str:
+    """Return vLLM's Mamba cache mode for the model.
+
+    Older vLLM sets it on ``cache_config.mamba_cache_mode``. vLLM with
+    vllm-project/vllm#63830 has no such field: the mode is ``"align"`` when a
+    Mamba group caches prefixes (see :func:`group_mamba_cache_mode`).
+
+    Args:
+        cache_config: vLLM's ``CacheConfig``.
+        kv_cache_config: vLLM's resolved ``KVCacheConfig``, or ``None``.
+
+    Returns:
+        ``"align"``, ``"all"`` or ``"none"``; ``"none"`` for models without
+        Mamba layers on vLLM without the field.
+    """
+    mode = getattr(cache_config, "mamba_cache_mode", None)
+    if mode is not None:
+        return mode
+    groups = getattr(kv_cache_config, "kv_cache_groups", None) or ()
+    return "align" if any(is_align_mode_mamba_group(g) for g in groups) else "none"
 
 
 def _is_cachable_mamba(group: Any, spec: Any) -> bool:

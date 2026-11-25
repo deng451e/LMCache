@@ -310,6 +310,57 @@ def test_dcp_cache_identity_ignores_worker_mutated_interleave(gated):
     assert scheduler.parallel_config.cp_kv_cache_interleave_size == 1
 
 
+@requires_vllm
+def test_dcp_adjust_receives_kv_cache_groups_on_current_vllm():
+    """Current vLLM's ``adjust_dcp_kv_cache_interleave_size`` takes the KV cache
+    groups, not the ``KVCacheConfig``."""
+    _, get_dcp_decorated_model_name, _, _ = _import_connector_geometry_helpers()
+    cfg = _geometry_config(dcp_size=8, interleave=1, base_block_size=1536)
+    kv_cache_config = _hybrid_kv_cache_config(1536, 1536)
+    received = []
+
+    def adjust(kv_cache_groups):
+        received.append(kv_cache_groups)
+        cfg.parallel_config.cp_kv_cache_interleave_size = 1536
+
+    cfg.adjust_dcp_kv_cache_interleave_size = adjust
+
+    name = get_dcp_decorated_model_name(cfg, kv_cache_config)
+
+    assert received == [kv_cache_config.kv_cache_groups]
+    assert name.endswith("##lmcache-dcp-layout-v1-d8-interleave1536")
+    assert cfg.parallel_config.cp_kv_cache_interleave_size == 1
+
+
+@requires_vllm
+def test_mamba_alignment_reads_mode_from_groups_on_current_vllm():
+    """Without ``cache_config.mamba_cache_mode`` (vllm-project/vllm#63830), a
+    Mamba group with prefix caching enables the step-alignment check."""
+    *_, validate_mamba_step_alignment = _import_connector_geometry_helpers()
+    config = _geometry_config(max_num_batched_tokens=2048)
+    del config.cache_config.mamba_cache_mode
+    mamba = SimpleNamespace(
+        kv_cache_specs={"layer.1": MambaSpec(2304)},
+        distinct_specs=(MambaSpec(2304),),
+        layer_names=["layer.1"],
+        manager_config=SimpleNamespace(
+            manager_cls=type("MambaManager", (), {}),
+            params=SimpleNamespace(enable_prefix_caching=True),
+        ),
+        block_size=2304,
+        dcp_sharded=False,
+        prefix_cacheable=True,
+        prefix_replay_tokens=0,
+    )
+    kv_config = SimpleNamespace(kv_cache_groups=[mamba])
+
+    with pytest.raises(ValueError, match=r"block_size=2304"):
+        validate_mamba_step_alignment(config, kv_config)
+
+    mamba.manager_config.params.enable_prefix_caching = False
+    validate_mamba_step_alignment(config, kv_config)
+
+
 # --------------------------------------------------------------------------- #
 # validate_dcp_support: fail closed on unproven topologies                     #
 # --------------------------------------------------------------------------- #
