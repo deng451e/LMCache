@@ -480,6 +480,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         if not entries:
             return
         for entry in entries:
+            # Peer reads land outside the stream, which close() waits for.
+            self._nic_dma.drain(entry.cache_context)
             entry.cache_context.close()
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size

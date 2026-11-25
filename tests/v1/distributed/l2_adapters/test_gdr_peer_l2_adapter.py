@@ -226,6 +226,26 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
         obj.release()
 
 
+def test_a_read_that_finishes_after_its_deadline_fails() -> None:
+    """Past the deadline the owner's lock may lapse before the bytes are
+    used, so a read the cancel did not stop in time is not trusted."""
+    with _adapter(load_timeout_s=0.01) as (adapter, req_client, _tc_ctx, tc_client):
+        key, obj = _borrow(adapter, req_client)
+        tc_client.submit_read.return_value = 1
+        tc_client.query_status.return_value = TransferChannelTransferResult(
+            finished=False
+        )
+        tc_client.cancel.return_value = False
+        read = _read(obj, 1, 0)
+        time.sleep(0.02)
+        assert not read.is_finished()
+        tc_client.query_status.return_value = TransferChannelTransferResult(
+            finished=True, succeeded_mask=[True]
+        )
+        assert read.is_finished() and not read.succeeded()
+        obj.release()
+
+
 def test_objects_of_one_peer_are_read_with_one_submit() -> None:
     """The NIC DMA engine reads a wave of a peer's objects in one transfer,
     and not at all once one of their leases has ended."""

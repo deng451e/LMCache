@@ -65,7 +65,7 @@ RETRIEVE handler (affinity worker)
   NicDmaEngine.read(runs) → DeferredResponse              worker is free again
 
 per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
-  take free slots of the NIC staging buffer (StagingSlotPool)
+  take free slots of the NIC staging buffer (`_SlotPool`)
   one BorrowedReader.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
   HostPoller sees the reads finished → on the worker:
       block kernels: NIC slots → paged KV, then record an event
@@ -122,7 +122,9 @@ user releases it.
 | Failure | Behavior |
 |---|---|
 | Read fails | The retrieve completes with `False` once every read it started has stopped; its later waves are never read and no kernel is queued after the failure. vLLM recomputes the blocks (`kv_load_failure_policy=recompute`). |
-| Read exceeds `load_timeout_s` | It is cancelled (`TransferChannelClient.cancel`) and fails once the transport confirms it stopped. Until then its slots stay taken: a read still running could land in them. |
+| Read exceeds `load_timeout_s` | It is cancelled (`TransferChannelClient.cancel`) and fails once the transport confirms it stopped, also if it finished before the cancel took effect: the owner's lock may lapse before late bytes are used. Until then its slots stay taken: a read still running could land in them. A cancel the transport never confirms keeps the retrieve waiting (known gap). |
+| NIC staging buffer cannot be allocated or registered | The retrieve completes with `False` at once, so its read locks are released and vLLM recomputes. The next borrowed retrieve tries again. |
+| Instance unregistered or reaped with reads in flight | `NicDmaEngine.drain` waits until the context's retrieves completed before the context is closed: closing deregisters the NIC slots and unmaps the KV cache. |
 | Server shuts down with reads in flight | The poller abandons them: the retrieve fails and their slots are never reused. |
 | Read TTL not above `--p2p-load-timeout` + 1 s | The server refuses to start in `gdr` mode. |
 | Lease expired | The key is a miss; a read of a held object is refused. |

@@ -7,6 +7,7 @@ and their kernels are queued only after the reads land (CPU, fakes)."""
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock
+import threading
 
 # Third Party
 import pytest
@@ -283,6 +284,44 @@ def test_shutdown_abandons_the_reads(h) -> None:
     response, outcome = h.retrieve("ab")
     h.poller.stop()
     assert outcome == [False] and response.done() and _kernels(h.log) == []
+
+
+def test_a_staging_buffer_that_cannot_be_created_fails_the_retrieve(h) -> None:
+    """E.g. the transfer channel refuses the region: the retrieve completes
+    as failed, so its read locks are released and vLLM recomputes."""
+    h.cc.create_staging_buffer.side_effect = RuntimeError("no GPUDirect RDMA")
+    response, outcome = h.retrieve("ab")
+    assert outcome == [False] and response.result(timeout=1) is False
+    assert _reads(h.log) == []
+
+
+def _drain(h) -> threading.Thread:
+    thread = threading.Thread(target=h.engine.drain, args=(h.cc,), daemon=True)
+    thread.start()
+    thread.join(0.1)
+    return thread
+
+
+def test_drain_waits_until_the_contexts_retrieves_completed(h) -> None:
+    """A context is closed only after its reads landed and their kernels
+    were queued: closing deregisters the slots and unmaps the KV cache."""
+    assert not _drain(h).is_alive()  # nothing was read for this context
+    h.retrieve("ab")
+    drain = _drain(h)
+    assert drain.is_alive()
+    h.p.reads[0].finished = True
+    h.poller.poll()
+    drain.join(5)
+    assert not drain.is_alive() and len(_kernels(h.log)) == 1
+
+
+def test_drain_does_not_wait_after_close(h) -> None:
+    """At shutdown the workers may be gone, so abandoned retrieves never
+    complete."""
+    h.retrieve("ab")
+    h.poller.stop = lambda: None
+    h.engine.close()
+    assert not _drain(h).is_alive()
 
 
 def test_unfull_chunks_use_the_spare_rows_one_at_a_time(h) -> None:

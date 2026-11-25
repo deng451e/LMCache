@@ -71,6 +71,7 @@ class _TransferChannelRead(PendingRead):
         self._deadline = deadline
         self._on_finished = on_finished
         self._succeeded: bool | None = None
+        self._timed_out = False
 
     def is_finished(self) -> bool:
         """Return whether the transport stopped the read; latches the result."""
@@ -79,8 +80,11 @@ class _TransferChannelRead(PendingRead):
         try:
             result = self._client.query_status(self._task_id)
             if result.is_finished():
-                self._succeeded = all(result.succeeded_mask)
+                # Finishing after the deadline is too late: the owner's lock
+                # may lapse before the bytes are used.
+                self._succeeded = not self._timed_out and all(result.succeeded_mask)
             elif time.monotonic() > self._deadline:
+                self._timed_out = True
                 if self._client.cancel(self._task_id):
                     logger.warning("GDR read task %d timed out", self._task_id)
                     self._succeeded = False
@@ -96,8 +100,6 @@ class _TransferChannelRead(PendingRead):
             if self._stopped_after_error():
                 logger.exception("GDR read task %d failed", self._task_id)
                 self._succeeded = False
-            else:
-                time.sleep(_CANCEL_RETRY_S)
         if self._succeeded is None:
             return False
         self._on_finished()

@@ -112,6 +112,25 @@ def test_unregister_reclaims_ipc_memory(monkeypatch) -> None:
     assert module.context_entries_snapshot() == {}
 
 
+def test_unregister_drains_peer_reads_before_closing_the_context(monkeypatch) -> None:
+    """Reads of objects a peer owns land outside the stream, so the stream
+    synchronize in close() does not wait for them."""
+    order: list = []
+    engine = MagicMock()
+    engine.drain.side_effect = lambda cache_context: order.append(
+        ("drain", cache_context)
+    )
+    monkeypatch.setattr(gpu_mod, "NicDmaEngine", lambda: engine)
+    monkeypatch.setattr(gpu_mod, "torch_dev", _FakeTorchDev())
+    module = _module(monkeypatch)
+    ctx = _register(module, monkeypatch, 7)
+    ctx.close.side_effect = lambda: order.append("close")
+
+    module.unregister_kv_cache(7)
+
+    assert order == [("drain", ctx), "close"]
+
+
 def test_unregister_unknown_instance_does_not_reclaim(monkeypatch) -> None:
     """The warn path (already-reaped / never-registered id) must not touch
     the allocator — reclaim is tied to an actual release."""

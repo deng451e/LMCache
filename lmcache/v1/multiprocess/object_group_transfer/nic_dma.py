@@ -15,7 +15,6 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Sequence
 import threading
-import weakref
 
 # First Party
 from lmcache import torch_dev
@@ -24,7 +23,11 @@ from lmcache.v1.distributed.transfer_channel import (
     TransferChannelStagingRegistration,
     get_transfer_channel_context,
 )
-from lmcache.v1.memory_management import BorrowedMemoryObj, PendingRead
+from lmcache.v1.memory_management import (
+    BorrowedMemoryObj,
+    BorrowedReader,
+    PendingRead,
+)
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -42,6 +45,25 @@ NIC_STAGING_BYTES = 512 << 20
 # Rows after the slots for an unfull chunk: one row plus at most one lead
 # block per kernel group.
 _SPARE_ROWS = 2
+
+
+def _complete(
+    cache_context: BaseCacheContext,
+    response: DeferredResponse,
+    finish: Callable[[bool], object],
+    succeeded: bool,
+) -> None:
+    """Complete ``response`` with ``finish(succeeded)``, called under the
+    context's device and stream."""
+    try:
+        with (
+            torch_dev.device(cache_context.device),
+            torch_dev.stream(cache_context.stream),
+        ):
+            response.set_result(finish(succeeded))
+    except Exception as error:
+        logger.exception("Cannot complete a retrieve of objects a peer owns")
+        response.set_exception(error)
 
 
 class _SlotPool:
@@ -98,6 +120,9 @@ class _NicStaging:
     registration: TransferChannelStagingRegistration
     pool: _SlotPool
     spare: _SlotPool  # the rows at the end, one unfull chunk at a time
+    # Retrieves not completed yet; drain() waits on the condition for zero.
+    active: int = 0
+    idle: threading.Condition = field(default_factory=threading.Condition)
 
 
 class _Retrieve:
@@ -155,7 +180,9 @@ class _Retrieve:
         """One read per peer of the wave's objects."""
         buffer = self._staging.buffer
         base = buffer.buffer.data_ptr()
-        per_reader: dict[int, tuple] = {}
+        per_reader: dict[
+            int, tuple[BorrowedReader, list[tuple[BorrowedMemoryObj, int]]]
+        ] = {}
         free = iter(slots)
         for run in wave.runs:
             run_slots = [next(free) for _ in run.memory_objs]
@@ -217,13 +244,10 @@ class _Retrieve:
         self._unsettled -= 1
         if self._unsettled:
             return
-        cc = self._cache_context
-        try:
-            with torch_dev.device(cc.device), torch_dev.stream(cc.stream):
-                self.response.set_result(self._finish(not self._failed))
-        except Exception as error:
-            logger.exception("Cannot complete a retrieve of objects a peer owns")
-            self.response.set_exception(error)
+        _complete(self._cache_context, self.response, self._finish, not self._failed)
+        with self._staging.idle:
+            self._staging.active -= 1
+            self._staging.idle.notify_all()
 
 
 class NicDmaEngine:
@@ -239,10 +263,10 @@ class NicDmaEngine:
 
     def __init__(self, poller: HostPoller | None = None) -> None:
         self._poller = poller
+        self._closed = False
         self._lock = threading.Lock()
-        self._staging: weakref.WeakKeyDictionary[BaseCacheContext, _NicStaging] = (
-            weakref.WeakKeyDictionary()
-        )
+        # By id(context); drain() removes a context's entry before it closes.
+        self._staging: dict[int, _NicStaging] = {}
 
     def read(
         self,
@@ -259,7 +283,8 @@ class NicDmaEngine:
             finish: Called once on the worker, under the context's device
                 and stream: True after the last run's
                 kernels are queued; False once a read failed or was abandoned
-                and every started read stopped (later runs are not read).
+                and every started read stopped (later runs are not read), or
+                at once if the NIC staging buffer cannot be created.
 
         Returns:
             A response completed with ``finish``'s result or exception.
@@ -268,8 +293,35 @@ class NicDmaEngine:
             if self._poller is None:
                 self._poller = HostPoller("lmcache-nic-dma")
             poller = self._poller
-        staging = self._staging.get(cache_context) or self._create(cache_context)
+        try:
+            staging = self._staging.get(id(cache_context)) or self._create(
+                cache_context
+            )
+        except Exception:
+            # Allocation and transport registration errors have many types.
+            logger.exception("Cannot create the NIC staging buffer")
+            response = DeferredResponse()
+            _complete(cache_context, response, finish, False)
+            return response
+        with staging.idle:
+            staging.active += 1
         return _Retrieve(cache_context, staging, poller, runs, finish).response
+
+    def drain(self, cache_context: BaseCacheContext) -> None:
+        """Wait until every retrieve of ``cache_context`` completed. Call
+        before closing the context, and not on its affinity worker: closing
+        deregisters the slots reads land in and unmaps the KV cache their
+        kernels fill. Returns at once after :meth:`close`.
+
+        Args:
+            cache_context: The context about to be closed.
+        """
+        staging = self._staging.get(id(cache_context))
+        if staging is None:
+            return
+        with staging.idle:
+            staging.idle.wait_for(lambda: staging.active == 0 or self._closed)
+        del self._staging[id(cache_context)]
 
     def close(self) -> None:
         """Stop the poller; reads in flight are abandoned."""
@@ -277,6 +329,10 @@ class NicDmaEngine:
             poller = self._poller
         if poller is not None:
             poller.stop()
+        self._closed = True
+        for staging in list(self._staging.values()):
+            with staging.idle:
+                staging.idle.notify_all()
 
     def _create(self, cache_context: BaseCacheContext) -> _NicStaging:
         groups = range(cache_context.kv_layer_groups_manager.num_object_groups)
@@ -299,5 +355,5 @@ class NicDmaEngine:
         staging = _NicStaging(
             buffer, registration, _SlotPool(range(num_slots)), _SlotPool([num_slots])
         )
-        self._staging[cache_context] = staging
+        self._staging[id(cache_context)] = staging
         return staging
