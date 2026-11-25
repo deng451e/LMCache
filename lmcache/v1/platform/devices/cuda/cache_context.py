@@ -25,10 +25,7 @@ if TYPE_CHECKING:
 # First Party
 from lmcache import torch_dev
 from lmcache.utils import EngineType
-from lmcache.v1.common.buffer_registration import (
-    BufferRegistration,
-    staging_slot_alignment,
-)
+from lmcache.v1.common.buffer_registration import BufferRegistration
 from lmcache.v1.common.group_view import (
     EngineGroupInfo,
     engine_group_layer_indices,
@@ -45,10 +42,6 @@ from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.base.ipc_wrapper import KVCache
 
 logger = init_logger(__name__)
-
-
-def _round_up(value: int, multiple: int) -> int:
-    return -(-value // multiple) * multiple
 
 
 def unwrap_kv_cache_tensors(kv_caches: KVCache) -> list[torch.Tensor]:
@@ -109,9 +102,9 @@ class _TempGPUBuffer:
         lmcache_memcpy_async(...)
     ```
 
-    Every object group slot starts on the staging slot alignment
-    (:func:`staging_slot_alignment`, 1 unless GPU-direct borrowing set it), so a
-    transfer channel can read a peer's object straight into a slot.
+    With ``slot_align_bytes`` every object group slot starts on that
+    alignment, so a transfer channel can read a peer's object straight into
+    a slot.
     """
 
     def __init__(
@@ -120,8 +113,8 @@ class _TempGPUBuffer:
         lmcache_tokens_per_chunk: int,
         device: torch.device,
         max_batch_size: int = 4,
+        slot_align_bytes: int = 1,
     ) -> None:
-        slot_align_bytes = staging_slot_alignment()
         self._kv_groups_manager = kv_layer_groups_manager
         self._lmcache_tokens_per_chunk = lmcache_tokens_per_chunk
         self._max_batch_size = max_batch_size
@@ -142,7 +135,7 @@ class _TempGPUBuffer:
         for batch_idx in range(max_batch_size):
             for object_group_idx in range(self._kv_groups_manager.num_object_groups):
                 object_group_size = 0
-                offset = _round_up(offset, slot_align_bytes)
+                offset = -(-offset // slot_align_bytes) * slot_align_bytes
                 object_group_start_offset = offset
 
                 for kernel_group_idx in self._kv_groups_manager.object_groups[
@@ -164,9 +157,9 @@ class _TempGPUBuffer:
                     object_group_size,
                 )
 
-        # Over-allocate and take an aligned view: the buffer must start and
-        # end on the alignment.
-        size = _round_up(offset, slot_align_bytes)
+        # Over-allocate and take an aligned view: the buffer starts and ends
+        # on the alignment, so every object group slot starts on it.
+        size = -(-offset // slot_align_bytes) * slot_align_bytes
         storage = torch.empty(
             size + slot_align_bytes - 1, dtype=torch.uint8, device=device
         )
@@ -384,6 +377,8 @@ class GPUCacheContext(BaseCacheContext):
         # that pin the exporter's device memory until explicitly closed.
         self._kv_wrappers: KVCache = list(kv_caches)
         self._buffer_registration: BufferRegistration | None = None
+        # Buffers from create_staging_buffer, deregistered by close().
+        self._extra_staging: list[tuple[_TempGPUBuffer, BufferRegistration]] = []
         try:
             self._init_impl(
                 kv_caches,
@@ -466,7 +461,6 @@ class GPUCacheContext(BaseCacheContext):
             self.group_kv_pointers_.append(list_to_gpu_tensor(ptrs, self.device_))
 
         # Temporary GPU buffer for transfers — a single flat uint8 buffer
-        # Under GPU-direct borrowing its slots are aligned for peer reads.
         self._temp_buffer = self._make_temp_buffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=lmcache_tokens_per_chunk,
@@ -530,6 +524,25 @@ class GPUCacheContext(BaseCacheContext):
             registration.register(self._temp_buffer.buffer)
         self._buffer_registration = registration
 
+    def create_staging_buffer(
+        self,
+        num_slots: int,
+        slot_align_bytes: int,
+        registration: BufferRegistration,
+    ) -> _TempGPUBuffer:
+        """Allocate and register a staging buffer; see the base class."""
+        staging = _TempGPUBuffer(
+            kv_layer_groups_manager=self.kv_layer_groups_manager_,
+            lmcache_tokens_per_chunk=self.lmcache_tokens_per_chunk,
+            device=self.device_,
+            max_batch_size=num_slots,
+            slot_align_bytes=slot_align_bytes,
+        )
+        with torch_dev.stream(self.cuda_stream_):
+            registration.register(staging.buffer)
+        self._extra_staging.append((staging, registration))
+        return staging
+
     def close(self) -> None:
         """Drain the context stream, release any staging registration and
         release the imported KV mappings (reverse of __init__).
@@ -547,6 +560,10 @@ class GPUCacheContext(BaseCacheContext):
             with torch_dev.stream(self.cuda_stream_):
                 self._buffer_registration.deregister(self._temp_buffer.buffer)
             self._buffer_registration = None
+        with torch_dev.stream(self.cuda_stream_):
+            for staging, registration in self._extra_staging:
+                registration.deregister(staging.buffer)
+        self._extra_staging = []
         self._close_kv_wrappers()
 
     def _close_kv_wrappers(self) -> None:

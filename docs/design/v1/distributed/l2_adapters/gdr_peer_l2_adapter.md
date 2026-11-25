@@ -2,7 +2,8 @@
 
 `lmcache/v1/distributed/l2_adapters/gdr_peer_l2_adapter.py`,
 `BorrowingPeerL2AdapterBase` in `lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`,
-`NicDmaEngine` in `lmcache/v1/multiprocess/object_group_transfer/nic_dma.py`
+`NicDmaEngine` in `lmcache/v1/multiprocess/object_group_transfer/nic_dma.py`,
+`HostPoller` in `lmcache/v1/multiprocess/host_poller.py`
 
 The copying P2P adapter ([`p2p_l2_adapter.md`](p2p_l2_adapter.md)) pulls a
 peer's object into the local DRAM L1 at lookup, then copies it to the GPU at
@@ -54,39 +55,67 @@ reply is a possible follow-up.
 
 `transfer_kv_per_object_group` splits a group into runs by transfer engine
 (see [`lmcache_driven_transfer_copy_paths.md`](../../multiprocess/lmcache_driven_transfer_copy_paths.md)).
-Peer-owned objects select the NIC DMA engine, under the same staged loop as
-the other engines:
+Runs of peer-owned objects are **returned, not staged**, and read without
+blocking the retrieve:
 
 ```
-for each batch:                                       (run_staged_loop)
-    NicDmaEngine.stage(objects, staging slots):
-        synchronize the stream
-        obj.read_into(region_id, slot offset)         RDMA → GPU slot
-        wait for every read (a failure raises RuntimeError)
-    block kernel: slots → paged KV
+RETRIEVE handler (affinity worker)
+  host-memory runs → queued on the stream as usual
+  peer runs        → returned as DeferredNicRun (one per kernel batch, own block ids)
+  NicDmaEngine.read(runs) → DeferredResponse              worker is free again
+
+per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
+  take free slots of the NIC staging buffer (StagingSlotPool)
+  one BorrowedReader.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
+  HostPoller sees the reads finished → on the worker:
+      block kernels: NIC slots → paged KV, then record an event
+  HostPoller sees the event complete  → on the worker: slots free again
+
+after the last wave's kernels are queued (on the worker):
+  record the completion event, queue finish_read_by_owner, MP_RETRIEVE_END
+  → DeferredResponse = (event handle, True)
 ```
 
-The reads are outside the stream, so the engine waits for the stream before
-reading and for every read before returning. No read is abandoned: it could
-land in a slot the next batch reuses. The unfull chunk uses the same engine.
+Why it is built this way:
 
-The slots are `GPUCacheContext`'s staging buffer. Under `gdr` the P2P
-controller calls `enable_staging_buffers(context, alignment)`, which sets the
-staging slot alignment (`lmcache.v1.common.buffer_registration`). A cache
-context built afterwards aligns every slot to it, and the
-`TransferChannelStagingRegistration` that `LMCacheDrivenTransfer` injects
-(next to the GDS one, through `CompositeBufferRegistration`) registers the
-whole buffer as one region. The engine finds that region by address
-(`find_staging_region`). The platform layer never imports the transfer
-channel: it only reads the alignment and calls the injected registration.
-Without `gdr` the alignment is 1 and the registration does nothing, so copy
-mode needs no GPUDirect support.
+- **A NIC staging buffer.** The shared staging buffer (GPU DMA, NVMe) is
+  reused by every copy queued on the stream, so a read into it must first
+  wait for the stream. The NIC staging buffer is written only by peer reads
+  and read only by the kernels queued after them, so a read never waits for
+  stream work. `BaseCacheContext.create_staging_buffer` allocates it on a
+  context's first peer read, with the shared buffer's slot layout, aligned
+  to the L1 alignment and registered as one transfer-channel region
+  (`TransferChannelStagingRegistration`, found by address with
+  `find_staging_region`); the context deregisters it at `close`. Size:
+  `NIC_STAGING_BYTES` = 512 MiB of slots (at least two kernel batches), plus
+  two rows at the end for an unfull chunk, whose object can extend past one
+  slot. In a module benchmark over a 400 Gb/s link, 512 MiB in waves of half
+  the slots ran at 47.9–48.5 GB/s for 6 MiB and 80 MiB chunks; a one-slot
+  pool, which cannot overlap a read with the previous copy, ran at 40 GB/s.
+- **One read per peer per wave.** `BorrowedMemoryObj` is bound to a
+  `BorrowedReader` (the adapter), so a wave's objects of one peer go in one
+  `submit_read`. Per-object submits gave the same bandwidth but 10x the
+  poller CPU and up to 13 ms tail delay before the kernels were queued.
+- **The host orders the work; no stream waits on a host-written value.** A
+  stream parked on `cuStreamWaitValue32` blocks every first-time kernel
+  launch in the process and deadlocks if the releasing thread launches one
+  (measured on H200, driver 580; the hang behind PR #6687). The poller
+  (`lmcache/v1/multiprocess/host_poller.py`) only checks reads and events,
+  backing off from 50 µs to 1 ms, and hands every step back to the
+  instance's affinity worker, which owns the slot pools.
+- **Own block ids.** The staged block ids live in a buffer the next transfer
+  restages, so each deferred run clones them on the stream when it is made.
 
-The engine synchronizes the current stream, which is the cache context's
-stream: the retrieve runs every transfer under it. Reads and kernels of
-consecutive batches do not overlap, and the retrieve holds its affinity thread
-while reads run. Per-engine staging lanes with a deferred retrieve reply are
-the follow-up.
+Under `--rocm-host-event-wait` the waiter runs the handler deferred already;
+it completes the request from the handler's `DeferredResponse`.
+
+The P2P controller enables the registration under `gdr` with
+`enable_staging_buffers(context, alignment)`. Copy mode never creates a NIC
+staging buffer, so it needs no GPUDirect support.
+
+Each DMA engine getting its own staging buffer and CUDA stream (GPU DMA and
+NVMe still share one) is a planned follow-up, needed once mixed DRAM + GDS
+retrieves are supported.
 
 ## Peer clients
 
@@ -101,8 +130,9 @@ user releases it.
 
 | Failure | Behavior |
 |---|---|
-| Read fails | The retrieve raises `RuntimeError` before the batch's kernel. |
-| Read exceeds `load_timeout_s` | It is cancelled (`TransferChannelClient.cancel`) and fails once the transport confirms it stopped. Until then the retrieve waits: a read still running could land in a reused slot. |
+| Read fails | The retrieve completes with `False` once every read it started has stopped; its later waves are never read and no kernel is queued after the failure. vLLM recomputes the blocks (`kv_load_failure_policy=recompute`). |
+| Read exceeds `load_timeout_s` | It is cancelled (`TransferChannelClient.cancel`) and fails once the transport confirms it stopped. Until then its slots stay taken: a read still running could land in them. |
+| Server shuts down with reads in flight | The poller abandons them: the retrieve fails and their slots are never reused. |
 | Read TTL not above `--p2p-load-timeout` + 1 s | The server refuses to start in `gdr` mode. |
 | Lease expired | The key is a miss; a held object refuses `read_into`. |
 | Owner unreachable for unlocks | The unlock is lost; the owner's TTL reclaims the locks. |

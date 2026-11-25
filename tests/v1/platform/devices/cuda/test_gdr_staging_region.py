@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""GPU cache context: the staging buffer registered as a transfer-channel
-device region for GPU-direct borrowing (CUDA)."""
+"""GPU cache context: the NIC staging buffer, registered as a
+transfer-channel device region for GPU-direct borrowing (CUDA)."""
 
 # Standard
 from unittest.mock import MagicMock
@@ -67,56 +67,50 @@ def _context() -> GPUCacheContext:
     )
 
 
-def test_context_registers_its_staging_buffer_with_aligned_slots() -> None:
+def test_nic_staging_buffer_is_aligned_registered_and_released_on_close() -> None:
     context = _enabled_context()
     try:
         ctx = _context()
-        ctx.register_staging_buffer(TransferChannelStagingRegistration())
+        staging = ctx.create_staging_buffer(
+            6, _ALIGN, TransferChannelStagingRegistration()
+        )
+        try:
+            assert staging.max_batch_size == 6
+            (call_,) = context.register_memory_region.call_args_list
+            ptr, size, device_index = call_.args
+            assert ptr == staging.buffer.data_ptr() and size == staging.buffer.nbytes
+            assert ptr % _ALIGN == 0 and size % _ALIGN == 0 and device_index == 0
+            # Every slot a peer's object is read into starts on the alignment,
+            # has the context's layout, and is found by address.
+            for slot in range(staging.max_batch_size):
+                buffer = staging.get_temp_object_group_buffer(slot, 0)
+                offset = buffer.data_ptr() - ptr
+                assert offset % _ALIGN == 0 and offset + buffer.nbytes <= size
+                assert buffer.nbytes == ctx.get_temp_object_group_buffer(0, 0).nbytes
+                assert (
+                    staging.get_temp_kernel_group_buffer(slot, 0).shape
+                    == ctx.get_temp_kernel_group_buffer(0, 0).shape
+                )
+                region = find_staging_region(buffer.data_ptr())
+                assert region is not None and region.region_id == 1
+            # The buffer the context's own transfers share is not registered.
+            shared = ctx.get_temp_object_group_buffer(0, 0).data_ptr()
+            assert find_staging_region(shared) is None
+        finally:
+            ctx.close()
     finally:
         disable_staging_buffers()
-    try:
-        assert ctx.max_batch_size == 4
-        (call_,) = context.register_memory_region.call_args_list
-        ptr, size, device_index = call_.args
-        assert ptr % _ALIGN == 0
-        assert size % _ALIGN == 0
-        assert device_index == 0
-
-        # Every slot a peer's object is read into starts on the alignment,
-        # and the NIC DMA engine finds the region from any slot address.
-        for batch in range(ctx.max_batch_size):
-            slot = ctx.get_temp_object_group_buffer(batch, 0)
-            offset = slot.data_ptr() - ptr
-            assert offset % _ALIGN == 0 and offset + slot.nbytes <= size
-            region = find_staging_region(slot.data_ptr())
-            assert region is not None and region.region_id == 1
-    finally:
-        ctx.close()
     context.deregister_memory_region.assert_called_once_with(1)
     assert find_staging_region(ptr) is None
 
 
-def test_registration_does_nothing_while_staging_buffers_are_disabled() -> None:
-    context = MagicMock()
+def test_a_nic_staging_buffer_needs_gdr() -> None:
     ctx = _context()
     try:
-        ctx.register_staging_buffer(TransferChannelStagingRegistration())
+        with pytest.raises(RuntimeError, match="p2p-load-mode gdr"):
+            ctx.create_staging_buffer(2, _ALIGN, TransferChannelStagingRegistration())
     finally:
         ctx.close()
-    context.register_memory_region.assert_not_called()
-
-
-def test_an_unaligned_buffer_is_refused_before_registration() -> None:
-    """A context whose staging layout ignores the alignment (for example a
-    subclass with its own ``_make_temp_buffer``) must fail loudly."""
-    context = _enabled_context()
-    try:
-        buffer = torch.empty(_ALIGN + 512, dtype=torch.uint8, device="cuda:0")[512:]
-        with pytest.raises(RuntimeError, match="align"):
-            TransferChannelStagingRegistration().register(buffer)
-    finally:
-        disable_staging_buffers()
-    context.register_memory_region.assert_not_called()
 
 
 def test_close_tolerates_a_transfer_channel_that_closed_first() -> None:
@@ -126,7 +120,7 @@ def test_close_tolerates_a_transfer_channel_that_closed_first() -> None:
     context.deregister_memory_region.side_effect = KeyError(1)
     try:
         ctx = _context()
-        ctx.register_staging_buffer(TransferChannelStagingRegistration())
+        ctx.create_staging_buffer(2, _ALIGN, TransferChannelStagingRegistration())
     finally:
         disable_staging_buffers()
     ctx.close()

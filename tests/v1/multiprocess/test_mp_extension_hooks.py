@@ -194,13 +194,9 @@ def test_default_cache_context_hook_applies_server_settings(monkeypatch):
         object_group_transfer=mod.transfer_kv_per_object_group,
         buffer_registration=ANY,
     )
-    # GDS reads and GPU-direct peer reads both land in the staging buffer.
-    registration = create.call_args.kwargs["buffer_registration"]
-    assert isinstance(registration, mod.CompositeBufferRegistration)
-    assert [type(member) for member in registration.registrations] == [
-        mod.GDSBufferRegistration,
-        mod.TransferChannelStagingRegistration,
-    ]
+    assert isinstance(
+        create.call_args.kwargs["buffer_registration"], mod.GDSBufferRegistration
+    )
 
 
 # ------------------------------------------------------------------ #

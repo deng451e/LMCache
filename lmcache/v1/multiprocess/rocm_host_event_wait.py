@@ -158,9 +158,15 @@ def _run_completed(done: tuple[Any, Any, Any], run: Callable[[], Any]) -> Any:
 
 def _settle(response: DeferredResponse, call: Callable[[], Any]) -> None:
     try:
-        response.set_result(call())
+        result = call()
     except BaseException as exc:
         response.set_exception(exc)
+        return
+    if isinstance(result, DeferredResponse):
+        # A retrieve of objects a peer owns completes after its reads land.
+        result.add_done_callback(lambda done: _settle(response, done.result))
+    else:
+        response.set_result(result)
 
 
 class HostEventWaiter:

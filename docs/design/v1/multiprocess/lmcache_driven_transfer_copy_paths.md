@@ -12,7 +12,7 @@ planning) driven from `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.p
 | `engines.py` | which transfer engine moves an object, the split of a group into same-engine runs, the `DMAEngine` protocol and `stage`, which calls the engine |
 | `gpu_dma.py` | `GpuDmaEngine`: host/GPU copies queued on the stream |
 | `nvme_dma.py` | `NvmeDmaEngine`: GDS slab reads and writes queued on the stream |
-| `nic_dma.py` | `NicDmaEngine`: transfer-channel reads of peer-owned objects into the staging buffer |
+| `nic_dma.py` | `NicDmaEngine`: non-blocking transfer-channel reads of peer-owned objects into a NIC staging buffer, then their kernels |
 | `dispatch.py` | `transfer_kv_per_object_group`: picks each run's copy path |
 | `unfull_chunk.py` | the request's trailing unfull chunk |
 
@@ -46,7 +46,7 @@ even where the code is short today.
 |---|---|---|---|
 | Host memory (DRAM, DevDAX) | GPU DMA | host/GPU copy on the stream | `direct` when usable, else `kernel` (native plan, or per batch without it) |
 | Storage-backed (`GDSMemoryObject`) | NVMe DMA | file read or write on the stream | `kernel`, per batch |
-| Owned by a peer (`BorrowedMemoryObj`) | NIC DMA | transfer-channel read, waited for; retrieve only | `kernel`, per batch |
+| Owned by a peer (`BorrowedMemoryObj`) | NIC DMA | transfer-channel read into a NIC staging buffer, not waited for; retrieve only | returned as `DeferredNicRun`, `kernel` per batch after the read |
 
 `split_into_runs` cuts the group's chunks into consecutive runs of one engine
 and each copy path gets its run as a `[start, end)` chunk range over the full
@@ -80,7 +80,7 @@ flowchart TD
     GD["run_direct_transfer<br/>one batched copy per chunk,<br/>host memory to or from the pages"]
     GP["run_object_group_transfer_plan<br/>staging copies and kernels<br/>in one native call"]
     L["run_staged_loop, per batch"]
-    ST["stage: the run's engine<br/>GPU DMA: host copy<br/>NVMe DMA: file read or write<br/>NIC DMA: transfer-channel read"]
+    ST["stage: the run's engine<br/>GPU DMA: host copy<br/>NVMe DMA: file read or write"]
     K["block transfer kernel<br/>staging slots to or from the pages"]
     E{"more runs?"}
     Q["work is queued on the context's stream"]
@@ -114,7 +114,8 @@ flowchart TD
 - **Skipped chunks.** On retrieve the loop does not stage the chunks of a
   batch that `skip_first_n_tokens` covers entirely; the kernel skips them.
 - **Store.** The loop queues the kernels, then stages out.
-- **NIC DMA** always uses the per-batch loop and is retrieve only.
+- **NIC DMA** is retrieve only and never staged here: its runs are returned
+  (see below).
 - **Errors.** A retrieve raises on a missing object; a store skips the batch
   that contains one.
 - **Partial work.** When a later run raises, the earlier runs are already
@@ -124,20 +125,22 @@ flowchart TD
 
 ### NIC DMA
 
-A peer's object (`BorrowedMemoryObj`) has no local bytes. It reads itself
-into a slot of the staging buffer over the transfer channel
-(`read_into(region_id, offset)`), then the block kernel runs as for the other
-engines:
+A peer's object (`BorrowedMemoryObj`) has no local bytes; its peer's
+transfer channel reads them into GPU memory, outside the stream. So the
+transfer does not stage it: `transfer_kv_per_object_group` and
+`transfer_unfull_chunk` return a `DeferredNicRun` per kernel batch (with
+its own copy of the block ids), and the RETRIEVE handler hands them to
+`NicDmaEngine.read` after queuing everything else:
 
 ```
-peer DRAM --read_into--> staging slot --kernel--> paged KV
+peer DRAM --read_many--> NIC staging slot --kernel--> paged KV
 ```
 
-The reads are outside the stream, so `NicDmaEngine.stage` synchronizes the
-stream, starts one read per object and waits for all of them. The staging
-buffer is registered with the transfer channel only under
-`--p2p-load-mode gdr`; without that a peer-owned object raises
-`RuntimeError`. See
+The engine reads waves into its own NIC staging buffer, which nothing on the
+stream uses, and queues each wave's kernels once its reads landed; the
+handler answers with a `DeferredResponse` meanwhile. Only under
+`--p2p-load-mode gdr` can the buffer register with the transfer channel;
+without it a peer-owned object fails the retrieve. See
 `docs/design/v1/distributed/l2_adapters/gdr_peer_l2_adapter.md`.
 
 ## Problem
@@ -287,9 +290,11 @@ moves strided 2-D rows more slowly than 1-D entries of the same size
   dispatch (CPU only).
 - `tests/v1/multiprocess/test_transfer_engines.py`: object type to engine,
   the split into runs (including missing entries), the routing of each
-  run with its chunk range, and the NIC engine's refusal to store (CPU only).
-- `tests/v1/multiprocess/test_nic_dma_transfer.py`: the NIC DMA engine's
-  ordering of stream sync, reads and kernels (CPU only, fakes).
+  run with its chunk range, the returned NIC runs, and the refusal to
+  store into a peer's object (CPU only).
+- `tests/v1/multiprocess/test_nic_dma.py`: the returned NIC runs, waves
+  over the NIC staging slots, one read per peer, kernels after the reads,
+  failures and the unfull chunk (CPU only, fakes).
 - `tests/v1/multiprocess/test_staged_loop.py`: the per-batch loop's chunk
   range, block-id slices, skipped chunks, missing objects and the order of
   staging and kernels (CPU only, fakes).

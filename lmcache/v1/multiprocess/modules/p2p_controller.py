@@ -279,7 +279,7 @@ class P2PController(DiscoverableModule):
                     read_ttl,
                     self._p2p_config.load_timeout,
                 )
-            # GPU cache contexts register their staging buffers with it.
+            # The NIC DMA engine registers its staging buffers with it.
             enable_staging_buffers(
                 get_transfer_channel_context(), l1_memory_desc.align_bytes
             )

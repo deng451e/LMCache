@@ -222,6 +222,52 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
         obj.release()
 
 
+def test_objects_of_one_peer_are_read_with_one_submit() -> None:
+    """The NIC DMA engine reads a wave of a peer's objects in one transfer."""
+    with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
+        keys = [_key(0), _key(1)]
+        addresses = [
+            TransferChannelAddress(offset=PAGE, size=PAGE),
+            TransferChannelAddress(offset=3 * PAGE, size=PAGE),
+        ]
+        _lookup(adapter, req_client, keys, addresses)
+        objects = _load(adapter, keys)
+        first, second = objects[keys[0]], objects[keys[1]]
+        assert first.reader is adapter and second.reader is adapter
+        tc_client.submit_read.return_value = 7
+        tc_client.query_status.return_value = TransferChannelTransferResult(
+            finished=True, succeeded_mask=[True, True]
+        )
+        read = adapter.read_many(5, [(first, 0), (second, 4 * PAGE)])
+        tc_client.submit_read.assert_called_once_with(
+            [
+                TransferChannelAddress(offset=0, size=PAGE),
+                TransferChannelAddress(offset=4 * PAGE, size=PAGE),
+            ],
+            addresses,
+            local_region=5,
+        )
+        assert read.is_finished() and read.succeeded()
+        first.release()
+        second.release()
+
+
+def test_a_batch_with_an_ended_lease_is_not_read() -> None:
+    with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
+        keys = [_key(0), _key(1)]
+        addresses = [
+            TransferChannelAddress(offset=0, size=PAGE),
+            TransferChannelAddress(offset=PAGE, size=PAGE),
+        ]
+        _lookup(adapter, req_client, keys, addresses)
+        objects = _load(adapter, keys)
+        objects[keys[1]].release()
+        read = adapter.read_many(5, [(objects[keys[0]], 0), (objects[keys[1]], PAGE)])
+        assert read.is_finished() and not read.succeeded()
+        tc_client.submit_read.assert_not_called()
+        objects[keys[0]].release()
+
+
 def test_a_transport_error_fails_the_read_once_it_is_stopped() -> None:
     """The read is cancelled and no longer counts as in flight, so the peer
     can still be removed."""

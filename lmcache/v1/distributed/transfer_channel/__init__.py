@@ -8,11 +8,7 @@ from typing import TYPE_CHECKING
 import threading
 
 # First Party
-from lmcache.v1.common.buffer_registration import (
-    BufferRegistration,
-    set_staging_slot_alignment,
-    staging_slot_alignment,
-)
+from lmcache.v1.common.buffer_registration import BufferRegistration
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.common.transfer_channel.api import (
     TransferChannelAddress,
@@ -51,6 +47,7 @@ __all__ = [
     "enable_staging_buffers",
     "disable_staging_buffers",
     "find_staging_region",
+    "staging_alignment",
     "acquire_transfer_channel_client",
     "release_transfer_channel_client",
 ]
@@ -132,17 +129,18 @@ def delete_transfer_channel_context() -> None:
 
 
 # GPU-direct borrowing state, guarded by ``_context_lock``:
-# - the staging target: enabled by the P2P controller once the context exists,
-#   disabled when it closes; read when a cache context registers its staging
-#   buffer (TransferChannelStagingRegistration).
+# - the staging target and its alignment: enabled by the P2P controller once
+#   the context exists, disabled when it closes; read when the NIC DMA engine
+#   registers a NIC staging buffer (TransferChannelStagingRegistration).
 # - the staging regions: one per registered staging buffer, keyed by base
 #   address; read by the NIC DMA engine on every borrowed retrieve.
 _staging_target: TransferChannelContext | None = None
+_staging_align_bytes = 1
 
 
 @dataclass(frozen=True)
 class StagingRegion:
-    """A cache context's staging buffer as a transfer-channel region.
+    """A NIC staging buffer as a transfer-channel region.
 
     Attributes:
         context: The transfer channel context the buffer is registered with.
@@ -161,11 +159,11 @@ _staging_regions: dict[int, StagingRegion] = {}
 
 
 def enable_staging_buffers(context: TransferChannelContext, align_bytes: int) -> None:
-    """Have cache contexts align their staging slots and register their
-    staging buffers with ``context``.
+    """Let NIC staging buffers register with ``context``, with slots aligned
+    to ``align_bytes``.
 
     Only a GPU-direct borrowing reader calls this: its peers' objects are read
-    straight into its staging slots. Copy mode never registers GPU memory,
+    straight into its NIC staging slots. Copy mode never registers GPU memory,
     so its hosts need no GPUDirect support.
 
     Args:
@@ -175,44 +173,57 @@ def enable_staging_buffers(context: TransferChannelContext, align_bytes: int) ->
     Raises:
         ValueError: If ``align_bytes`` is not a positive power of two.
     """
-    global _staging_target
-    set_staging_slot_alignment(align_bytes)
+    if align_bytes < 1 or align_bytes & (align_bytes - 1):
+        raise ValueError(
+            f"Staging slot alignment must be a power of two, got {align_bytes}"
+        )
+    global _staging_target, _staging_align_bytes
     with _context_lock:
         _staging_target = context
+        _staging_align_bytes = align_bytes
 
 
 def disable_staging_buffers() -> None:
-    """Stop new staging buffers from aligning their slots and registering."""
-    global _staging_target
+    """Stop NIC staging buffers from registering."""
+    global _staging_target, _staging_align_bytes
     with _context_lock:
         _staging_target = None
-    set_staging_slot_alignment(1)
+        _staging_align_bytes = 1
+
+
+def staging_alignment() -> int:
+    """Return the slot alignment NIC staging buffers need (1 when disabled)."""
+    with _context_lock:
+        return _staging_align_bytes
 
 
 class TransferChannelStagingRegistration(BufferRegistration):
-    """Register a cache context's staging buffer with the transfer channel,
-    so the NIC DMA engine can read a peer's objects straight into its slots.
+    """Register a NIC staging buffer with the transfer channel, so the NIC
+    DMA engine can read a peer's objects straight into its slots.
 
-    Does nothing unless :func:`enable_staging_buffers` was called. Inject it
-    with ``create_cache_context(buffer_registration=...)``.
+    Pass it to :meth:`BaseCacheContext.create_staging_buffer`; it needs
+    :func:`enable_staging_buffers`.
     """
 
     def register(self, buffer: torch.Tensor) -> None:
         """Register ``buffer`` as one transfer-channel region.
 
         Args:
-            buffer: The cache context's flat staging buffer.
+            buffer: The NIC staging buffer.
 
         Raises:
-            RuntimeError: If the buffer does not start and end on the staging
-                slot alignment (a layout that ignored it), or the transfer
-                channel refuses the region.
+            RuntimeError: If staging buffers are not enabled (no
+                ``--p2p-load-mode gdr``), the buffer does not start and end on
+                the staging alignment, or the transfer channel refuses the
+                region.
         """
         with _context_lock:
             target = _staging_target
+            align = _staging_align_bytes
         if target is None:
-            return
-        align = staging_slot_alignment()
+            raise RuntimeError(
+                "Reading objects a peer owns into GPU memory needs --p2p-load-mode gdr"
+            )
         ptr = buffer.data_ptr()
         if ptr % align or buffer.nbytes % align:
             raise RuntimeError(

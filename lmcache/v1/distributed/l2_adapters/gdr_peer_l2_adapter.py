@@ -7,8 +7,7 @@ shadow L1 indexes the borrowed objects and no local L1 capacity is used.
 """
 
 # Standard
-from functools import partial
-from typing import Any, Callable, cast
+from typing import Any, Callable, Sequence, cast
 import threading
 import time
 
@@ -220,32 +219,33 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             ),
         }
 
-    def _bind_borrowed_object(
-        self, obj: BorrowedMemoryObj, address: TransferChannelAddress, lease: Lease
-    ) -> bool:
-        """Bind the placeholder to a read of the peer's bytes; the read checks
-        the object's current lease."""
-        obj.bind(
-            lease,
-            read_into=partial(self._read_into, address, obj.is_valid),
-            address=address.offset,
-            source=self._config.peer_transfer_channel_server_url,
-        )
-        return True
-
-    def _read_into(
+    def read_many(
         self,
-        address: TransferChannelAddress,
-        lease_is_valid: Callable[[], bool],
         region_id: int,
-        offset: int,
+        targets: Sequence[tuple[BorrowedMemoryObj, int]],
     ) -> PendingRead:
-        """Start reading one borrowed object into a registered region."""
-        if not lease_is_valid():
+        """Read borrowed objects of this peer into a registered region with
+        one transfer-channel submit; see :class:`BorrowedReader`.
+
+        Args:
+            region_id: Local region registered with the transfer channel.
+            targets: ``(object, offset)`` pairs of objects this adapter bound.
+
+        Returns:
+            The read, cancelled past ``load_timeout_s``; a failed read
+            without a submit if any object's lease has ended.
+        """
+        if not all(obj.is_valid() for obj, _ in targets):
             return _FailedRead()
         task_id = self._tc_client.submit_read(
-            [TransferChannelAddress(offset=offset, size=address.size)],
-            [address],
+            [
+                TransferChannelAddress(offset=offset, size=obj.get_size())
+                for obj, offset in targets
+            ],
+            [
+                TransferChannelAddress(offset=obj.meta.address, size=obj.get_size())
+                for obj, _ in targets
+            ],
             local_region=region_id,
         )
         with self._reads_lock:
@@ -256,6 +256,19 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             time.monotonic() + self._config.load_timeout_s,
             self._read_finished,
         )
+
+    def _bind_borrowed_object(
+        self, obj: BorrowedMemoryObj, address: TransferChannelAddress, lease: Lease
+    ) -> bool:
+        """Bind the placeholder to this adapter's reads of the peer's bytes;
+        a read checks the object's current lease."""
+        obj.bind(
+            lease,
+            reader=self,
+            address=address.offset,
+            source=self._config.peer_transfer_channel_server_url,
+        )
+        return True
 
     def _read_finished(self) -> None:
         with self._reads_lock:

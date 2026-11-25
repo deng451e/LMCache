@@ -19,7 +19,6 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
 from lmcache.v1.multiprocess.object_group_transfer.nvme_dma import NvmeDmaEngine
 import lmcache.lmcache_native as lmcache_native
 
@@ -32,7 +31,9 @@ class TransferEngine(enum.Enum):
     NVME_DMA = "nvme_dma"
     """Storage-backed object: a file read or write against GPU memory."""
     NIC_DMA = "nic_dma"
-    """Object a peer owns: a transfer-channel read into GPU memory."""
+    """Object a peer owns: a transfer-channel read into GPU memory, retrieve
+    only. Not staged here: the transfer hands its runs to the NIC DMA engine
+    (``nic_dma.py``), which reads them without blocking."""
 
 
 def select_engine(memory_obj: MemoryObj) -> TransferEngine:
@@ -77,7 +78,6 @@ class DMAEngine(Protocol):
 _ENGINES: dict[TransferEngine, DMAEngine] = {
     TransferEngine.GPU_DMA: GpuDmaEngine(),
     TransferEngine.NVME_DMA: NvmeDmaEngine(),
-    TransferEngine.NIC_DMA: NicDmaEngine(),
 }
 
 
@@ -89,8 +89,8 @@ def stage(
 ) -> None:
     """Move objects to or from their staging regions with ``engine``.
 
-    On return the bytes are in place, or the copies are queued on the
-    stream ahead of anything queued later.
+    On return the copies are queued on the stream ahead of anything queued
+    later.
 
     Args:
         engine: The engine of every object in ``memory_objs``.
@@ -99,10 +99,13 @@ def stage(
         direction: H2D fills the regions, D2H fills the objects.
 
     Raises:
-        ValueError: If an object and its region differ in size, or a store
-            targets an object a peer owns.
-        RuntimeError: If an object a peer owns cannot be read from its peer.
+        ValueError: If a host-memory object and its region differ in size,
+            or ``engine`` is NIC DMA (a store into an object a peer owns).
     """
+    if engine not in _ENGINES:
+        raise ValueError(
+            "Objects a peer owns are only retrieved, through the NIC DMA engine"
+        )
     _ENGINES[engine].stage(memory_objs, buffers, direction)
 
 

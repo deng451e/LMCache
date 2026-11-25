@@ -37,7 +37,11 @@ if TYPE_CHECKING:
     from lmcache.v1.common.memory_management import MemoryObj
     from lmcache.v1.common.ops_types import PageBufferShapeDesc
     from lmcache.v1.kv_layer_groups import KVLayerGroupsManager
-    from lmcache.v1.platform.base.object_group_transfer import ObjectGroupTransfer
+    from lmcache.v1.platform.base.object_group_transfer import (
+        DeferredNicRun,
+        ObjectGroupTransfer,
+        StagingBuffer,
+    )
 
 
 class BaseCacheContext(ABC):
@@ -134,6 +138,34 @@ class BaseCacheContext(ABC):
     def max_batch_size(self) -> int:
         """Returns the maximum number of concurrent batches."""
         ...
+
+    def create_staging_buffer(
+        self,
+        num_slots: int,
+        slot_align_bytes: int,
+        registration: BufferRegistration,
+    ) -> StagingBuffer:
+        """Allocate a staging buffer of ``num_slots`` slots with this
+        context's layout, apart from the one its transfers share.
+
+        The buffer is registered with ``registration`` on the context's
+        stream and deregistered by :meth:`close`.
+
+        Args:
+            num_slots: Slots in the buffer.
+            slot_align_bytes: Every slot starts on this power of two.
+            registration: Registers the buffer, e.g. with a transfer channel.
+
+        Returns:
+            The buffer.
+
+        Raises:
+            NotImplementedError: If the platform has no such buffers.
+            RuntimeError: If the registration fails.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} cannot create extra staging buffers"
+        )
 
     @abstractmethod
     def close(self) -> None:
@@ -405,7 +437,7 @@ class BaseCacheContext(ABC):
         direction: lmcache_native.TransferDirection,
         transfer_key: str,
         block_ids_host: Sequence[Sequence[int]] = (),
-    ) -> None:
+    ) -> list[DeferredNicRun] | None:
         """Enqueue the copy of one object group between the KV cache and
         *memory_objs*, in either direction.
 
@@ -414,6 +446,10 @@ class BaseCacheContext(ABC):
         see :class:`~lmcache.v1.platform.base.object_group_transfer.ObjectGroupTransfer`
         for argument semantics, completion ownership and copy errors.
 
+        Returns:
+            On retrieve, the runs of objects a peer owns for the NIC DMA
+            engine to read; None when there are none.
+
         Raises:
             RuntimeError: If no default transfer callback was supplied.
         """
@@ -421,7 +457,7 @@ class BaseCacheContext(ABC):
             raise RuntimeError(
                 "No object-group transfer callback supplied to cache context"
             )
-        self._object_group_transfer(
+        return self._object_group_transfer(
             self,
             block_ids_gpu,
             memory_objs,

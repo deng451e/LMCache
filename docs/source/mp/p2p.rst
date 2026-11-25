@@ -185,6 +185,9 @@ What to expect:
 
 * Borrowed chunks use no local L1 capacity. The server adds a *shadow L1*
   (``shadow.dram``) to index them (see :doc:`multi_l1`).
+* Each vLLM instance gets a NIC staging buffer of about 512 MiB of GPU memory
+  on its first borrowed retrieve.
+* A borrowed read that fails fails the retrieve; vLLM recomputes those blocks.
 * The network read happens at retrieve, so retrieve latency depends on the
   fabric. Measure both modes before choosing.
 * A chunk whose lease lapsed before the retrieve is a cache miss.

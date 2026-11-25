@@ -2,7 +2,7 @@
 # Standard
 from dataclasses import dataclass
 from functools import cache, wraps
-from typing import Any, Callable, Optional, Protocol, Tuple
+from typing import Any, Callable, Optional, Protocol, Sequence, Tuple
 import ctypes
 import os
 import threading
@@ -826,13 +826,37 @@ class PendingRead(Protocol):
         ...
 
 
+class BorrowedReader(Protocol):
+    """Reads borrowed objects' bytes into a local device region."""
+
+    def read_many(
+        self,
+        region_id: int,
+        targets: Sequence[tuple["BorrowedMemoryObj", int]],
+    ) -> PendingRead:
+        """Start one transport read of every target's bytes.
+
+        Args:
+            region_id: Local region registered with the borrower's transport.
+            targets: ``(object, offset)`` pairs: an object this reader bound
+                and the byte offset of its destination within the region.
+
+        Returns:
+            The in-flight read. It fails without reading if any object's
+            lease has already ended.
+        """
+        ...
+
+
 class BorrowedMemoryObj(MemoryObj):
     """An object whose bytes a peer owns, held under a lease; no local tensor.
 
     :class:`ShadowL1MemoryManager` creates it as a placeholder: layout
     metadata, no bytes, no lease. A borrower's load :meth:`bind`\\ s it to a
     lease and to a ``read_into`` that reads the bytes into a registered local
-    device region at retrieve time. The tensor accessors report no local
+    device region at retrieve time; objects bound to the same
+    :class:`BorrowedReader` can be read together in one transfer. The tensor
+    accessors report no local
     bytes. ``is_valid()`` is False before binding, after :meth:`release`, and
     once the lease ended.
     """
@@ -842,7 +866,7 @@ class BorrowedMemoryObj(MemoryObj):
         self.valid = True
         self._lock = threading.Lock()
         self._lease: Lease | None = None
-        self._read_into: Callable[[int, int], PendingRead] | None = None
+        self._reader: BorrowedReader | None = None
         self._source = ""
 
     @property
@@ -854,13 +878,13 @@ class BorrowedMemoryObj(MemoryObj):
     def is_remote(self) -> bool:
         """Whether the object reads its bytes into a device region; True once
         bound."""
-        return self._read_into is not None
+        return self._reader is not None
 
     def bind(
         self,
         lease: Lease,
         *,
-        read_into: Callable[[int, int], PendingRead],
+        reader: BorrowedReader,
         address: int,
         source: str,
     ) -> None:
@@ -868,8 +892,7 @@ class BorrowedMemoryObj(MemoryObj):
 
         Args:
             lease: The owner's reservation.
-            read_into: ``(region_id, offset) -> PendingRead`` starting a read
-                of the bytes into a registered device region.
+            reader: Reads the bytes into a registered device region.
             address: The owner's address of the bytes.
             source: The owner, e.g. its transfer URL. One shadow serves every
                 peer, so ``source`` and ``address`` together tell two views of
@@ -883,7 +906,7 @@ class BorrowedMemoryObj(MemoryObj):
             raise RuntimeError("BorrowedMemoryObj is already bound")
         if address < 0 or not source:
             raise ValueError("borrowed bytes need the owner's address and source")
-        self._read_into = read_into
+        self._reader = reader
         self.meta.address = address
         self._source = source
         self._lease = lease
@@ -894,6 +917,17 @@ class BorrowedMemoryObj(MemoryObj):
         if self._lease is None:
             raise RuntimeError("BorrowedMemoryObj is not bound")
         return self._lease
+
+    @property
+    def reader(self) -> BorrowedReader:
+        """Return the reader the object is bound to.
+
+        Raises:
+            RuntimeError: If the object is not bound.
+        """
+        if self._reader is None:
+            raise RuntimeError("BorrowedMemoryObj is not bound")
+        return self._reader
 
     def replace_lease(self, lease: Lease) -> None:
         """Put the object under a newer lease of the same bytes; the caller
@@ -917,7 +951,8 @@ class BorrowedMemoryObj(MemoryObj):
         )
 
     def read_into(self, region_id: int, offset: int) -> PendingRead:
-        """Start reading the bytes into a registered local memory region.
+        """Start reading the bytes into a registered local memory region,
+        as a one-object :meth:`BorrowedReader.read_many`.
 
         Args:
             region_id: Local region registered with the borrower's transport.
@@ -930,9 +965,7 @@ class BorrowedMemoryObj(MemoryObj):
         Raises:
             RuntimeError: If the object is not bound.
         """
-        if self._read_into is None:
-            raise RuntimeError("BorrowedMemoryObj is not bound")
-        return self._read_into(region_id, offset)
+        return self.reader.read_many(region_id, [(self, offset)])
 
     # -- MemoryObj: layout and lifetime from the metadata --------------------
 

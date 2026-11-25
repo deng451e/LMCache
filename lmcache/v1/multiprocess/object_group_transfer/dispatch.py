@@ -19,12 +19,14 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     split_into_runs,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import defer_peer_run
 from lmcache.v1.multiprocess.object_group_transfer.staged import (
     native_plan_available,
     run_object_group_transfer_plan,
     run_staged_loop,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
+from lmcache.v1.platform.base.object_group_transfer import DeferredNicRun
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -39,12 +41,14 @@ def transfer_kv_per_object_group(
     *,
     transfer_key: str,
     block_ids_host: Sequence[Sequence[int]] = (),
-) -> None:
+) -> list[DeferredNicRun] | None:
     """Transfer one object group's chunks, each by the engine its L1 object
     selects. Runs are issued in chunk order on the context's stream.
 
     Host-memory runs take the direct copy if usable, else the native plan if
-    the extension has it; every other run is staged one batch at a time.
+    the extension has it; on retrieve, runs of objects a peer owns are
+    returned for the NIC DMA engine; every other run is staged one batch at
+    a time.
 
     Args:
         cache_context: Cache context of the KV cache.
@@ -64,12 +68,30 @@ def transfer_kv_per_object_group(
 
     Raises:
         ValueError: If a None entry is found on retrieve.
-        RuntimeError: If an object a peer owns cannot be read from its peer.
+        ValueError: If a store targets an object a peer owns.
+
+    Returns:
+        On retrieve, the runs of objects a peer owns, for the NIC DMA engine
+        to read; None when there are none.
     """
+    deferred: list[DeferredNicRun] = []
     for engine, start, end in split_into_runs(memory_objs):
         chunk_range = (start, end)
         is_host_memory = engine is TransferEngine.GPU_DMA
         if (
+            engine is TransferEngine.NIC_DMA
+            and direction == lmcache_native.TransferDirection.H2D
+        ):
+            deferred += defer_peer_run(
+                cache_context,
+                block_ids_gpu,
+                memory_objs,
+                object_group_id,
+                batch_size,
+                skip_first_n_tokens,
+                chunk_range,
+            )
+        elif (
             is_host_memory
             and batch_memcpy_available()
             and direct_transfer_supported(
@@ -109,3 +131,4 @@ def transfer_kv_per_object_group(
                 engine=engine,
                 chunk_range=chunk_range,
             )
+    return deferred or None

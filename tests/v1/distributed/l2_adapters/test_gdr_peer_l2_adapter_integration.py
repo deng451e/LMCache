@@ -213,9 +213,11 @@ def test_gdr_borrow_reads_owner_bytes_straight_into_gpu() -> None:
         )
         # An aligned GPU buffer registered the way a cache context registers
         # its staging buffer.
-        storage = torch.empty((_NUM_KEYS + 1) * _PAGE, dtype=torch.uint8, device=device)
+        storage = torch.empty(
+            (2 * _NUM_KEYS + 1) * _PAGE, dtype=torch.uint8, device=device
+        )
         start = (-storage.data_ptr()) % _PAGE
-        landing = storage[start : start + _NUM_KEYS * _PAGE]
+        landing = storage[start : start + 2 * _NUM_KEYS * _PAGE]
         region_id = get_transfer_channel_context().register_memory_region(
             landing.data_ptr(), landing.nbytes, device.index
         )
@@ -258,6 +260,19 @@ def test_gdr_borrow_reads_owner_bytes_straight_into_gpu() -> None:
             assert torch.all(slot.cpu() == expected_values[key]), (
                 f"GPU slot for key {i} did not receive the owner's bytes"
             )
+
+        # All of them again with one transfer, into the slots in reverse order.
+        handles = [cast(BorrowedMemoryObj, results[key][1]) for key in keys]
+        batch_slots = [2 * _NUM_KEYS - 1 - i for i in range(_NUM_KEYS)]
+        read = handles[0].reader.read_many(
+            region_id,
+            [(h, slot * _PAGE) for h, slot in zip(handles, batch_slots, strict=True)],
+        )
+        _wait_until(read.is_finished)
+        assert read.succeeded()
+        for key, slot_index in zip(keys, batch_slots, strict=True):
+            slot = landing[slot_index * _PAGE : (slot_index + 1) * _PAGE]
+            assert torch.all(slot.cpu() == expected_values[key])
 
         # Release: the last finish_read frees the handle, which unlocks the owner.
         shadow.finish_read(keys)
