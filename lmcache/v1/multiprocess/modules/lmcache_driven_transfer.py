@@ -1330,10 +1330,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 retained_keys, read_owners
             )
             total_bytes = 0
-            retrieve_succeeded = True
-            # Runs of objects a peer owns: the NIC DMA engine reads them once
-            # everything else is queued.
+            num_tokens = 0
+            # Batches of objects a peer owns, returned by the transfers: the
+            # NIC DMA engine reads them once everything else is queued.
             peer_runs: list[DeferredNicRun] = []
+            retrieve_succeeded = True
             try:
                 for obj_group_id in range(num_object_groups):
                     if obj_group_id in skipped_groups:
@@ -1354,22 +1355,20 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
-                    peer_runs += (
-                        cache_context.transfer_object_group(
-                            block_ids_per_group_gpu,
-                            memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
-                            skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmcache_native.TransferDirection.H2D,
-                            transfer_key=transfer_key,
-                            block_ids_host=gpu_block_ids,
-                        )
-                        or []
+                    deferred = cache_context.transfer_object_group(
+                        block_ids_per_group_gpu,
+                        memory_objs,
+                        object_group_id=obj_group_id,
+                        batch_size=cache_context.max_batch_size,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        direction=lmcache_native.TransferDirection.H2D,
+                        transfer_key=transfer_key,
+                        block_ids_host=gpu_block_ids,
                     )
+                    peer_runs += deferred or []
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
-                    unfull_bytes, unfull_runs = self._retrieve_unfull_chunk_objects(
+                    total_bytes += self._retrieve_unfull_chunk_objects(
                         cache_context,
                         key,
                         unfull_retained_keys,
@@ -1380,20 +1379,17 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         ],
                         unfull_block_ids,
                         max(0, skip_first_n_tokens - num_chunks * self._ctx.chunk_size),
+                        peer_runs,
                     )
-                    total_bytes += unfull_bytes
-                    peer_runs += unfull_runs
                     prefetched_keys.extend(unfull_retained_keys)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
                 retrieve_succeeded = False
 
-        def finish(succeeded: bool) -> tuple[bytes, bool]:
-            """Complete the retrieve once all of its device work is queued."""
-            with (
-                torch_dev.device(cache_context.device),
-                torch_dev.stream(cache_context.stream),
-            ):
+            # Completes the retrieve; it runs after the last device work is
+            # queued, which for peer_runs is once their reads landed.
+            def finish() -> None:
+                nonlocal num_tokens
                 event_backend.record_event(event, cache_context.stream)
                 if retained_keys:
                     submit_callback_to_stream(
@@ -1404,7 +1400,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 num_tokens = (
                     num_chunks * self._ctx.chunk_size
                     + (key.end % self._ctx.chunk_size if unfull_obj_keys else 0)
-                    if succeeded and len(prefetched_keys) == expected_retained
+                    if len(prefetched_keys) == expected_retained
                     else 0
                 )
                 self._ctx.event_bus.publish_on_stream(
@@ -1424,23 +1420,36 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         },
                     ),
                 )
-            if succeeded:
-                logger.info(
-                    "Retrieved %d tokens in %.3f seconds",
-                    num_tokens,
-                    time.perf_counter() - st,
-                )
-            return (
-                event_backend.export_event(event, cache_context.device),
-                succeeded,
+
+            if not (retrieve_succeeded and peer_runs):
+                finish()
+        if retrieve_succeeded and peer_runs:
+
+            def finish_peer_reads(succeeded: bool) -> tuple[bytes, bool]:
+                if not succeeded:
+                    prefetched_keys.clear()
+                finish()
+                return event_backend.export_event(
+                    event, cache_context.device
+                ), succeeded
+
+            # The affinity pool completes the request from the deferred
+            # response; the annotation stays the wire type.
+            return cast(
+                tuple[bytes, bool],
+                self._nic_dma.read(cache_context, peer_runs, finish_peer_reads),
+            )
+        if retrieve_succeeded:
+            ed = time.perf_counter()
+            logger.info(
+                "Retrieved %d tokens in %.3f seconds",
+                num_tokens,
+                ed - st,
             )
 
-        if not (retrieve_succeeded and peer_runs):
-            return finish(retrieve_succeeded)
-        # The affinity pool completes the request from the deferred response;
-        # the annotation stays the wire type the dispatcher encodes.
-        return cast(
-            tuple[bytes, bool], self._nic_dma.read(cache_context, peer_runs, finish)
+        return (
+            event_backend.export_event(event, cache_context.device),
+            retrieve_succeeded,
         )
 
     def _publish_token_bindings(
@@ -1602,7 +1611,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         obj_group_ids: list[int],
         block_ids: list[list[int]],
         skip_first_n_tokens: int,
-    ) -> tuple[int, list[DeferredNicRun]]:
+        peer_runs: list[DeferredNicRun],
+    ) -> int:
         """Copy an unfull chunk's read-locked objects into the GPU blocks.
 
         Runs inside a retrieve transaction, on its stream, after the producer
@@ -1617,10 +1627,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             block_ids: The unfull chunk's block IDs per kernel group.
             skip_first_n_tokens: Leading tokens of the unfull chunk not to
                 write: the engine's prefix cache holds them in shared blocks.
+            peer_runs: Receives the objects a peer owns, which are not
+                queued here but read by the NIC DMA engine.
 
         Returns:
-            The bytes copied, and the runs of objects a peer owns for the NIC
-            DMA engine.
+            The bytes copied.
 
         Raises:
             ValueError: If an object is missing or does not fit the staging
@@ -1645,7 +1656,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             raise ValueError(
                 f"unfull chunk of request {key.request_id} not found during retrieve"
             )
-        peer_runs: list[DeferredNicRun] = []
         for obj_group_id, memory_obj, object_buffer in zip(
             obj_group_ids, memory_objs, object_buffers, strict=True
         ):
@@ -1661,4 +1671,4 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             if peer_run is not None:
                 peer_runs.append(peer_run)
-        return sum(memory_obj.get_size() for memory_obj in memory_objs), peer_runs
+        return sum(memory_obj.get_size() for memory_obj in memory_objs)

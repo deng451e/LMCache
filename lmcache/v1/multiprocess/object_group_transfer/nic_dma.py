@@ -217,8 +217,10 @@ class _Retrieve:
         self._unsettled -= 1
         if self._unsettled:
             return
+        cc = self._cache_context
         try:
-            self.response.set_result(self._finish(not self._failed))
+            with torch_dev.device(cc.device), torch_dev.stream(cc.stream):
+                self.response.set_result(self._finish(not self._failed))
         except Exception as error:
             logger.exception("Cannot complete a retrieve of objects a peer owns")
             self.response.set_exception(error)
@@ -254,7 +256,8 @@ class NicDmaEngine:
         Args:
             cache_context: The retrieve's context.
             runs: The runs its transfers returned.
-            finish: Called once on the worker: True after the last run's
+            finish: Called once on the worker, under the context's device
+                and stream: True after the last run's
                 kernels are queued; False once a read failed or was abandoned
                 and every started read stopped (later runs are not read).
 
