@@ -25,15 +25,15 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     stage,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    DeferredNicRun,
+    StagingBuffer,
+)
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
     batched_iteration_with_skip,
     resolve_chunk_range,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.platform.base.object_group_transfer import (
-    DeferredNicRun,
-    StagingBuffer,
-)
 import lmcache.lmcache_native as lmcache_native
 
 logger = init_logger(__name__)

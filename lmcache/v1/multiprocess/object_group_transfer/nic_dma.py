@@ -31,11 +31,12 @@ from lmcache.v1.memory_management import (
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.platform.base.object_group_transfer import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
     DeferredNicRun,
     StagingBuffer,
+    StagingBufferFactory,
 )
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.stream import record_completion_event
 
 logger = init_logger(__name__)
@@ -374,6 +375,10 @@ class NicDmaEngine:
                 staging.idle.notify_all()
 
     def _create(self, cache_context: BaseCacheContext) -> _NicStaging:
+        if not isinstance(cache_context, StagingBufferFactory):
+            raise NotImplementedError(
+                f"{type(cache_context).__name__} cannot create a NIC staging buffer"
+            )
         groups = range(cache_context.kv_layer_groups_manager.num_object_groups)
         row = sum(
             cache_context.get_temp_object_group_buffer(0, g).nbytes for g in groups

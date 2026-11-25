@@ -19,13 +19,16 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     split_into_runs,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    DeferredNicRun,
+    defer_peer_runs,
+)
 from lmcache.v1.multiprocess.object_group_transfer.staged import (
     native_plan_available,
     run_object_group_transfer_plan,
     run_staged_loop,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.platform.base.object_group_transfer import DeferredNicRun
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -40,13 +43,14 @@ def transfer_kv_per_object_group(
     *,
     transfer_key: str,
     block_ids_host: Sequence[Sequence[int]] = (),
-) -> list[DeferredNicRun] | None:
+) -> None:
     """Transfer one object group's chunks, each by the engine its L1 object
     selects. Runs are issued in chunk order on the context's stream.
 
     Host-memory runs take the direct copy if usable, else the native plan if
     the extension has it; every other run is staged one batch at a time,
-    except that on retrieve the batches of objects a peer owns are returned.
+    except that on retrieve the batches of objects a peer owns are handed to
+    the caller's :func:`collect_peer_runs` block for the NIC DMA engine.
 
     Args:
         cache_context: Cache context of the KV cache.
@@ -67,10 +71,8 @@ def transfer_kv_per_object_group(
     Raises:
         ValueError: If a None entry is found on retrieve.
         ValueError: If a store targets an object a peer owns.
-
-    Returns:
-        On retrieve, the runs of objects a peer owns, for the NIC DMA engine
-        to read; None when there are none.
+        NotImplementedError: If a retrieve meets an object a peer owns and
+            the caller collects no peer runs.
     """
     deferred: list[DeferredNicRun] = []
     for engine, start, end in split_into_runs(memory_objs):
@@ -116,4 +118,5 @@ def transfer_kv_per_object_group(
                 engine=engine,
                 chunk_range=chunk_range,
             )
-    return deferred or None
+    if deferred:
+        defer_peer_runs(deferred)

@@ -16,6 +16,9 @@ import torch
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    defer_peer_runs,
+)
 from tests.v1.multiprocess.test_event_ipc_handle_path import (
     _FakeEventBackend,
     _FakeStorageManager,
@@ -76,7 +79,7 @@ def t(monkeypatch: pytest.MonkeyPatch):
             ),
         ),
         calculate_num_blocks=lambda chunk_size, group_idx: 1,
-        transfer_object_group=lambda *a, **k: list(returned) or None,
+        transfer_object_group=lambda *a, **k: defer_peer_runs(returned),
     )
     entry = transfer.ContextEntry(
         cast(Any, cache_context), "model", 1, event_backend=cast(Any, backend)

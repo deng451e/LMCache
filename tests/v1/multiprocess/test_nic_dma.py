@@ -27,6 +27,9 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     unfull_chunk,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    collect_peer_runs,
+)
 import lmcache.lmcache_native as lmcache_native
 
 OBJ = 256  # bytes per object and per slot
@@ -172,9 +175,12 @@ def h(monkeypatch):
 
     def runs(objs, skip=0, block_ids=None):
         ids = block_ids or [torch.arange(4 * len(objs)) for _ in range(2)]
-        return transfer_kv_per_object_group(
-            cc, ids, objs, 0, 2, skip, H2D, transfer_key="t"
-        )
+        collected: list = []
+        with collect_peer_runs(collected):
+            transfer_kv_per_object_group(
+                cc, ids, objs, 0, 2, skip, H2D, transfer_key="t"
+            )
+        return collected
 
     def retrieve(names, skip=0, block_ids=None):
         outcome: list = []

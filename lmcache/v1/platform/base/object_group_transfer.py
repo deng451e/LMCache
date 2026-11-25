@@ -5,68 +5,19 @@
 from __future__ import annotations
 
 # Standard
-from collections.abc import Callable, Sequence
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
-# Third Party
-import torch
-
 if TYPE_CHECKING:
+    # Standard
+    from collections.abc import Sequence
+
+    # Third Party
+    import torch
+
     # First Party
     from lmcache.v1.common.memory_management import MemoryObj
     from lmcache.v1.platform.base.cache_context import BaseCacheContext
     import lmcache.lmcache_native as lmcache_native
-
-
-class StagingBuffer(Protocol):
-    """Staging slots with a cache context's layout.
-
-    Slot ``i`` holds one chunk: object group ``g`` at
-    ``get_temp_object_group_buffer(i, g)``, kernel group ``k`` (as the block
-    kernel reads it) at ``get_temp_kernel_group_buffer(i, k)``.
-    """
-
-    @property
-    def buffer(self) -> torch.Tensor:
-        """The flat buffer every slot lies in."""
-        ...
-
-    def get_temp_object_group_buffer(
-        self, batch_idx: int, object_group_idx: int
-    ) -> torch.Tensor:
-        """Flat uint8 region of one object group in slot ``batch_idx``."""
-        ...
-
-    def get_temp_kernel_group_buffer(
-        self, batch_idx: int, kernel_group_idx: int
-    ) -> torch.Tensor:
-        """One kernel group in slot ``batch_idx``, shaped for the kernel."""
-        ...
-
-
-@dataclass
-class DeferredNicRun:
-    """Device work that waits for objects a peer owns to be read.
-
-    A transfer returns it instead of reading inline; the NIC DMA engine reads
-    ``memory_objs`` into staging slots it picks, then queues the kernels.
-
-    Attributes:
-        memory_objs: The objects to read, in slot order.
-        targets: ``(staging, slots) -> regions``: where each object lands
-            when the run gets ``slots`` of ``staging``.
-        launch: ``(staging, slots) -> None``: queues the kernels that copy
-            the landed bytes into the paged KV cache.
-        spans_slots: The object may extend past its slot into the following
-            ones (an unfull chunk with lead blocks), so the run needs the
-            slot at the end of the buffer that has room after it.
-    """
-
-    memory_objs: Sequence[MemoryObj]
-    targets: Callable[[StagingBuffer, Sequence[int]], list[torch.Tensor]]
-    launch: Callable[[StagingBuffer, Sequence[int]], None]
-    spans_slots: bool = False
 
 
 class ObjectGroupTransfer(Protocol):
@@ -89,7 +40,7 @@ class ObjectGroupTransfer(Protocol):
         *,
         transfer_key: str,
         block_ids_host: Sequence[Sequence[int]] = (),
-    ) -> list[DeferredNicRun] | None:
+    ) -> None:
         """Transfer one object group without committing storage.
 
         Args:
@@ -105,13 +56,11 @@ class ObjectGroupTransfer(Protocol):
             block_ids_host: Host block IDs; empty forces the kernel copy path.
 
         Returns:
-            On retrieve, the runs of objects a peer owns, for the NIC DMA
-            engine to read; None when there are none. Every other copy is
-            enqueued on the context's stream.
+            None after copies have been enqueued on the context's stream.
 
         Raises:
-            ValueError: If a retrieve encounters a missing object, or a store
-                targets an object a peer owns.
+            ValueError: If a retrieve encounters a missing object.
+            NotImplementedError: If an object is owned by a peer.
 
         Copy failures propagate to the caller. The caller owns completion,
         storage commit and the lifetime of the context and memory objects.

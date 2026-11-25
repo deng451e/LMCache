@@ -530,7 +530,23 @@ class GPUCacheContext(BaseCacheContext):
         slot_align_bytes: int,
         registration: BufferRegistration,
     ) -> _TempGPUBuffer:
-        """Allocate and register a staging buffer; see the base class."""
+        """Allocate a staging buffer of ``num_slots`` slots with this
+        context's layout, apart from the one its transfers share.
+
+        The buffer is registered with ``registration`` on the context's
+        stream and deregistered by :meth:`close`.
+
+        Args:
+            num_slots: Slots in the buffer.
+            slot_align_bytes: Every slot starts on this power of two.
+            registration: Registers the buffer, e.g. with a transfer channel.
+
+        Returns:
+            The buffer.
+
+        Raises:
+            RuntimeError: If the registration fails.
+        """
         staging = _TempGPUBuffer(
             kv_layer_groups_manager=self.kv_layer_groups_manager_,
             lmcache_tokens_per_chunk=self.lmcache_tokens_per_chunk,

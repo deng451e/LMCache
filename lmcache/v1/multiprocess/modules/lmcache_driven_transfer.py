@@ -53,6 +53,10 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     trim_and_stage_unfull_chunk_block_ids,
 )
 from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    DeferredNicRun,
+    collect_peer_runs,
+)
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.multiprocess.rocm_host_event_wait import (
     HostEventWaiter,
@@ -65,7 +69,6 @@ from lmcache.v1.platform.base.event_ipc import (
     get_event_ipc_backend,
 )
 from lmcache.v1.platform.base.ipc_wrapper import KVCache, set_fd_resolver
-from lmcache.v1.platform.base.object_group_transfer import DeferredNicRun
 from lmcache.v1.platform.cache_context import create_cache_context
 from lmcache.v1.platform.fd_channel import (
     FdChannelServer,
@@ -1367,17 +1370,17 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
-                    deferred = cache_context.transfer_object_group(
-                        block_ids_per_group_gpu,
-                        memory_objs,
-                        object_group_id=obj_group_id,
-                        batch_size=cache_context.max_batch_size,
-                        skip_first_n_tokens=skip_first_n_tokens,
-                        direction=lmcache_native.TransferDirection.H2D,
-                        transfer_key=transfer_key,
-                        block_ids_host=gpu_block_ids,
-                    )
-                    peer_runs += deferred or []
+                    with collect_peer_runs(peer_runs):
+                        cache_context.transfer_object_group(
+                            block_ids_per_group_gpu,
+                            memory_objs,
+                            object_group_id=obj_group_id,
+                            batch_size=cache_context.max_batch_size,
+                            skip_first_n_tokens=skip_first_n_tokens,
+                            direction=lmcache_native.TransferDirection.H2D,
+                            transfer_key=transfer_key,
+                            block_ids_host=gpu_block_ids,
+                        )
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
                     total_bytes += self._retrieve_unfull_chunk_objects(

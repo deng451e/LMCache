@@ -17,11 +17,11 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     select_engine,
     stage,
 )
-from lmcache.v1.platform.base.cache_context import BaseCacheContext
-from lmcache.v1.platform.base.object_group_transfer import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
     DeferredNicRun,
     StagingBuffer,
 )
+from lmcache.v1.platform.base.cache_context import BaseCacheContext
 import lmcache.lmcache_native as lmcache_native
 
 

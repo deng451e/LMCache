@@ -55,13 +55,17 @@ reply is a possible follow-up.
 
 `transfer_kv_per_object_group` splits a group into runs by transfer engine
 (see [`lmcache_driven_transfer_copy_paths.md`](../../multiprocess/lmcache_driven_transfer_copy_paths.md)).
-Runs of peer-owned objects are **returned, not staged**, and read without
-blocking the retrieve:
+Runs of peer-owned objects are **deferred, not staged**, and read without
+blocking the retrieve. `platform/base` is not involved: the context's
+transfer callback still returns nothing, so the transfer hands the runs to
+the `collect_peer_runs(...)` block the handler wraps around the call
+(`object_group_transfer/nic_staging.py`). A caller without such a block gets
+`NotImplementedError` for a peer-owned object, as before:
 
 ```
 RETRIEVE handler (affinity worker)
   host-memory runs → queued on the stream as usual
-  peer runs        → returned as DeferredNicRun (one per kernel batch, own block ids)
+  peer runs        → collected as DeferredNicRun (one per kernel batch, own block ids)
   NicDmaEngine.read(runs) → DeferredResponse              worker is free again
 
 per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
@@ -81,8 +85,9 @@ Why it is built this way:
 - **A NIC staging buffer.** The shared staging buffer (GPU DMA, NVMe) is
   reused by every copy queued on the stream, so a read into it would first
   wait for the stream. The NIC buffer is written only by peer reads and read
-  only by the kernels queued after them. `create_staging_buffer` allocates
-  it on a context's first peer read with the shared buffer's slot layout,
+  only by the kernels queued after them. `create_staging_buffer` (a
+  context that has it satisfies the `StagingBufferFactory` protocol; today
+  the CUDA context) allocates it on a context's first peer read with the shared buffer's slot layout,
   aligned to the L1 alignment and registered as one transfer-channel region
   (`TransferChannelStagingRegistration`); the context deregisters it at
   `close`. Size: `NIC_STAGING_BYTES` = 512 MiB of slots (at least two kernel

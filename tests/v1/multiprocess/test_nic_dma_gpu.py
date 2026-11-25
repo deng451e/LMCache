@@ -29,6 +29,9 @@ from lmcache.v1.multiprocess.object_group_transfer import (  # noqa: E402
 from lmcache.v1.multiprocess.object_group_transfer.engines import (  # noqa: E402
     TransferEngine,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (  # noqa: E402
+    collect_peer_runs,
+)
 from tests.v1.platform.devices.cuda.test_gdr_staging_region import (  # noqa: E402
     _channel,
     _context,
@@ -110,9 +113,18 @@ def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> No
     try:
         with torch.cuda.stream(nic_ctx.stream):
             ids = downsample_and_stage_block_ids(nic_ctx, [list(_BLOCK_IDS)] * 2)
-            runs = transfer_kv_per_object_group(
-                nic_ctx, ids, objs, 0, nic_ctx.max_batch_size, 0, _H2D, transfer_key="n"
-            )
+            runs: list = []
+            with collect_peer_runs(runs):
+                transfer_kv_per_object_group(
+                    nic_ctx,
+                    ids,
+                    objs,
+                    0,
+                    nic_ctx.max_batch_size,
+                    0,
+                    _H2D,
+                    transfer_key="n",
+                )
         assert runs and engine.read(nic_ctx, runs, lambda ok: ok).result(timeout=30)
         nic_ctx.stream.synchronize()
 

@@ -13,6 +13,7 @@ planning) driven from `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.p
 | `gpu_dma.py` | `GpuDmaEngine`: host/GPU copies queued on the stream |
 | `nvme_dma.py` | `NvmeDmaEngine`: GDS slab reads and writes queued on the stream |
 | `nic_dma.py` | `NicDmaEngine`: non-blocking transfer-channel reads of peer-owned objects into a NIC staging buffer, then their kernels |
+| `nic_staging.py` | what a transfer hands to the NIC DMA engine: `DeferredNicRun`, `collect_peer_runs`, and the `StagingBuffer` / `StagingBufferFactory` protocols |
 | `dispatch.py` | `transfer_kv_per_object_group`: picks each run's copy path |
 | `unfull_chunk.py` | the request's trailing unfull chunk |
 
@@ -127,10 +128,11 @@ flowchart TD
 
 A peer's object (`BorrowedMemoryObj`) has no local bytes; its peer's
 transfer channel reads them into GPU memory, outside the stream. So the
-transfer does not stage it: `transfer_kv_per_object_group` and
-`transfer_unfull_chunk` return a `DeferredNicRun` per kernel batch (with
-its own copy of the block ids), and the RETRIEVE handler hands them to
-`NicDmaEngine.read` after queuing everything else:
+transfer does not stage it: `transfer_kv_per_object_group` defers a
+`DeferredNicRun` per kernel batch (with its own copy of the block ids) to
+the caller's `collect_peer_runs` block, `transfer_unfull_chunk` returns
+one, and the RETRIEVE handler hands them to `NicDmaEngine.read` after
+queuing everything else:
 
 ```
 peer DRAM --read_many--> NIC staging slot --kernel--> paged KV

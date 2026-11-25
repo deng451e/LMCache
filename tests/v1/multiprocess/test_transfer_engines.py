@@ -25,6 +25,9 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     split_into_runs,
     stage,
 )
+from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+    collect_peer_runs,
+)
 import lmcache.lmcache_native as lmcache_native
 
 GPU = TransferEngine.GPU_DMA
@@ -91,7 +94,7 @@ def test_chunks_split_into_consecutive_same_engine_runs(pattern, expected):
 def _transfer(monkeypatch, pattern: str) -> list[tuple[str, tuple[int, int]]]:
     """Run the dispatcher with the copy paths stubbed and no direct copy;
     return each run's path and chunk range, in call order. What the staged
-    loop returns for NIC runs must come back from the dispatcher."""
+    loop returns for NIC runs must reach the caller's collect_peer_runs."""
     calls: list[tuple[str, tuple[int, int]]] = []
     monkeypatch.setattr(dispatch, "batch_memcpy_available", lambda: False)
     monkeypatch.setattr(dispatch, "native_plan_available", lambda: True)
@@ -108,19 +111,38 @@ def _transfer(monkeypatch, pattern: str) -> list[tuple[str, tuple[int, int]]]:
             or [k["chunk_range"]] * (k["engine"] is NIC)
         ),
     )
-    returned = transfer_kv_per_object_group(
-        MagicMock(),
-        block_ids_gpu=[MagicMock()],
-        memory_objs=_objects(pattern),
-        object_group_id=0,
-        batch_size=4,
-        skip_first_n_tokens=0,
-        direction=lmcache_native.TransferDirection.H2D,
-        transfer_key="test",
-        block_ids_host=[[1, 2]],
-    )
-    assert returned == ([r for e, r in calls if e == "nic_dma"] or None)
+    collected: list = []
+    with collect_peer_runs(collected):
+        transfer_kv_per_object_group(
+            MagicMock(),
+            block_ids_gpu=[MagicMock()],
+            memory_objs=_objects(pattern),
+            object_group_id=0,
+            batch_size=4,
+            skip_first_n_tokens=0,
+            direction=lmcache_native.TransferDirection.H2D,
+            transfer_key="test",
+            block_ids_host=[[1, 2]],
+        )
+    assert collected == [r for e, r in calls if e == "nic_dma"]
     return calls
+
+
+def test_peer_runs_nobody_collects_are_refused(monkeypatch):
+    """A caller that does not collect peer runs cannot read objects a peer
+    owns, as before the NIC DMA engine."""
+    monkeypatch.setattr(dispatch, "run_staged_loop", lambda *a, **k: ["run"])
+    with pytest.raises(NotImplementedError):
+        transfer_kv_per_object_group(
+            MagicMock(),
+            block_ids_gpu=[MagicMock()],
+            memory_objs=_objects("p"),
+            object_group_id=0,
+            batch_size=4,
+            skip_first_n_tokens=0,
+            direction=lmcache_native.TransferDirection.H2D,
+            transfer_key="test",
+        )
 
 
 def test_single_engine_group_is_one_transfer_over_every_chunk(monkeypatch):
