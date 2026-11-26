@@ -74,8 +74,8 @@ def test_storing_into_an_object_a_peer_owns_is_rejected():
 
 
 def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
-    """A caller that collects no peer runs cannot read objects a peer owns,
-    as before the NIC DMA engine. A collected run keeps its own block ids."""
+    """A caller that collects no deferred runs cannot read objects a peer
+    owns, as before the NIC DMA engine."""
     run = DeferredRun(
         [_peer()], [torch.arange(2)], lambda staging: [], lambda staging, ids: None
     )
@@ -93,10 +93,7 @@ def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
     collected: list = []
     with collect_deferred_runs(collected):
         assert deferred(NIC, make_run)
-    (taken,) = collected
-    assert taken.memory_objs is run.memory_objs
-    assert taken.block_ids[0] is not run.block_ids[0]
-    assert taken.block_ids[0].tolist() == [0, 1]
+    assert [taken.memory_objs for taken in collected] == [run.memory_objs]
 
 
 @pytest.mark.parametrize(

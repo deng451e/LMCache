@@ -18,6 +18,7 @@ from lmcache.v1.distributed.config import (
     GDSL1ManagerConfig,
     ShadowL1ManagerConfig,
     parse_args,
+    with_shadow_l1,
 )
 from lmcache.v1.distributed.l1_manager.base import BaseL1Manager
 from lmcache.v1.distributed.storage_manager import StorageManager, l1_owners_of
@@ -305,6 +306,24 @@ def test_shadow_l1_is_configured_after_an_owner() -> None:
         parse_args(_args([dram, {**shadow, "segment": "moon"}]))
     with pytest.raises(ValueError, match="_default"):
         parse_args(_args([dram, {**shadow, "tag": "_default"}]))
+
+
+def test_with_shadow_l1_adds_a_shadow_l1_once() -> None:
+    """A borrowing P2P load mode gets its shadow L1 from the server: appended
+    after the owned L1s, with their lock TTLs, and left alone when the
+    operator configured one."""
+    dram = {"type": "DRAM", "tag": "_default", "size_gb": 1}
+    config = parse_args(
+        _args([{**dram, "read_ttl_seconds": 7, "write_ttl_seconds": 9}])
+    )
+    shadowed = with_shadow_l1(config, MemorySegment.DRAM)
+    assert [c.tag for c in shadowed.l1_manager_configs] == ["_default", "shadow.dram"]
+    shadow = shadowed.l1_manager_configs[1]
+    assert isinstance(shadow, ShadowL1ManagerConfig)
+    assert shadow.segment is MemorySegment.DRAM
+    assert (shadow.read_ttl_seconds, shadow.write_ttl_seconds) == (7, 9)
+    assert with_shadow_l1(shadowed, MemorySegment.DRAM) is shadowed
+    assert [c.tag for c in config.l1_manager_configs] == ["_default"]
 
 
 def test_adapter_startup_failure_closes_all_created_l1s(

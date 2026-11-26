@@ -274,14 +274,22 @@ def test_a_failed_read_fails_the_retrieve_without_kernels(h) -> None:
     assert len(_reads(h.log)) == 4
 
 
-def test_a_staging_buffer_that_cannot_be_created_fails_the_retrieve(h) -> None:
-    """E.g. the transfer channel refuses the region: the retrieve completes
+@pytest.mark.parametrize("released", [False, True])
+def test_a_read_without_a_staging_buffer_fails_at_once(h, released) -> None:
+    """Either the buffer cannot be created (e.g. the transfer channel refuses
+    the region; not tried again), or drain() ran first: a retrieve that
+    looked its context up before the instance was unregistered must not
+    create a buffer on a context that may be closed. The retrieve completes
     as failed, so its read locks are released and vLLM recomputes."""
-    h.cc.create_staging_buffer.side_effect = RuntimeError("no GPUDirect RDMA")
-    response, outcome = h.retrieve("ab")
-    assert outcome == [False] and response.result(timeout=1) is False
-    h.retrieve("cd")  # not tried again
-    assert _reads(h.log) == [] and h.cc.create_staging_buffer.call_count == 1
+    if released:
+        assert h.engine.drain(h.cc, 0.05) is True  # nothing to wait for
+    else:
+        h.cc.create_staging_buffer.side_effect = RuntimeError("no GPUDirect RDMA")
+    for names in ("ab", "cd"):
+        response, outcome = h.retrieve(names)
+        assert outcome == [False] and response.result(timeout=1) is False
+    assert _reads(h.log) == []
+    assert h.cc.create_staging_buffer.call_count == (0 if released else 1)
 
 
 def _drain(h) -> threading.Thread:
@@ -289,18 +297,6 @@ def _drain(h) -> threading.Thread:
     thread.start()
     thread.join(0.1)
     return thread
-
-
-def test_drain_waits_until_the_contexts_retrieves_completed(h) -> None:
-    """A context is closed only after its reads landed and their kernels
-    were queued: closing deregisters the slots and unmaps the KV cache."""
-    h.retrieve("ab")
-    drain = _drain(h)
-    assert drain.is_alive()
-    h.p.reads[0].finished = True
-    h.poller.poll()
-    drain.join(5)
-    assert not drain.is_alive() and len(_kernels(h.log)) == 1
 
 
 def test_drain_gives_up_after_its_timeout(h) -> None:
@@ -325,22 +321,15 @@ def test_closing_the_engine_wakes_a_waiting_drain(h) -> None:
     assert not drain.is_alive()
 
 
-def test_a_read_of_a_released_context_fails_without_a_buffer(h) -> None:
-    """A retrieve that looked its context up before the instance was
-    unregistered reads after drain(): it must not create a buffer the drain
-    does not know, on a context that may be closed."""
-    assert h.engine.drain(h.cc, 0.05) is True  # nothing to wait for
-    response, outcome = h.retrieve("ab")
-    assert outcome == [False] and response.result(timeout=1) is False
-    assert _reads(h.log) == [] and h.cc.create_staging_buffer.call_count == 0
-
-
 def test_drain_fails_the_waves_that_have_not_started(h) -> None:
-    """The timeout bounds reads in flight; waves still waiting for slots
-    would each add a read's timeout to the wait."""
+    """A context is closed only after its reads in flight landed and their
+    kernels were queued: closing deregisters the slots and unmaps the KV
+    cache. Waves still waiting for slots are dropped: each would add a
+    read's timeout to the wait."""
     _, first = h.retrieve("abcde")  # two waves in flight, the third waits
     _, second = h.retrieve("gh")
     drain = _drain(h)
+    assert drain.is_alive()
     for read in h.p.reads:
         read.finished = True
     h.poller.poll()

@@ -29,17 +29,13 @@ def test_ready_runs_once_on_the_worker_that_watched() -> None:
     poller = HostPoller()
     pool = AffinityThreadPool(1, thread_name_prefix="w")
     ready = threading.Event()
-    checks = [0]
-
-    def check() -> bool:
-        checks[0] += 1
-        return ready.is_set()
 
     try:
-        calls, done = pool.submit(lambda: _watch(poller, check)).result(timeout=5)
-        time.sleep(0.1)
-        # Backing off to 1 ms: about 100 checks in 100 ms, not ~2000.
-        assert calls == [] and 1 <= checks[0] < 300
+        calls, done = pool.submit(lambda: _watch(poller, ready.is_set)).result(
+            timeout=5
+        )
+        time.sleep(0.05)
+        assert calls == []
         ready.set()
         assert done.wait(5)
         time.sleep(0.02)

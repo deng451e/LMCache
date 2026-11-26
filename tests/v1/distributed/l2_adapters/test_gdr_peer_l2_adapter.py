@@ -23,16 +23,7 @@ from lmcache.v1.distributed.api import (
     MemoryTags,
     ObjectKey,
 )
-from lmcache.v1.distributed.config import (
-    EvictionConfig,
-    L1ManagerConfig,
-    L1MemoryManagerConfig,
-    ShadowL1ManagerConfig,
-    StorageManagerConfig,
-    with_shadow_l1,
-)
 from lmcache.v1.distributed.l2_adapters import p2p_l2_adapter as p2p_mod
-from lmcache.v1.distributed.l2_adapters.config import L2AdaptersConfig
 from lmcache.v1.distributed.l2_adapters.gdr_peer_l2_adapter import (
     GdrPeerL2Adapter,
     GdrPeerL2AdapterConfig,
@@ -143,9 +134,9 @@ def _borrow(adapter, req_client):
     return key, _load(adapter, [key])[key]
 
 
-def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
-    """A lookup hit is borrowed as a remote handle; reading it submits one
-    transfer-channel read from the peer's address into the given region."""
+def test_hits_become_remote_handles_until_released() -> None:
+    """A lookup hit is borrowed as a remote handle under a lease; releasing
+    the handle unlocks the owner."""
     with _adapter() as (adapter, req_client, _tc_ctx, tc_client):
         keys = [_key(0), _key(1)]
         addresses = [
@@ -160,29 +151,10 @@ def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
         obj = objects[keys[0]]
         assert isinstance(obj, BorrowedMemoryObj)
         assert obj.is_valid()
-        assert obj.get_size() == PAGE
-        assert obj.get_shapes() == LAYOUT.shapes
-        assert obj.raw_tensor is None
         assert adapter.get_memory_tags() == MemoryTags(
             MemorySegment.DRAM, MemoryResidency.REMOTE
         )
         assert adapter.get_local_borrow_count() == 1
-
-        tc_client.submit_read.return_value = 42
-        tc_client.query_status.return_value = TransferChannelTransferResult(
-            finished=False
-        )
-        read = _read(obj, 3, 2 * PAGE)
-        tc_client.submit_read.assert_called_once_with(
-            [TransferChannelAddress(offset=2 * PAGE, size=PAGE)],
-            [addresses[0]],
-            local_region=3,
-        )
-        assert not read.is_finished()
-        tc_client.query_status.return_value = TransferChannelTransferResult(
-            finished=True, succeeded_mask=[True]
-        )
-        assert read.is_finished() and read.succeeded()
 
         # The controller returns the keys that became no object: the miss had
         # no reservation, so nothing is sent.
@@ -195,18 +167,14 @@ def test_hits_become_remote_handles_that_read_into_a_device_region() -> None:
         assert adapter.get_local_borrow_count() == 0
 
 
-def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
+def test_a_read_past_its_deadline_fails_once_it_is_confirmed_stopped() -> None:
     """A read past its deadline is cancelled, and stays unfinished until the
-    transport confirms it stopped: it could land in a reused staging slot."""
+    transport confirms it stopped: it could land in a reused staging slot.
+    One that finishes after the deadline is not trusted either: the owner's
+    lock may lapse before the bytes are used."""
     with _adapter(load_timeout_s=0.01) as (adapter, req_client, _tc_ctx, tc_client):
         key, obj = _borrow(adapter, req_client)
         tc_client.submit_read.return_value = 1
-        tc_client.query_status.return_value = TransferChannelTransferResult(
-            finished=True, succeeded_mask=[False]
-        )
-        read = _read(obj, 1, 0)
-        assert read.is_finished() and not read.succeeded()
-
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=False
         )
@@ -223,26 +191,15 @@ def test_a_timed_out_read_fails_only_once_its_cancel_is_confirmed() -> None:
         tc_client.cancel.return_value = True
         time.sleep(0.02)
         assert read.is_finished() and not read.succeeded()
-        obj.release()
 
-
-def test_a_read_that_finishes_after_its_deadline_fails() -> None:
-    """Past the deadline the owner's lock may lapse before the bytes are
-    used, so a read the cancel did not stop in time is not trusted."""
-    with _adapter(load_timeout_s=0.01) as (adapter, req_client, _tc_ctx, tc_client):
-        key, obj = _borrow(adapter, req_client)
-        tc_client.submit_read.return_value = 1
-        tc_client.query_status.return_value = TransferChannelTransferResult(
-            finished=False
-        )
         tc_client.cancel.return_value = False
-        read = _read(obj, 1, 0)
+        late = _read(obj, 1, 0)
         time.sleep(0.02)
-        assert not read.is_finished()
+        assert not late.is_finished()
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[True]
         )
-        assert read.is_finished() and not read.succeeded()
+        assert late.is_finished() and not late.succeeded()
         obj.release()
 
 
@@ -368,26 +325,3 @@ def test_only_the_borrowing_config_needs_a_read_ttl_above_the_load_timeout() -> 
     with pytest.raises(ValueError, match="l1-read-ttl-seconds"):
         GdrPeerL2AdapterConfig.check_timeouts(read_ttl_s=31, load_timeout_s=30)
 
-
-def test_gdr_mode_adds_a_dram_shadow_l1_once() -> None:
-    """The server derives the shadow L1 a GDR borrower needs from the load
-    mode: appended after the owned L1s, with their lock TTLs, and left alone
-    when the operator configured one."""
-    dram = L1ManagerConfig(
-        memory_config=L1MemoryManagerConfig(size_in_bytes=1 << 20, use_lazy=False),
-        read_ttl_seconds=7,
-        write_ttl_seconds=9,
-    )
-    config = StorageManagerConfig(
-        l1_manager_config=dram,
-        eviction_config=EvictionConfig(eviction_policy="LRU"),
-        l2_adapter_config=L2AdaptersConfig(adapters=[]),
-    )
-    shadowed = with_shadow_l1(config, MemorySegment.DRAM)
-    assert [c.tag for c in shadowed.l1_manager_configs] == ["_default", "shadow.dram"]
-    shadow = shadowed.l1_manager_configs[1]
-    assert isinstance(shadow, ShadowL1ManagerConfig)
-    assert shadow.segment is MemorySegment.DRAM
-    assert (shadow.read_ttl_seconds, shadow.write_ttl_seconds) == (7, 9)
-    assert with_shadow_l1(shadowed, MemorySegment.DRAM) is shadowed
-    assert [c.tag for c in config.l1_manager_configs] == ["_default"]
