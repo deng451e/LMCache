@@ -142,17 +142,13 @@ class TransferChannelStagingRegistration(BufferRegistration):
         """Register ``buffer``; :attr:`region_id` is then its region.
 
         Raises:
-            RuntimeError: If there is no transfer channel context, ``buffer``
-                is not aligned to its ``align_bytes``, or it refuses the region.
+            RuntimeError: If there is no transfer channel context, or it
+                refuses the region.
         """
         target = get_transfer_channel_context()
-        align = target.align_bytes
-        ptr = buffer.data_ptr()
-        if ptr % align or buffer.nbytes % align:
-            raise RuntimeError(f"The staging buffer at {ptr:#x} is not {align}-aligned")
         try:
             self.region_id = target.register_memory_region(
-                ptr, buffer.nbytes, buffer.device.index
+                buffer.data_ptr(), buffer.nbytes, buffer.device.index
             )
         except ValueError as error:
             raise RuntimeError("The transfer channel refused the buffer") from error

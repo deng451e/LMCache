@@ -272,7 +272,7 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
 
     def _bind_borrowed_object(
         self, obj: BorrowedMemoryObj, address: TransferChannelAddress, lease: Lease
-    ) -> bool:
+    ) -> None:
         """Bind the placeholder to this adapter's reads of the peer's bytes;
         a read checks the object's current lease."""
         obj.bind(
@@ -281,7 +281,6 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             address=address.offset,
             source=self._config.peer_transfer_channel_server_url,
         )
-        return True
 
     def _read_finished(self) -> None:
         with self._reads_lock:

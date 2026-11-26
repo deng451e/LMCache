@@ -127,11 +127,13 @@ def collect_deferred_runs(runs: list[DeferredRun]) -> Iterator[None]:
         _run_sink.reset(token)
 
 
-def defer_runs(runs: Sequence[DeferredRun]) -> None:
-    """Hand ``runs`` to the caller's :func:`collect_deferred_runs` block.
+def defer_run(run: DeferredRun) -> None:
+    """Hand one run to the caller's :func:`collect_deferred_runs` block, with
+    its own copy of the block ids: the next transfer restages the buffer
+    they live in.
 
     Args:
-        runs: The runs a transfer did not stage.
+        run: The run a transfer did not stage.
 
     Raises:
         NotImplementedError: If the caller collects none: it cannot run
@@ -143,21 +145,7 @@ def defer_runs(runs: Sequence[DeferredRun]) -> None:
             "This transfer defers steps to an engine: call it inside "
             "collect_deferred_runs()"
         )
-    sink.extend(runs)
-
-
-def defer_run(run: DeferredRun) -> None:
-    """Hand one run to the caller's :func:`collect_deferred_runs` block, with
-    its own copy of the block ids: the next transfer restages the buffer
-    they live in.
-
-    Args:
-        run: The run a transfer did not stage.
-
-    Raises:
-        NotImplementedError: If the caller collects none.
-    """
-    defer_runs([replace(run, block_ids=[ids.clone() for ids in run.block_ids])])
+    sink.append(replace(run, block_ids=[ids.clone() for ids in run.block_ids]))
 
 
 class DeferredTransferEngine(Protocol):

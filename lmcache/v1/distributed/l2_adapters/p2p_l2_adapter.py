@@ -743,10 +743,7 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
                 functools.partial(self._lease_is_valid, record),
                 functools.partial(self._end_lease, record),
             )
-            if not self._bind_borrowed_object(
-                cast(BorrowedMemoryObj, obj), address, lease
-            ):
-                continue
+            self._bind_borrowed_object(cast(BorrowedMemoryObj, obj), address, lease)
             self._pop_reservation(key)
             with self._borrow_lock:
                 self._leases.add(record)
@@ -799,16 +796,13 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
     @abstractmethod
     def _bind_borrowed_object(
         self, obj: BorrowedMemoryObj, address: TransferChannelAddress, lease: Lease
-    ) -> bool:
+    ) -> None:
         """Bind a placeholder to the bytes of one lookup hit.
 
         Args:
             obj: The shadow L1's unbound placeholder for the key.
             address: The owner's address of the object.
             lease: The reservation, to pass to ``obj.bind``.
-
-        Returns:
-            True once ``obj`` is bound; False to skip the key.
         """
 
     def _drain_borrows_for_close(self) -> None:
