@@ -1,12 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """NIC DMA engine: reads objects a peer owns into GPU memory without blocking.
 
-The first part of this file is the generic interface for retrieve steps an
-engine runs outside the stream: a transfer hands each such step as a
-:class:`DeferredRun` to the caller's :func:`collect_deferred_runs` block, and
-the caller gives the collected runs to a :class:`DeferredTransferEngine`.
-
-The rest is that engine for objects bound to a reader:
+The off-stream engine (``off_stream.py``) of objects bound to a reader:
 :meth:`NicDmaEngine.read` reads their runs in waves into a NIC staging
 buffer that nothing on the stream uses, queues each wave's kernels once its
 reads landed, and frees the slots once those kernels finished. A
@@ -17,10 +12,7 @@ instance's affinity worker; no stream waits on a host-written value. See
 
 # Standard
 from collections import deque
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Callable, Protocol, Sequence, runtime_checkable
 import threading
 import weakref
@@ -38,11 +30,14 @@ from lmcache.v1.distributed.transfer_channel import (
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
     BorrowedReader,
-    MemoryObj,
     PendingRead,
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
+    Staging,
+)
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.stream import record_completion_event
 
@@ -54,142 +49,6 @@ NIC_STAGING_BYTES = 512 << 20
 # Rows after the slots for an unfull chunk: one row plus at most one lead
 # block per kernel group.
 _SPARE_ROWS = 2
-
-
-class Staging(Protocol):
-    """Where one transfer step is staged, indexed by its chunks: chunk ``i``
-    of the step is in slot ``i``. A cache context is one (its shared
-    buffer); an engine that stages elsewhere passes a view of its own."""
-
-    def get_temp_object_group_buffer(
-        self, batch_idx: int, object_group_idx: int
-    ) -> torch.Tensor:
-        """Flat uint8 region of one object group of chunk ``batch_idx``."""
-        ...
-
-    def get_temp_kernel_group_buffer(
-        self, batch_idx: int, kernel_group_idx: int
-    ) -> torch.Tensor:
-        """One kernel group of chunk ``batch_idx``, shaped for the kernel."""
-        ...
-
-    def get_temp_staging_buffer(self, num_bytes: int) -> torch.Tensor | None:
-        """The first ``num_bytes`` bytes from chunk 0 on, as one flat region;
-        None if they do not fit."""
-        ...
-
-
-@dataclass
-class DeferredRun:
-    """One retrieve step of an engine that stages outside the stream.
-
-    A transfer hands it over instead of staging inline; the engine stages
-    ``memory_objs`` into staging slots it picks, then queues the kernels.
-
-    Attributes:
-        memory_objs: The objects to stage, in chunk order.
-        block_ids: The block ids the kernels use.
-        targets: ``staging -> regions``: where each object lands.
-        launch: ``(staging, block_ids) -> None``: queues the kernels that
-            copy the landed bytes into the paged KV cache.
-        skipped: Chunks of the step before the first object; the kernels
-            skip them, so they get no slot.
-        spans_slots: The object may extend past its slot into the following
-            ones (an unfull chunk with lead blocks), so the run needs the
-            slot at the end of the buffer that has room after it.
-    """
-
-    memory_objs: Sequence[MemoryObj]
-    block_ids: list[torch.Tensor]
-    targets: Callable[[Staging], list[torch.Tensor]]
-    launch: Callable[[Staging, list[torch.Tensor]], None]
-    skipped: int = 0
-    spans_slots: bool = False
-
-
-_run_sink: ContextVar[list[DeferredRun] | None] = ContextVar(
-    "lmcache_run_sink", default=None
-)
-
-
-@contextmanager
-def collect_deferred_runs(runs: list[DeferredRun]) -> Iterator[None]:
-    """Append to ``runs`` the runs that transfers called inside the block,
-    on this thread, defer.
-
-    Args:
-        runs: Receives the runs, in transfer order.
-    """
-    token = _run_sink.set(runs)
-    try:
-        yield
-    finally:
-        _run_sink.reset(token)
-
-
-def defer_run(run: DeferredRun) -> None:
-    """Hand one run to the caller's :func:`collect_deferred_runs` block, with
-    its own copy of the block ids: the next transfer restages the buffer
-    they live in.
-
-    Args:
-        run: The run a transfer did not stage.
-
-    Raises:
-        NotImplementedError: If the caller collects none: it cannot run
-            deferred steps.
-    """
-    sink = _run_sink.get()
-    if sink is None:
-        raise NotImplementedError(
-            "This transfer defers steps to an engine: call it inside "
-            "collect_deferred_runs()"
-        )
-    sink.append(replace(run, block_ids=[ids.clone() for ids in run.block_ids]))
-
-
-class DeferredTransferEngine(Protocol):
-    """Runs the deferred runs of retrieves without blocking the worker."""
-
-    def read(
-        self,
-        cache_context: BaseCacheContext,
-        runs: Sequence[DeferredRun],
-        finish: Callable[[bool], object],
-    ) -> DeferredResponse:
-        """Stage ``runs`` and queue their kernels; return at once. Call on
-        the context's affinity worker after the retrieve queued its other
-        work.
-
-        Args:
-            cache_context: The retrieve's context.
-            runs: The runs its transfers deferred.
-            finish: Called once on the worker, under the context's device
-                and stream: True after the last run's kernels are queued,
-                False if the runs could not all be staged.
-
-        Returns:
-            A response completed with ``finish``'s result or exception.
-        """
-        ...
-
-    def drain(self, cache_context: BaseCacheContext) -> bool:
-        """Wait until every retrieve of ``cache_context`` completed. Call
-        before closing the context, and not on its affinity worker. From
-        this call on, a read of the context fails.
-
-        Args:
-            cache_context: The context about to be closed.
-
-        Returns:
-            False if a retrieve is still running after the engine's
-            timeout: the context must then stay open.
-        """
-        ...
-
-    def close(self) -> None:
-        """Stop the engine; runs in flight are abandoned."""
-        ...
 
 
 class StagingBuffer(Protocol):
@@ -339,7 +198,7 @@ class _SlotPool:
 class _Wave:
     retrieve: "_Retrieve"
     pool: _SlotPool
-    runs: list[DeferredRun] = field(default_factory=list)
+    runs: list[OffStreamRun] = field(default_factory=list)
     started: bool = False
 
     @property
@@ -373,7 +232,7 @@ class _Retrieve:
         cache_context: BaseCacheContext,
         staging: _NicStaging,
         poller: HostPoller,
-        runs: Sequence[DeferredRun],
+        runs: Sequence[OffStreamRun],
         finish: Callable[[bool], object],
     ) -> None:
         self._cache_context = cache_context
@@ -531,7 +390,7 @@ class NicDmaEngine:
     def read(
         self,
         cache_context: BaseCacheContext,
-        runs: Sequence[DeferredRun],
+        runs: Sequence[OffStreamRun],
         finish: Callable[[bool], object],
     ) -> DeferredResponse:
         """Read ``runs`` and queue their kernels; return at once. Call on the

@@ -16,9 +16,9 @@ import torch
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
-    defer_run,
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
+    hand_off_run,
 )
 from tests.v1.multiprocess.test_event_ipc_handle_path import (
     _FakeEventBackend,
@@ -62,7 +62,7 @@ def t(monkeypatch: pytest.MonkeyPatch):
         reads.append((list(runs), finish, DeferredResponse()))
         return reads[-1][2]
 
-    module._deferred_engine = SimpleNamespace(read=read)
+    module._off_stream_engine = SimpleNamespace(read=read)
     backend = _FakeEventBackend()
     record = backend.record_event
     backend.record_event = lambda e, s: order.append("record") or record(e, s)  # type: ignore[method-assign]
@@ -80,7 +80,7 @@ def t(monkeypatch: pytest.MonkeyPatch):
             ),
         ),
         calculate_num_blocks=lambda chunk_size, group_idx: 1,
-        transfer_object_group=lambda *a, **k: [defer_run(run) for run in returned],
+        transfer_object_group=lambda *a, **k: [hand_off_run(run) for run in returned],
     )
     entry = transfer.ContextEntry(
         cast(Any, cache_context), "model", 1, event_backend=cast(Any, backend)
@@ -101,7 +101,7 @@ def t(monkeypatch: pytest.MonkeyPatch):
 def test_peer_runs_defer_the_response_until_their_kernels_are_queued(t, ok) -> None:
     """A failed read completes the retrieve as failed (vLLM recomputes); the
     read locks are released either way."""
-    run = DeferredRun([], [], lambda staging: [], lambda staging, ids: None)
+    run = OffStreamRun([], [], lambda staging: [], lambda staging, ids: None)
     t.returned.append(run)
     response = t.retrieve()
     assert isinstance(response, DeferredResponse) and not response.done()

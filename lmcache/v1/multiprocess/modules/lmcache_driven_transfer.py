@@ -40,9 +40,9 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.object_group_transfer import (
-    DeferredRun,
-    collect_deferred_runs,
-    create_deferred_engine,
+    OffStreamRun,
+    collect_off_stream_runs,
+    create_off_stream_engine,
     downsample_and_stage_block_ids,
     get_unfull_chunk_layout_desc,
     get_unfull_chunk_staging_buffer,
@@ -247,20 +247,20 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         return cls(
             build_ctx.engine_context,
             fd_socket_path=fd_channel_path(build_ctx.mp_config.port),
-            deferred_drain_timeout_s=build_ctx.mp_config.deferred_drain_timeout_s,
+            off_stream_drain_timeout_s=build_ctx.mp_config.off_stream_drain_timeout_s,
         )
 
     def __init__(
         self,
         ctx: MPCacheServerContext,
         fd_socket_path: str = "",
-        deferred_drain_timeout_s: float = 30.0,
+        off_stream_drain_timeout_s: float = 30.0,
     ) -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
-        # Runs the retrieve steps that transfers defer, without blocking;
+        # Runs the retrieve steps whose bytes land off the stream;
         # releasing an instance waits that long for them.
-        self._deferred_engine = create_deferred_engine(deferred_drain_timeout_s)
+        self._off_stream_engine = create_off_stream_engine(off_stream_drain_timeout_s)
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
         # report_status all serialize through this lock. Held only for dict
@@ -466,12 +466,12 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         if not entries:
             return
         for entry in entries:
-            # Deferred steps run outside the stream, which close() waits for.
-            if self._deferred_engine.drain(entry.cache_context):
+            # Off-stream steps are not covered by the stream wait in close().
+            if self._off_stream_engine.drain(entry.cache_context):
                 entry.cache_context.close()
             else:
                 logger.error(
-                    "Deferred transfers of %s did not stop: its cache context "
+                    "Off-stream transfers of %s did not stop: its cache context "
                     "stays open, since they may still write to its staging",
                     entry.model_name,
                 )
@@ -514,7 +514,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
-        self._deferred_engine.close()
+        self._off_stream_engine.close()
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
@@ -1165,7 +1165,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             that signals the completion of the retrieve operation, and the
             second element indicates whether the key was successfully retrieved.
             The event handle is empty when no device work was submitted. A
-            retrieve whose transfers deferred steps returns a
+            retrieve with off-stream steps returns a
             ``DeferredResponse`` for the same tuple: it completes once
             their kernels are queued, with False if a step failed (the
             engine then recomputes the blocks).
@@ -1333,9 +1333,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             total_bytes = 0
             num_tokens = 0
-            # Steps the transfers deferred: the deferred engine runs them
+            # Steps the transfers handed off: the off-stream engine runs them
             # once everything else is queued.
-            deferred_runs: list[DeferredRun] = []
+            off_stream_runs: list[OffStreamRun] = []
             retrieve_succeeded = True
             try:
                 for obj_group_id in range(num_object_groups):
@@ -1357,7 +1357,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
-                    with collect_deferred_runs(deferred_runs):
+                    with collect_off_stream_runs(off_stream_runs):
                         cache_context.transfer_object_group(
                             block_ids_per_group_gpu,
                             memory_objs,
@@ -1370,7 +1370,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         )
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
-                    with collect_deferred_runs(deferred_runs):
+                    with collect_off_stream_runs(off_stream_runs):
                         total_bytes += self._retrieve_unfull_chunk_objects(
                             cache_context,
                             key,
@@ -1390,7 +1390,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 retrieve_succeeded = False
 
             # Completes the retrieve; it runs after the last device work is
-            # queued, which for deferred_runs is once they were staged.
+            # queued, which for off_stream_runs is once they were staged.
             def finish() -> None:
                 nonlocal num_tokens
                 event_backend.record_event(event, cache_context.stream)
@@ -1424,11 +1424,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     ),
                 )
 
-            if not (retrieve_succeeded and deferred_runs):
+            if not (retrieve_succeeded and off_stream_runs):
                 finish()
-        if retrieve_succeeded and deferred_runs:
+        if retrieve_succeeded and off_stream_runs:
 
-            def finish_deferred(succeeded: bool) -> tuple[bytes, bool]:
+            def finish_off_stream(succeeded: bool) -> tuple[bytes, bool]:
                 if not succeeded:
                     prefetched_keys.clear()
                 finish()
@@ -1440,8 +1440,8 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             # response; the annotation stays the wire type.
             return cast(
                 tuple[bytes, bool],
-                self._deferred_engine.read(
-                    cache_context, deferred_runs, finish_deferred
+                self._off_stream_engine.read(
+                    cache_context, off_stream_runs, finish_off_stream
                 ),
             )
         if retrieve_succeeded:

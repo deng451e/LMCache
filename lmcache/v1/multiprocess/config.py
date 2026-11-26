@@ -185,8 +185,8 @@ class MPServerConfig:
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
 
     @property
-    def deferred_drain_timeout_s(self) -> float:
-        """Seconds releasing an instance waits for its deferred transfers:
+    def off_stream_drain_timeout_s(self) -> float:
+        """Seconds releasing an instance waits for its off-stream transfers:
         the longest one can run (the peer load timeout) plus 1 s to cancel
         it."""
         return self.p2p_config.load_timeout + 1

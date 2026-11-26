@@ -62,27 +62,27 @@ reply is a possible follow-up.
 
 `transfer_kv_per_object_group` splits a group into runs by transfer engine
 (see [`lmcache_driven_transfer_copy_paths.md`](../../multiprocess/lmcache_driven_transfer_copy_paths.md)).
-Steps of peer-owned objects are **deferred, not staged**, and read without
+Steps of peer-owned objects are **handed off, not staged**, and read without
 blocking the retrieve.
 
 The shared transfer code has no NIC branch. For every retrieve step (a
 kernel batch of full chunks, or the unfull chunk) it asks
-`engines.deferred(engine, run)`. An engine that stages on the stream answers
+`engines.staged_off_stream(engine, run)`. An engine that stages on the stream answers
 False and the step is staged and launched as before. The NIC entry takes the
-step as a `DeferredRun` into the `collect_deferred_runs(...)` block the
+step as a `OffStreamRun` into the `collect_off_stream_runs(...)` block the
 handler wraps around its transfers. `platform/base` is not involved: the
 context's transfer callback still returns nothing. A caller without such a
 block gets `NotImplementedError` for a peer-owned object, as before.
-The handler knows only the generic interface (`DeferredRun`,
-`collect_deferred_runs`, `DeferredTransferEngine`), which the
+The handler knows only the generic interface (`OffStreamRun`,
+`collect_off_stream_runs`, `OffStreamEngine`), which the
 `object_group_transfer` package exports, and gets its engine from
-`create_deferred_engine(drain_timeout_s)`; the timeout is
-`MPServerConfig.deferred_drain_timeout_s` (the peer load timeout + 1 s). That
-interface and everything NIC-specific are in
-`object_group_transfer/nic_dma.py`.
+`create_off_stream_engine(drain_timeout_s)`; the timeout is
+`MPServerConfig.off_stream_drain_timeout_s` (the peer load timeout + 1 s). The
+interface is in `object_group_transfer/off_stream.py`; everything NIC-specific
+is in `object_group_transfer/nic_dma.py`.
 
 The runs reach the handler through a context variable
-(`collect_deferred_runs`) and not as a return value, because the transfer is
+(`collect_off_stream_runs`) and not as a return value, because the transfer is
 the cache context's `transfer_object_group` callback, declared in
 `platform/base` to return nothing: returning runs would change that interface
 for every platform. The variable is set only inside the handler's `with`
@@ -94,11 +94,11 @@ contexts' reads must not wait). `drain` waits for a creation in progress, and
 a creation that failed is not tried again for that context:
 
 ```
-RETRIEVE handler (affinity worker), inside collect_deferred_runs(deferred_runs):
+RETRIEVE handler (affinity worker), inside collect_off_stream_runs(off_stream_runs):
   host-memory and storage steps → staged and queued on the stream as usual
-  peer steps → engines.deferred() → DeferredRun in deferred_runs
+  peer steps → engines.staged_off_stream() → OffStreamRun in off_stream_runs
                (one per kernel batch, one for the unfull chunk; own block ids)
-  NicDmaEngine.read(cache_context, deferred_runs, finish) → DeferredResponse
+  NicDmaEngine.read(cache_context, off_stream_runs, finish) → DeferredResponse
                                                         worker is free again
 
 per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
@@ -147,7 +147,7 @@ Why it is built this way:
   backing off from 50 µs to 1 ms, and hands every step to the instance's
   affinity worker, which owns the slot pools.
 - **Own block ids.** The staged block ids live in a buffer the next transfer
-  restages, so a run gets its own copy when it is deferred (`defer_run`).
+  restages, so a run gets its own copy when it is handed off (`hand_off_run`).
 - **One staging interface.** The shared kernels take a `Staging` argument:
   the cache context for steps staged on the stream, or the NIC engine's view
   of the slots a run got. The slot mapping stays in `nic_dma.py`.

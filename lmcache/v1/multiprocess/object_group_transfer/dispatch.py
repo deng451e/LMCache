@@ -64,10 +64,10 @@ def transfer_kv_per_object_group(
 
     Raises:
         ValueError: If a None entry is found on retrieve.
-        ValueError: If a store targets an object whose engine defers.
+        ValueError: If a store targets an object whose engine is off-stream.
         NotImplementedError: If a retrieve meets such an object and
-            the caller collects no deferred runs
-            (:func:`collect_deferred_runs`).
+            the caller collects no off-stream runs
+            (:func:`collect_off_stream_runs`).
     """
     for engine, start, end in split_into_runs(memory_objs):
         chunk_range = (start, end)

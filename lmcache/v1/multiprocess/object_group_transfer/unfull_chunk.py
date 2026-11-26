@@ -13,12 +13,12 @@ from lmcache import device_ops
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.memory_management import MemoryObj
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
-    deferred,
     select_engine,
     stage,
+    staged_off_stream,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
     Staging,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -238,9 +238,9 @@ def transfer_unfull_chunk(
         direction: H2D (retrieve) or D2H (store).
 
     Raises:
-        ValueError: If a store targets an object whose engine defers.
+        ValueError: If a store targets an object whose engine is off-stream.
         NotImplementedError: If a retrieve meets such an object and
-            the caller collects no deferred runs.
+            the caller collects no off-stream runs.
 
     Notes:
         Always staged, by the engine ``memory_obj`` selects. An engine that
@@ -268,9 +268,9 @@ def transfer_unfull_chunk(
             staging,
         )
 
-    if is_h2d and deferred(
+    if is_h2d and staged_off_stream(
         engine,
-        lambda: DeferredRun(
+        lambda: OffStreamRun(
             [memory_obj], block_ids_gpu, targets, launch, spans_slots=True
         ),
     ):

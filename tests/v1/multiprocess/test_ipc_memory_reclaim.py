@@ -129,7 +129,7 @@ def test_unregister_drains_peer_reads_before_closing_the_context(
     engine.drain.side_effect = lambda cache_context: (
         order.append("drain") or drained
     )
-    monkeypatch.setattr(gpu_mod, "create_deferred_engine", lambda timeout_s: engine)
+    monkeypatch.setattr(gpu_mod, "create_off_stream_engine", lambda timeout_s: engine)
     monkeypatch.setattr(gpu_mod, "torch_dev", _FakeTorchDev())
     module = _module(monkeypatch)
     ctx = _register(module, monkeypatch, 7)

@@ -23,11 +23,11 @@ from lmcache.v1.mp_observability.event_bus import (
 )
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
-    deferred,
     stage,
+    staged_off_stream,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
     Staging,
 )
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
@@ -333,7 +333,7 @@ def _batch_run(
     skip_tokens_in_chunk: int,
     first: int,
     memory_objs: Sequence[MemoryObj],
-) -> DeferredRun:
+) -> OffStreamRun:
     """Describe one retrieve batch for an engine that stages outside the
     stream: its objects (chunks ``first`` to ``batch_len``) and its kernels."""
 
@@ -355,7 +355,7 @@ def _batch_run(
             staging,
         )
 
-    return DeferredRun(memory_objs, block_ids_gpu, targets, launch, skipped=first)
+    return OffStreamRun(memory_objs, block_ids_gpu, targets, launch, skipped=first)
 
 
 def run_staged_loop(
@@ -386,9 +386,9 @@ def run_staged_loop(
 
     Raises:
         ValueError: If a None entry is found on retrieve, or a store targets
-            an object whose engine defers.
+            an object whose engine is off-stream.
         NotImplementedError: If a retrieve meets such an object and
-            the caller collects no deferred runs.
+            the caller collects no off-stream runs.
     """
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager
@@ -441,7 +441,7 @@ def run_staged_loop(
             for chunk_idx in range(first, batch_len)
         ]
 
-        if is_h2d and deferred(
+        if is_h2d and staged_off_stream(
             engine,
             partial(
                 _batch_run,

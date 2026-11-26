@@ -19,13 +19,13 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
-    DeferredTransferEngine,
-    NicDmaEngine,
-    defer_run,
-)
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
 from lmcache.v1.multiprocess.object_group_transfer.nvme_dma import NvmeDmaEngine
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
+    OffStreamEngine,
+    hand_off_run,
+)
 import lmcache.lmcache_native as lmcache_native
 
 
@@ -39,7 +39,7 @@ class TransferEngine(enum.Enum):
     NIC_DMA = "nic_dma"
     """Object a peer owns: its bytes are read into GPU memory through the
     object's reader, retrieve only. Not
-    staged here: the transfer defers its runs to the NIC DMA engine
+    staged here: the transfer hands its runs to the NIC DMA engine
     (``nic_dma.py``), which reads them without blocking."""
 
 
@@ -88,12 +88,13 @@ _ENGINES: dict[TransferEngine, DMAEngine] = {
 }
 
 
-# Engines that stage outside the stream: their retrieve steps are deferred.
-_DEFERRING = frozenset({TransferEngine.NIC_DMA})
+# Engines whose bytes land off the stream: their retrieve steps are handed
+# to the off-stream engine.
+_OFF_STREAM = frozenset({TransferEngine.NIC_DMA})
 
 
-def create_deferred_engine(drain_timeout_s: float) -> DeferredTransferEngine:
-    """Return a new engine that runs the steps :func:`deferred` hands over.
+def create_off_stream_engine(drain_timeout_s: float) -> OffStreamEngine:
+    """Return a new engine that runs the steps :func:`staged_off_stream` hands over.
 
     Args:
         drain_timeout_s: How long its ``drain`` waits for a context's
@@ -122,23 +123,25 @@ def stage(
     Raises:
         ValueError: If a host-memory object and its region differ in size,
             or ``engine`` does not stage on the stream (see
-            :func:`deferred`), as for a store with such an engine.
+            :func:`staged_off_stream`), as for a store with such an engine.
     """
     if engine not in _ENGINES:
         raise ValueError(
             f"The {engine.value} engine does not stage on the stream: its "
-            "objects are only retrieved, as deferred steps"
+            "objects are only retrieved, as off-stream runs"
         )
     _ENGINES[engine].stage(memory_objs, buffers, direction)
 
 
-def deferred(engine: TransferEngine, make_run: Callable[[], DeferredRun]) -> bool:
+def staged_off_stream(
+    engine: TransferEngine, make_run: Callable[[], OffStreamRun]
+) -> bool:
     """Hand a retrieve step to ``engine`` if it stages outside the stream.
 
     Args:
         engine: The engine of every object of the step.
         make_run: Builds the step (its objects and the kernels that follow
-            them); called only for an engine that defers.
+            them); called only for an off-stream engine.
 
     Returns:
         True if the engine took the run and will stage it and launch its
@@ -146,12 +149,12 @@ def deferred(engine: TransferEngine, make_run: Callable[[], DeferredRun]) -> boo
         the caller stages and launches now.
 
     Raises:
-        NotImplementedError: If the engine defers and the caller of the
-            transfer collects no deferred runs.
+        NotImplementedError: If the engine is off-stream and the caller of
+            the transfer collects no off-stream runs.
     """
-    if engine not in _DEFERRING:
+    if engine not in _OFF_STREAM:
         return False
-    defer_run(make_run())
+    hand_off_run(make_run())
     return True
 
 

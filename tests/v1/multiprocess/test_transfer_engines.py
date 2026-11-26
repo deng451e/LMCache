@@ -22,14 +22,14 @@ from lmcache.v1.multiprocess.object_group_transfer import (
 )
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
-    deferred,
     select_engine,
     split_into_runs,
     stage,
+    staged_off_stream,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
-    collect_deferred_runs,
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
+    collect_off_stream_runs,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -73,26 +73,27 @@ def test_storing_into_an_object_a_peer_owns_is_rejected():
         )
 
 
-def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
-    """A caller that collects no deferred runs cannot read objects a peer
+def test_only_the_nic_engine_hands_a_retrieve_step_to_the_collector():
+    """A caller that collects no off-stream runs cannot read objects a peer
     owns, as before the NIC DMA engine."""
-    run = DeferredRun(
+    run = OffStreamRun(
         [_peer()], [torch.arange(2)], lambda staging: [], lambda staging, ids: None
     )
     built: list = []
 
-    def make_run() -> DeferredRun:
+    def make_run() -> OffStreamRun:
         built.append(run)
         return run
 
     # An engine that stages on the stream does not even build the run.
-    assert not deferred(GPU, make_run) and not deferred(NVME, make_run)
+    assert not staged_off_stream(GPU, make_run)
+    assert not staged_off_stream(NVME, make_run)
     assert built == []
     with pytest.raises(NotImplementedError):
-        deferred(NIC, make_run)
+        staged_off_stream(NIC, make_run)
     collected: list = []
-    with collect_deferred_runs(collected):
-        assert deferred(NIC, make_run)
+    with collect_off_stream_runs(collected):
+        assert staged_off_stream(NIC, make_run)
     assert [taken.memory_objs for taken in collected] == [run.memory_objs]
 
 

@@ -15,11 +15,11 @@ from lmcache.v1.multiprocess.object_group_transfer.dispatch import (
     transfer_kv_per_object_group,
 )
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
-    create_deferred_engine,
+    create_off_stream_engine,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredRun,
-    collect_deferred_runs,
+from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
+    OffStreamRun,
+    collect_off_stream_runs,
 )
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
     batched_iteration_with_skip,
@@ -35,10 +35,10 @@ from lmcache.v1.multiprocess.object_group_transfer.unfull_chunk import (
 )
 
 __all__ = [
-    "DeferredRun",
+    "OffStreamRun",
     "batched_iteration_with_skip",
-    "collect_deferred_runs",
-    "create_deferred_engine",
+    "collect_off_stream_runs",
+    "create_off_stream_engine",
     "direct_transfer_supported",
     "downsample_and_stage_block_ids",
     "get_unfull_chunk_layout_desc",
