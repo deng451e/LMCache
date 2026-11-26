@@ -55,29 +55,46 @@ reply is a possible follow-up.
 
 `transfer_kv_per_object_group` splits a group into runs by transfer engine
 (see [`lmcache_driven_transfer_copy_paths.md`](../../multiprocess/lmcache_driven_transfer_copy_paths.md)).
-Runs of peer-owned objects are **deferred, not staged**, and read without
-blocking the retrieve. `platform/base` is not involved: the context's
-transfer callback still returns nothing, so the transfer hands the runs to
-the `collect_peer_runs(...)` block the handler wraps around the call
-(`object_group_transfer/nic_dma.py`). A caller without such a block gets
-`NotImplementedError` for a peer-owned object, as before:
+Steps of peer-owned objects are **deferred, not staged**, and read without
+blocking the retrieve.
+
+The shared transfer code has no NIC branch. For every retrieve step (a
+kernel batch of full chunks, or the unfull chunk) it asks
+`engines.deferred(engine, run)`. An engine that stages on the stream answers
+False and the step is staged and launched as before. The NIC entry takes the
+step as a `DeferredNicRun` into the `collect_peer_runs(...)` block the
+handler wraps around its transfers. `platform/base` is not involved: the
+context's transfer callback still returns nothing. A caller without such a
+block gets `NotImplementedError` for a peer-owned object, as before.
+Everything NIC-specific is in `object_group_transfer/nic_dma.py`:
 
 ```
-RETRIEVE handler (affinity worker)
-  host-memory runs → queued on the stream as usual
-  peer runs        → collected as DeferredNicRun (one per kernel batch, own block ids)
-  NicDmaEngine.read(runs) → DeferredResponse              worker is free again
+RETRIEVE handler (affinity worker), inside collect_peer_runs(peer_runs):
+  host-memory and storage steps → staged and queued on the stream as usual
+  peer steps → engines.deferred() → DeferredNicRun in peer_runs
+               (one per kernel batch, one for the unfull chunk; own block ids)
+  NicDmaEngine.read(cache_context, peer_runs, finish) → DeferredResponse
+                                                        worker is free again
 
 per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
   take free slots of the NIC staging buffer (`_SlotPool`)
+  run.targets(view) → where each object lands; the view presents the run's
+      slots as the `Staging` the shared kernels read from
   one BorrowedReader.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
   HostPoller sees the reads finished → on the worker:
-      block kernels: NIC slots → paged KV, then record an event
+      run.launch(view, block ids): block kernels, NIC slots → paged KV,
+      then record an event
   HostPoller sees the event complete  → on the worker: slots free again
 
 after the last wave's kernels are queued (on the worker):
-  record the completion event, queue finish_read_by_owner, MP_RETRIEVE_END
+  finish(True): record the completion event, queue finish_read_by_owner,
+  MP_RETRIEVE_END
   → DeferredResponse = (event handle, True)
+
+instance unregistered or reaped:
+  NicDmaEngine.drain(cache_context, load timeout + 1 s)
+      new reads of the context fail at once; waves not started are dropped
+      waits for the reads in flight, then the context is closed
 ```
 
 Why it is built this way:
@@ -104,10 +121,14 @@ Why it is built this way:
   backing off from 50 µs to 1 ms, and hands every step to the instance's
   affinity worker, which owns the slot pools.
 - **Own block ids.** The staged block ids live in a buffer the next transfer
-  restages, so each run clones them on the stream when it is made.
+  restages, so a run gets its own copy when it is deferred (`defer_run`).
+- **One staging interface.** The shared kernels take a `Staging` argument:
+  the cache context for steps staged on the stream, or the NIC engine's view
+  of the slots a run got. The slot mapping stays in `nic_dma.py`.
 
-Under `--rocm-host-event-wait` the waiter completes the request from the
-handler's `DeferredResponse`. Only a retrieve of a borrowed object creates
+The affinity pool completes the request from the handler's
+`DeferredResponse`, and the poller posts every continuation back to the
+worker that asked (`current_worker_poster`). Only a retrieve of a borrowed object creates
 a NIC staging buffer, so copy mode never registers GPU memory and needs no
 GPUDirect support. Separate staging buffers
 and CUDA streams for GPU DMA and NVMe are a planned follow-up, needed once
