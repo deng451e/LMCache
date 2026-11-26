@@ -814,12 +814,11 @@ class P2PController(DiscoverableModule):
             write_enabled=self._p2p_config.enable_write,
             store_timeout_s=self._p2p_config.store_timeout,
             write_l1_usage_threshold=self._p2p_config.write_l1_usage_threshold,
-        )
-        if isinstance(config, GdrPeerL2AdapterConfig):
-            # Every node uses the same L1 read TTL: the local one bounds a lease.
-            config.read_ttl_s = self._ctx.storage_manager.get_l1_manager_by_tags(
+            # Every node uses the same L1 read TTL, so the local one is the peer's.
+            read_ttl_s=self._ctx.storage_manager.get_l1_manager_by_tags(
                 _P2P_L1_TAGS
-            ).config.read_ttl_seconds
+            ).config.read_ttl_seconds,
+        )
         try:
             adapter_id = self._ctx.storage_manager.add_l2_adapter(config)
         except Exception:

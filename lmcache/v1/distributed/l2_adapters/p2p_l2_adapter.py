@@ -139,6 +139,9 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
     - store_timeout_s: deadline for a store before it counts as a failure.
     - write_l1_usage_threshold: used fraction of the local DRAM L1 at which
       the ``p2p`` store policy starts storing objects into this peer.
+    - read_ttl_s: the L1 read-lock TTL, the same on every node; how long the
+      peer keeps a looked-up object locked. The P2P controller sets it from
+      the local L1.
     """
 
     def __init__(
@@ -150,8 +153,10 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         write_enabled: bool = False,
         store_timeout_s: float = 10.0,
         write_l1_usage_threshold: float = 0.7,
+        read_ttl_s: float = 300.0,
     ) -> None:
         super().__init__(peer_mq_server_url, lookup_timeout_s)
+        self.read_ttl_s = read_ttl_s
         self.peer_transfer_channel_server_url = peer_transfer_channel_server_url
         self.load_timeout_s = load_timeout_s
         self.write_enabled = write_enabled

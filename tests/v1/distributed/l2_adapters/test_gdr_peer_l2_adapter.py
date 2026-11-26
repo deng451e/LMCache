@@ -91,8 +91,8 @@ def _adapter(
             peer_transfer_channel_server_url="peer:7600",
             lookup_timeout_s=10.0,
             load_timeout_s=load_timeout_s,
+            read_ttl_s=read_ttl_s,
         )
-        config.read_ttl_s = read_ttl_s
         adapter = GdrPeerL2Adapter(config)
         try:
             yield adapter, req_client, tc_ctx, tc_client

@@ -134,12 +134,8 @@ class GdrPeerL2AdapterConfig(P2PL2AdapterConfig):
     """Config for a GPU-direct borrowing peer: the P2P fields.
 
     ``load_timeout_s`` bounds each retrieve-time read into GPU memory; a
-    read past it is cancelled.
+    read past it is cancelled. ``read_ttl_s`` bounds a lease.
     """
-
-    read_ttl_s: float = 300.0
-    """The L1 read-lock TTL, the same on every node; bounds a lease. The P2P
-    controller sets it from the local L1."""
 
     @classmethod
     def help(cls) -> str:
