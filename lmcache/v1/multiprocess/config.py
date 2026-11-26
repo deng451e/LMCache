@@ -185,6 +185,13 @@ class MPServerConfig:
     """Out-of-tree ``DiscoverableModule`` classes to import explicitly."""
 
     @property
+    def deferred_drain_timeout_s(self) -> float:
+        """Seconds releasing an instance waits for its deferred transfers:
+        the longest one can run (the peer load timeout) plus 1 s to cancel
+        it."""
+        return self.p2p_config.load_timeout + 1
+
+    @property
     def enable_dedup_content(self) -> bool:
         """Deprecated alias of :attr:`enable_dedup_content_fingerprint`."""
         return self.enable_dedup_content_fingerprint
@@ -241,12 +248,16 @@ class _P2PLoadMode:
     """Registered L2 adapter type that connects each peer."""
 
     borrows: bool
-    """Peers' objects stay on the peer and are indexed by a shadow L1."""
+    """Peers' objects stay on the peer and are indexed by a shadow L1; such a
+    mode never stores into a peer."""
+
+    transfer_engine: str | None = None
+    """The only transfer engine the mode works with; None for any."""
 
 
 _P2P_LOAD_MODES = {
     "l1": _P2PLoadMode("p2p", borrows=False),
-    "gdr": _P2PLoadMode("p2p_gdr", borrows=True),
+    "gdr": _P2PLoadMode("p2p_gdr", borrows=True, transfer_engine="nixl"),
 }
 
 
@@ -297,15 +308,18 @@ class P2PConfig:
 
         Raises:
             ValueError: If the store timeout is not positive, the usage
-                threshold is outside (0, 1], or ``gdr`` load mode is combined
-                with writes or with a transfer engine other than ``nixl``.
+                threshold is outside (0, 1], or the load mode does not work
+                with the transfer engine or with writes.
         """
-        if self.load_mode == "gdr" and (
-            self.enable_write or self.transfer_engine != "nixl"
-        ):
+        mode = _P2P_LOAD_MODES[self.load_mode]
+        if mode.transfer_engine not in (None, self.transfer_engine):
             raise ValueError(
-                "--p2p-load-mode gdr needs --p2p-transfer-engine nixl and "
-                "excludes --enable-p2p-write"
+                f"--p2p-load-mode {self.load_mode} needs --p2p-transfer-engine "
+                f"{mode.transfer_engine}"
+            )
+        if mode.borrows and self.enable_write:
+            raise ValueError(
+                f"--p2p-load-mode {self.load_mode} excludes --enable-p2p-write"
             )
         if self.store_timeout <= 0:
             raise ValueError(f"P2P store timeout must be > 0, got {self.store_timeout}")

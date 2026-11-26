@@ -270,7 +270,9 @@ def transfer_unfull_chunk(
 
     if is_h2d and deferred(
         engine,
-        DeferredRun([memory_obj], block_ids_gpu, targets, launch, spans_slots=True),
+        lambda: DeferredRun(
+            [memory_obj], block_ids_gpu, targets, launch, spans_slots=True
+        ),
     ):
         return
     if is_h2d:

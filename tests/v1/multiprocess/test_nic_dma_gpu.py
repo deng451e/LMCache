@@ -109,7 +109,7 @@ def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> No
             buffer.copy_(src) for src, buffer in zip(srcs, buffers, strict=True)
         ],
     )
-    engine = nic_dma.NicDmaEngine(HostPoller())
+    engine = nic_dma.NicDmaEngine(30, HostPoller())
     try:
         with torch.cuda.stream(nic_ctx.stream):
             ids = downsample_and_stage_block_ids(nic_ctx, [list(_BLOCK_IDS)] * 2)

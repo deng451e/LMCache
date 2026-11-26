@@ -6,7 +6,7 @@ regions hold (a full chunk, an unfull chunk) is the caller's business.
 """
 
 # Standard
-from typing import Protocol, Sequence
+from typing import Callable, Protocol, Sequence
 import enum
 
 # Third Party
@@ -33,13 +33,12 @@ class TransferEngine(enum.Enum):
     """How an L1 object's bytes travel to or from GPU memory."""
 
     GPU_DMA = "gpu_dma"
-    """Host memory (DRAM, DevDAX, a borrowed object bound to a local view):
-    a host/GPU copy."""
+    """Host memory (DRAM, DevDAX): a host/GPU copy."""
     NVME_DMA = "nvme_dma"
     """Storage-backed object: a file read or write against GPU memory."""
     NIC_DMA = "nic_dma"
-    """Borrowed object bound to a reader: its bytes are not mapped locally
-    and are read into GPU memory through the reader, retrieve only. Not
+    """Object a peer owns: its bytes are read into GPU memory through the
+    object's reader, retrieve only. Not
     staged here: the transfer defers its runs to the NIC DMA engine
     (``nic_dma.py``), which reads them without blocking."""
 
@@ -55,7 +54,7 @@ def select_engine(memory_obj: MemoryObj) -> TransferEngine:
     """
     if isinstance(memory_obj, GDSMemoryObject):
         return TransferEngine.NVME_DMA
-    if isinstance(memory_obj, BorrowedMemoryObj) and not memory_obj.is_local:
+    if isinstance(memory_obj, BorrowedMemoryObj):
         return TransferEngine.NIC_DMA
     return TransferEngine.GPU_DMA
 
@@ -93,9 +92,14 @@ _ENGINES: dict[TransferEngine, DMAEngine] = {
 _DEFERRING = frozenset({TransferEngine.NIC_DMA})
 
 
-def create_deferred_engine() -> DeferredTransferEngine:
-    """Return a new engine that runs the steps :func:`deferred` hands over."""
-    return NicDmaEngine()
+def create_deferred_engine(drain_timeout_s: float) -> DeferredTransferEngine:
+    """Return a new engine that runs the steps :func:`deferred` hands over.
+
+    Args:
+        drain_timeout_s: How long its ``drain`` waits for a context's
+            retrieves.
+    """
+    return NicDmaEngine(drain_timeout_s)
 
 
 def stage(
@@ -128,15 +132,16 @@ def stage(
     _ENGINES[engine].stage(memory_objs, buffers, direction)
 
 
-def deferred(engine: TransferEngine, run: DeferredRun) -> bool:
+def deferred(engine: TransferEngine, make_run: Callable[[], DeferredRun]) -> bool:
     """Hand a retrieve step to ``engine`` if it stages outside the stream.
 
     Args:
-        engine: The engine of every object in ``run``.
-        run: The step: its objects and the kernels that follow them.
+        engine: The engine of every object of the step.
+        make_run: Builds the step (its objects and the kernels that follow
+            them); called only for an engine that defers.
 
     Returns:
-        True if the engine took ``run`` and will stage it and launch its
+        True if the engine took the run and will stage it and launch its
         kernels later; False for an engine that stages on the stream, where
         the caller stages and launches now.
 
@@ -146,7 +151,7 @@ def deferred(engine: TransferEngine, run: DeferredRun) -> bool:
     """
     if engine not in _DEFERRING:
         return False
-    defer_run(run)
+    defer_run(make_run())
     return True
 
 

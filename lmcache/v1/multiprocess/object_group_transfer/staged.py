@@ -3,6 +3,7 @@
 as one native plan (host-memory objects only) or one batch at a time."""
 
 # Standard
+from functools import partial
 from typing import Any, Sequence
 
 # Third Party
@@ -442,7 +443,8 @@ def run_staged_loop(
 
         if is_h2d and deferred(
             engine,
-            _batch_run(
+            partial(
+                _batch_run,
                 cache_context,
                 block_ids_gpu,
                 object_group_id,

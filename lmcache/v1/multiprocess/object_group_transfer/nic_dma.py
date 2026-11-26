@@ -21,7 +21,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Callable, Protocol, Sequence, runtime_checkable
+from typing import Callable, Protocol, Sequence, runtime_checkable
 import threading
 import weakref
 
@@ -45,10 +45,6 @@ from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.stream import record_completion_event
-
-if TYPE_CHECKING:
-    # First Party
-    from lmcache.v1.multiprocess.config import MPServerConfig
 
 logger = init_logger(__name__)
 
@@ -166,14 +162,6 @@ def defer_run(run: DeferredRun) -> None:
 
 class DeferredTransferEngine(Protocol):
     """Runs the deferred runs of retrieves without blocking the worker."""
-
-    def configure(self, mp_config: "MPServerConfig") -> None:
-        """Take what the engine needs from the server configuration.
-
-        Args:
-            mp_config: The server configuration.
-        """
-        ...
 
     def read(
         self,
@@ -298,6 +286,8 @@ class _SlotView:
     def get_temp_staging_buffer(self, num_bytes: int) -> torch.Tensor | None:
         flat = self._buffer.buffer
         start = self.get_temp_object_group_buffer(0, 0).data_ptr() - flat.data_ptr()
+        if start + num_bytes > flat.nbytes:
+            return None
         return flat[start : start + num_bytes]
 
     def _slot(self, batch_idx: int) -> int:
@@ -523,15 +513,24 @@ class NicDmaEngine:
     rows for an unfull chunk, registered with the transfer channel.
 
     Args:
+        drain_timeout_s: How long :meth:`drain` waits: the longest a read
+            can run, plus the time to cancel it.
         poller: Watches reads and kernel events; started on first use if None.
     """
 
-    def __init__(self, poller: HostPoller | None = None) -> None:
+    def __init__(
+        self, drain_timeout_s: float, poller: HostPoller | None = None
+    ) -> None:
+        self._drain_timeout_s = drain_timeout_s
         self._poller = poller
-        # How long drain() waits; configure() sets it from the load timeout.
-        self._drain_timeout_s = 31.0
         self._closed = False
         self._lock = threading.Lock()
+        # Contexts whose staging buffer is being created, outside the lock;
+        # drain() waits for them.
+        self._creating: set[int] = set()
+        self._created = threading.Condition(self._lock)
+        # Contexts whose staging buffer could not be created: not retried.
+        self._uncreatable: weakref.WeakSet[BaseCacheContext] = weakref.WeakSet()
         # By id(context); drain() removes a context's entry before the
         # context can be freed and its id reused.
         self._staging: dict[int, _NicStaging] = {}
@@ -540,15 +539,6 @@ class NicDmaEngine:
         # Buffers being drained, for close() to wake the wait. One whose
         # reads did not stop in time stays: it is never freed.
         self._draining: list[_NicStaging] = []
-
-    def configure(self, mp_config: "MPServerConfig") -> None:
-        """Bound :meth:`drain` by the peer load timeout: a read past it is
-        cancelled, so one more second covers the cancel.
-
-        Args:
-            mp_config: The server configuration.
-        """
-        self._drain_timeout_s = mp_config.p2p_config.load_timeout + 1
 
     def read(
         self,
@@ -566,8 +556,8 @@ class NicDmaEngine:
                 and stream: True after the last run's
                 kernels are queued; False once a read failed or was abandoned
                 and every started read stopped (later runs are not read), or
-                at once if the NIC staging buffer cannot be created or
-                :meth:`drain` was called for the context.
+                at once if the NIC staging buffer cannot be created (tried
+                once per context) or :meth:`drain` was called for the context.
 
         Returns:
             A response completed with ``finish``'s result or exception.
@@ -579,17 +569,17 @@ class NicDmaEngine:
             # Under the lock, so that drain() either counts this retrieve or
             # makes it fail.
             staging = None
+            create = False
             if cache_context not in self._released:
-                try:
-                    staging = self._staging.get(id(cache_context)) or self._create(
-                        cache_context
-                    )
-                except Exception:
-                    # Allocation and registration errors have many types.
-                    logger.exception("Cannot create the NIC staging buffer")
-                else:
+                staging = self._staging.get(id(cache_context))
+                if staging is not None:
                     with staging.idle:
                         staging.active += 1
+                elif cache_context not in self._uncreatable:
+                    create = True
+                    self._creating.add(id(cache_context))
+        if create:
+            staging = self._create_counted(cache_context)
         if staging is None:
             response = DeferredResponse()
             _complete(cache_context, response, finish, False)
@@ -608,7 +598,7 @@ class NicDmaEngine:
 
         Args:
             cache_context: The context about to be closed.
-            timeout_s: How long to wait; the configured timeout if None.
+            timeout_s: How long to wait; the engine's timeout if None.
 
         Returns:
             False if a retrieve is still running after ``timeout_s``: the
@@ -619,6 +609,10 @@ class NicDmaEngine:
             timeout_s = self._drain_timeout_s
         with self._lock:
             self._released.add(cache_context)
+            if not self._created.wait_for(
+                lambda: id(cache_context) not in self._creating, timeout_s
+            ):
+                return False
             staging = self._staging.pop(id(cache_context), None)
             if staging is None:
                 return True
@@ -646,6 +640,34 @@ class NicDmaEngine:
             with staging.idle:
                 staging.idle.notify_all()
 
+    def _create_counted(self, cache_context: BaseCacheContext) -> _NicStaging | None:
+        """Create the context's staging buffer and count the calling retrieve
+        on it; None if it cannot be created or :meth:`drain` ran meanwhile.
+
+        Runs outside the lock: it allocates and registers hundreds of MiB,
+        and other contexts' reads must not wait for that. One context's
+        reads run on one worker, so only one of them gets here.
+        """
+        created = None
+        try:
+            created = self._create(cache_context)
+        except Exception:
+            # Allocation and registration errors have many types.
+            logger.exception("Cannot create the NIC staging buffer")
+        with self._lock:
+            self._creating.discard(id(cache_context))
+            self._created.notify_all()
+            if created is None:
+                self._uncreatable.add(cache_context)
+            elif cache_context in self._released:
+                # The context deregisters the buffer when it is closed.
+                created = None
+            else:
+                self._staging[id(cache_context)] = created
+                with created.idle:
+                    created.active += 1
+        return created
+
     def _create(self, cache_context: BaseCacheContext) -> _NicStaging:
         if not isinstance(cache_context, StagingBufferFactory):
             raise NotImplementedError(
@@ -666,8 +688,6 @@ class NicDmaEngine:
             buffer.buffer.nbytes >> 20,
             cache_context.device,
         )
-        staging = _NicStaging(
+        return _NicStaging(
             buffer, registration, _SlotPool(range(num_slots)), _SlotPool([num_slots])
         )
-        self._staging[id(cache_context)] = staging
-        return staging

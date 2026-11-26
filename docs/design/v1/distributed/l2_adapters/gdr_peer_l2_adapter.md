@@ -76,8 +76,22 @@ block gets `NotImplementedError` for a peer-owned object, as before.
 The handler knows only the generic interface (`DeferredRun`,
 `collect_deferred_runs`, `DeferredTransferEngine`), which the
 `object_group_transfer` package exports, and gets its engine from
-`create_deferred_engine()`. That interface and everything NIC-specific are
-in `object_group_transfer/nic_dma.py`:
+`create_deferred_engine(drain_timeout_s)`; the timeout is
+`MPServerConfig.deferred_drain_timeout_s` (the peer load timeout + 1 s). That
+interface and everything NIC-specific are in
+`object_group_transfer/nic_dma.py`.
+
+The runs reach the handler through a context variable
+(`collect_deferred_runs`) and not as a return value, because the transfer is
+the cache context's `transfer_object_group` callback, declared in
+`platform/base` to return nothing: returning runs would change that interface
+for every platform. The variable is set only inside the handler's `with`
+block, on the worker thread that runs the transfer.
+
+The engine creates a context's NIC staging buffer on its first read, outside
+the engine lock (it allocates and registers hundreds of MiB, and other
+contexts' reads must not wait). `drain` waits for a creation in progress, and
+a creation that failed is not tried again for that context:
 
 ```
 RETRIEVE handler (affinity worker), inside collect_deferred_runs(deferred_runs):

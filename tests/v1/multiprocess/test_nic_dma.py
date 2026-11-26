@@ -171,7 +171,7 @@ def h(monkeypatch):
     monkeypatch.setattr(nic_dma, "record_completion_event", record)
     monkeypatch.setattr(nic_dma, "NIC_STAGING_BYTES", OBJ)  # floor: 2 batches
     poller = _Poller()
-    engine = nic_dma.NicDmaEngine(poller)  # type: ignore[arg-type]
+    engine = nic_dma.NicDmaEngine(30, poller)  # type: ignore[arg-type]
     p = _Reader("p", log)
 
     def runs(objs, skip=0, block_ids=None):
@@ -280,7 +280,8 @@ def test_a_staging_buffer_that_cannot_be_created_fails_the_retrieve(h) -> None:
     h.cc.create_staging_buffer.side_effect = RuntimeError("no GPUDirect RDMA")
     response, outcome = h.retrieve("ab")
     assert outcome == [False] and response.result(timeout=1) is False
-    assert _reads(h.log) == []
+    h.retrieve("cd")  # not tried again
+    assert _reads(h.log) == [] and h.cc.create_staging_buffer.call_count == 1
 
 
 def _drain(h) -> threading.Thread:

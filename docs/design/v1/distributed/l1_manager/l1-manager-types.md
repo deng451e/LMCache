@@ -120,13 +120,9 @@ finish_write_and_reserve_read ──► resident, read-locked ──► readers
   borrower wants `(segment, SHADOW)` first, so tag affinity binds it there.
 - **`BorrowedMemoryObj`** (`lmcache/v1/memory_management.py`, with the other
   memory objects) is a placeholder until the borrower's load binds it to a
-  lease and to the bytes, in one of two ways, so every borrowing adapter
-  shares it. With a `BorrowedReader` the bytes are not addressable here (a
-  peer's DRAM) and are read into a device region at retrieve time; the
-  object has no tensor. With a `local_view` the owner's bytes are mapped
-  into this process (a shared CXL slab, another server's shared memory); the
-  object exposes that view, `is_local` is True and it is retrieved as host
-  memory. The GDR adapter binds readers; no adapter binds a local view yet.
+  lease and to a `BorrowedReader`, so every borrowing adapter shares it. The
+  bytes are not addressable here (a peer's DRAM) and are read into a device
+  region at retrieve time; the object has no tensor.
   `Lease` and `PendingRead`, defined beside it, are the borrower's contract
   types.
 - **No capacity check** in `reserve_write`; every placeholder is temporary.

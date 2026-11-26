@@ -46,8 +46,8 @@ def _storage() -> MemoryObj:
     return MagicMock(spec=GDSMemoryObject)
 
 
-def _peer(is_local: bool = False) -> MemoryObj:
-    return MagicMock(spec=BorrowedMemoryObj, is_local=is_local)
+def _peer() -> MemoryObj:
+    return MagicMock(spec=BorrowedMemoryObj)
 
 
 def _objects(pattern: str) -> list[MemoryObj | None]:
@@ -61,8 +61,6 @@ def test_engine_follows_the_object_type():
     assert select_engine(_host()) is GPU
     assert select_engine(_storage()) is NVME
     assert select_engine(_peer()) is NIC
-    # A borrowed object mapped into this process is host memory.
-    assert select_engine(_peer(is_local=True)) is GPU
 
 
 def test_storing_into_an_object_a_peer_owns_is_rejected():
@@ -81,12 +79,20 @@ def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
     run = DeferredRun(
         [_peer()], [torch.arange(2)], lambda staging: [], lambda staging, ids: None
     )
-    assert not deferred(GPU, run) and not deferred(NVME, run)
+    built: list = []
+
+    def make_run() -> DeferredRun:
+        built.append(run)
+        return run
+
+    # An engine that stages on the stream does not even build the run.
+    assert not deferred(GPU, make_run) and not deferred(NVME, make_run)
+    assert built == []
     with pytest.raises(NotImplementedError):
-        deferred(NIC, run)
+        deferred(NIC, make_run)
     collected: list = []
     with collect_deferred_runs(collected):
-        assert deferred(NIC, run)
+        assert deferred(NIC, make_run)
     (taken,) = collected
     assert taken.memory_objs is run.memory_objs
     assert taken.block_ids[0] is not run.block_ids[0]

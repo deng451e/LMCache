@@ -244,18 +244,23 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         mode = build_ctx.mp_config.supported_transfer_mode
         if mode == "engine_driven":
             return None
-        module = cls(
+        return cls(
             build_ctx.engine_context,
             fd_socket_path=fd_channel_path(build_ctx.mp_config.port),
+            deferred_drain_timeout_s=build_ctx.mp_config.deferred_drain_timeout_s,
         )
-        module._deferred_engine.configure(build_ctx.mp_config)
-        return module
 
-    def __init__(self, ctx: MPCacheServerContext, fd_socket_path: str = "") -> None:
+    def __init__(
+        self,
+        ctx: MPCacheServerContext,
+        fd_socket_path: str = "",
+        deferred_drain_timeout_s: float = 30.0,
+    ) -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
-        # Runs the retrieve steps that transfers defer, without blocking.
-        self._deferred_engine = create_deferred_engine()
+        # Runs the retrieve steps that transfers defer, without blocking;
+        # releasing an instance waits that long for them.
+        self._deferred_engine = create_deferred_engine(deferred_drain_timeout_s)
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
         # report_status all serialize through this lock. Held only for dict

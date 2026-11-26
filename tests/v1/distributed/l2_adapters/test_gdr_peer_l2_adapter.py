@@ -361,6 +361,14 @@ def test_close_refuses_while_handles_are_live_then_drains() -> None:
         assert adapter.report_status()["local_borrows"] == 0
 
 
+def test_only_the_borrowing_config_needs_a_read_ttl_above_the_load_timeout() -> None:
+    """The P2P controller asks the load mode's config class at startup."""
+    p2p_mod.P2PL2AdapterConfig.check_timeouts(read_ttl_s=5, load_timeout_s=30)
+    GdrPeerL2AdapterConfig.check_timeouts(read_ttl_s=32, load_timeout_s=30)
+    with pytest.raises(ValueError, match="l1-read-ttl-seconds"):
+        GdrPeerL2AdapterConfig.check_timeouts(read_ttl_s=31, load_timeout_s=30)
+
+
 def test_gdr_mode_adds_a_dram_shadow_l1_once() -> None:
     """The server derives the shadow L1 a GDR borrower needs from the load
     mode: appended after the owned L1s, with their lock TTLs, and left alone
