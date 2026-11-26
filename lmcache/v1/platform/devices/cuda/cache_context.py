@@ -375,9 +375,9 @@ class GPUCacheContext(BaseCacheContext):
         # Kept for close(): raw-IPC wrappers hold driver-level mappings
         # that pin the exporter's device memory until explicitly closed.
         self._kv_wrappers: KVCache = list(kv_caches)
-        self._buffer_registration: BufferRegistration | None = None
-        # Buffers from create_staging_buffer, deregistered by close().
-        self._extra_staging: list[tuple[_TempGPUBuffer, BufferRegistration]] = []
+        # Registered staging buffers (the shared one, and any from
+        # create_staging_buffer), deregistered by close().
+        self._registered_staging: list[tuple[_TempGPUBuffer, BufferRegistration]] = []
         try:
             self._init_impl(
                 kv_caches,
@@ -521,7 +521,7 @@ class GPUCacheContext(BaseCacheContext):
         """
         with torch_dev.stream(self.cuda_stream_):
             registration.register(self._temp_buffer.buffer)
-        self._buffer_registration = registration
+        self._registered_staging.append((self._temp_buffer, registration))
 
     def create_staging_buffer(
         self,
@@ -554,7 +554,7 @@ class GPUCacheContext(BaseCacheContext):
         )
         with torch_dev.stream(self.cuda_stream_):
             registration.register(staging.buffer)
-        self._extra_staging.append((staging, registration))
+        self._registered_staging.append((staging, registration))
         return staging
 
     def close(self) -> None:
@@ -570,14 +570,10 @@ class GPUCacheContext(BaseCacheContext):
         right after this call.
         """
         self.cuda_stream_.synchronize()
-        if self._buffer_registration is not None:
-            with torch_dev.stream(self.cuda_stream_):
-                self._buffer_registration.deregister(self._temp_buffer.buffer)
-            self._buffer_registration = None
         with torch_dev.stream(self.cuda_stream_):
-            for staging, registration in self._extra_staging:
+            for staging, registration in self._registered_staging:
                 registration.deregister(staging.buffer)
-        self._extra_staging = []
+        self._registered_staging = []
         self._close_kv_wrappers()
 
     def _close_kv_wrappers(self) -> None:
