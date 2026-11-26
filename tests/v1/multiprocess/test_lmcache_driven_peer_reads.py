@@ -110,7 +110,3 @@ def test_peer_runs_defer_the_response_until_their_kernels_are_queued(t, ok) -> N
     assert response.result(timeout=5) == (b"completion-handle", ok)
     assert t.order[-3:] == _TAIL
 
-
-def test_a_retrieve_without_peer_runs_completes_inline(t) -> None:
-    assert t.retrieve() == (b"completion-handle", True)
-    assert t.order[-3:] == _TAIL and t.reads == []

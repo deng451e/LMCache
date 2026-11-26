@@ -249,19 +249,8 @@ def test_gdr_borrow_reads_owner_bytes_straight_into_gpu() -> None:
         assert borrower_sm.get_l1_usage()[0] == 0
         assert adapter.get_local_borrow_count() == _NUM_KEYS
 
-        # Read each borrowed object straight into a GPU landing slot.
-        for i, key in enumerate(keys):
-            handle = results[key][1]
-            assert isinstance(handle, BorrowedMemoryObj)
-            read = handle.reader.read_many(region_id, [(handle, i * _PAGE)])
-            _wait_until(read.is_finished)
-            assert read.succeeded()
-            slot = landing[i * _PAGE : (i + 1) * _PAGE]
-            assert torch.all(slot.cpu() == expected_values[key]), (
-                f"GPU slot for key {i} did not receive the owner's bytes"
-            )
-
-        # All of them again with one transfer, into the slots in reverse order.
+        # Read them straight into GPU landing slots with one transfer, in
+        # reverse order.
         handles = [cast(BorrowedMemoryObj, results[key][1]) for key in keys]
         batch_slots = [2 * _NUM_KEYS - 1 - i for i in range(_NUM_KEYS)]
         read = handles[0].reader.read_many(

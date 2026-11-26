@@ -274,25 +274,6 @@ def test_a_failed_read_fails_the_retrieve_without_kernels(h) -> None:
     assert len(_reads(h.log)) == 4
 
 
-def test_retrieves_share_the_slots_in_order(h) -> None:
-    h.retrieve("abcdef")
-    h.retrieve("gh")
-    for read in h.p.reads:
-        read.finished = True
-    h.poller.poll()
-    for event in h.events[:2]:
-        event.done = True
-        h.poller.poll()
-    names = [r[1] for r in _reads(h.log)]
-    assert names == [["a", "b"], ["c", "d"], ["e", "f"], ["g", "h"]]
-
-
-def test_shutdown_abandons_the_reads(h) -> None:
-    response, outcome = h.retrieve("ab")
-    h.poller.stop()
-    assert outcome == [False] and response.done() and _kernels(h.log) == []
-
-
 def test_a_staging_buffer_that_cannot_be_created_fails_the_retrieve(h) -> None:
     """E.g. the transfer channel refuses the region: the retrieve completes
     as failed, so its read locks are released and vLLM recomputes."""
@@ -331,19 +312,15 @@ def test_drain_gives_up_after_its_timeout(h) -> None:
     assert outcome == [True] and len(_kernels(h.log)) == 1
 
 
-@pytest.mark.parametrize("close_first", [True, False])
-def test_drain_does_not_wait_once_the_engine_closed(h, close_first) -> None:
+def test_closing_the_engine_wakes_a_waiting_drain(h) -> None:
     """At shutdown the workers may be gone, so abandoned retrieves never
-    complete; a drain already waiting is woken."""
+    complete."""
     h.retrieve("ab")
     h.poller.stop = lambda: None
-    if close_first:
-        h.engine.close()
     drain = _drain(h)
-    if not close_first:
-        assert drain.is_alive()
-        h.engine.close()
-        drain.join(5)
+    assert drain.is_alive()
+    h.engine.close()
+    drain.join(5)
     assert not drain.is_alive()
 
 

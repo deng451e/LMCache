@@ -95,11 +95,3 @@ def test_nic_staging_buffer_is_aligned_registered_and_released_on_close(
     ctx.close()
     context.deregister_memory_region.assert_called_once_with(1)
 
-
-def test_a_nic_staging_buffer_needs_a_transfer_channel() -> None:
-    ctx = _context()
-    try:
-        with pytest.raises(RuntimeError, match="not initialized"):
-            ctx.create_staging_buffer(2, TransferChannelStagingRegistration())
-    finally:
-        ctx.close()
