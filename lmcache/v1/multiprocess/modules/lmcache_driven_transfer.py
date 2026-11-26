@@ -1249,9 +1249,13 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             gpu_block_ids, blocks_per_chunk, num_chunks, bool(unfull_obj_keys)
         )
 
+        # Steps the transfers hand off: the off-stream engine runs them once
+        # everything else is queued.
+        off_stream_runs: list[OffStreamRun] = []
         with (
             torch_dev.device(cache_context.device),
             torch_dev.stream(cache_context.stream),
+            collect_off_stream_runs(off_stream_runs),
         ):
             event = event_backend.create_event(cache_context.device)
 
@@ -1333,9 +1337,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             total_bytes = 0
             num_tokens = 0
-            # Steps the transfers handed off: the off-stream engine runs them
-            # once everything else is queued.
-            off_stream_runs: list[OffStreamRun] = []
             retrieve_succeeded = True
             try:
                 for obj_group_id in range(num_object_groups):
@@ -1357,33 +1358,31 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
-                    with collect_off_stream_runs(off_stream_runs):
-                        cache_context.transfer_object_group(
-                            block_ids_per_group_gpu,
-                            memory_objs,
-                            object_group_id=obj_group_id,
-                            batch_size=cache_context.max_batch_size,
-                            skip_first_n_tokens=skip_first_n_tokens,
-                            direction=lmcache_native.TransferDirection.H2D,
-                            transfer_key=transfer_key,
-                            block_ids_host=gpu_block_ids,
-                        )
+                    cache_context.transfer_object_group(
+                        block_ids_per_group_gpu,
+                        memory_objs,
+                        object_group_id=obj_group_id,
+                        batch_size=cache_context.max_batch_size,
+                        skip_first_n_tokens=skip_first_n_tokens,
+                        direction=lmcache_native.TransferDirection.H2D,
+                        transfer_key=transfer_key,
+                        block_ids_host=gpu_block_ids,
+                    )
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
-                    with collect_off_stream_runs(off_stream_runs):
-                        total_bytes += self._retrieve_unfull_chunk_objects(
-                            cache_context,
-                            key,
-                            unfull_retained_keys,
-                            [
-                                group
-                                for group in range(num_object_groups)
-                                if group not in skipped_groups
-                            ],
-                            unfull_block_ids,
-                            max(0, skip_first_n_tokens - num_chunks * chunk_size),
-                            chunk_size,
-                        )
+                    total_bytes += self._retrieve_unfull_chunk_objects(
+                        cache_context,
+                        key,
+                        unfull_retained_keys,
+                        [
+                            group
+                            for group in range(num_object_groups)
+                            if group not in skipped_groups
+                        ],
+                        unfull_block_ids,
+                        max(0, skip_first_n_tokens - num_chunks * chunk_size),
+                        chunk_size,
+                    )
                     prefetched_keys.extend(unfull_retained_keys)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
