@@ -162,12 +162,12 @@ mixed DRAM + GDS retrieves are supported.
 
 ## Peer clients
 
-The transfer channel keeps one client per peer URL. A GDR adapter whose
-removal waits for its leases (see Failures) can still hold that client when
-the controller adds a new adapter for the same peer. Adapters therefore take
-the client with `acquire_transfer_channel_client` and give it back with
-`release_transfer_channel_client`; the client is removed only when its last
-user releases it.
+The transfer channel keeps one client per peer URL, and an adapter's close
+removes it, as on the copying adapter. A GDR adapter whose removal waits for
+its leases (see Failures) still holds that client, so the P2P controller does
+not add an adapter for the same transfer URL until that removal completed:
+there is one adapter per peer at a time. A peer that comes back meanwhile is
+a miss for at most one read TTL.
 
 ## Failures
 

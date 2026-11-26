@@ -32,9 +32,7 @@ from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import (
 )
 from lmcache.v1.distributed.transfer_channel import (
     TransferChannelClient,
-    acquire_transfer_channel_client,
     get_transfer_channel_context,
-    release_transfer_channel_client,
 )
 from lmcache.v1.memory_management import BorrowedMemoryObj, Lease, PendingRead
 
@@ -196,15 +194,12 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             RuntimeError: If the transfer context is unavailable or setup fails.
         """
         self._tc_context = get_transfer_channel_context()
-        # Shared with any other adapter of the same peer, for example one
-        # re-added while this one's removal waits for its leases to end.
-        self._tc_client = acquire_transfer_channel_client(
-            self._tc_context, self._config.peer_transfer_channel_server_url
+        self._tc_client = self._tc_context.get_transfer_channel_client(
+            self._config.peer_transfer_channel_server_url
         )
 
     def _unregister_peer_region(self) -> None:
-        """Drain the unlocks, then release this adapter's use of the peer's
-        transfer-channel client (the last user removes it).
+        """Drain the unlocks, then drop the peer's transfer-channel client.
 
         Raises:
             RuntimeError: If a lease is still live or a read is in flight;
@@ -214,8 +209,8 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             if self._reads_in_flight:
                 raise RuntimeError("Cannot close GdrPeerL2Adapter with reads in flight")
         self._drain_borrows_for_close()
-        release_transfer_channel_client(
-            self._tc_context, self._config.peer_transfer_channel_server_url
+        self._tc_context.remove_transfer_channel_client(
+            self._config.peer_transfer_channel_server_url
         )
 
     def get_memory_tags(self) -> MemoryTags:

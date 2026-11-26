@@ -42,8 +42,6 @@ __all__ = [
     "get_transfer_channel_context",
     "delete_transfer_channel_context",
     "TransferChannelStagingRegistration",
-    "acquire_transfer_channel_client",
-    "release_transfer_channel_client",
 ]
 
 logger = init_logger(__name__)
@@ -112,14 +110,8 @@ def delete_transfer_channel_context() -> None:
     global _context
     with _context_lock:
         if _context is not None:
-            closed = _context
-            closed.close()
+            _context.close()
             _context = None
-        else:
-            return
-    with _clients_lock:
-        for key in [key for key in _client_users if key[0] == id(closed)]:
-            del _client_users[key]
 
 
 class TransferChannelStagingRegistration(BufferRegistration):
@@ -164,55 +156,3 @@ class TransferChannelStagingRegistration(BufferRegistration):
             # The context was closed first, which released every region.
             logger.debug("Staging region %d was already released", self.region_id)
         self._context = None
-
-
-# Peer clients shared by several adapters of the same peer (a removal can be
-# deferred while a re-added adapter already uses the client): users per
-# ``(context, peer url)``, guarded by ``_clients_lock``. A separate lock, as
-# acquiring may connect to the peer.
-_client_users: dict[tuple[int, str], int] = {}
-_clients_lock = threading.Lock()
-
-
-def acquire_transfer_channel_client(
-    context: TransferChannelContext, peer_advertise_url: str
-) -> TransferChannelClient:
-    """Get the client for a peer and count the caller as one of its users.
-
-    Every call must be paired with :func:`release_transfer_channel_client`.
-
-    Args:
-        context: The transfer channel context.
-        peer_advertise_url: The peer's ``host:port``.
-
-    Returns:
-        The context's client for the peer.
-    """
-    key = (id(context), peer_advertise_url)
-    with _clients_lock:
-        client = context.get_transfer_channel_client(peer_advertise_url)
-        _client_users[key] = _client_users.get(key, 0) + 1
-    return client
-
-
-def release_transfer_channel_client(
-    context: TransferChannelContext, peer_advertise_url: str
-) -> None:
-    """Drop one user of a peer's client; the last one removes the client.
-
-    Releasing a peer with no users does nothing.
-
-    Args:
-        context: The transfer channel context.
-        peer_advertise_url: The peer's ``host:port``.
-    """
-    key = (id(context), peer_advertise_url)
-    with _clients_lock:
-        users = _client_users.get(key, 0)
-        if users == 0:
-            return
-        if users > 1:
-            _client_users[key] = users - 1
-            return
-        del _client_users[key]
-        context.remove_transfer_channel_client(peer_advertise_url)

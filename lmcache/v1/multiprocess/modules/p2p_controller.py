@@ -220,8 +220,9 @@ class P2PController(DiscoverableModule):
         self._orch_lock = threading.Lock()
         self._state = _P2PState.UNREGISTERED
         self._adapters: dict[str, _PeerAdapter] = {}
-        # Adapter id -> peer id of removals the storage manager refused so far.
-        self._pending_removals: dict[int, str] = {}
+        # Adapter id -> (peer id, transfer url) of removals the storage
+        # manager refused so far. The peer is not added again meanwhile.
+        self._pending_removals: dict[int, tuple[str, str]] = {}
 
         self._instances_url = ""
         self._http_client: httpx.Client | None = None
@@ -796,8 +797,20 @@ class P2PController(DiscoverableModule):
             inst: The peer to connect to.
 
         Returns:
-            ``True`` if the adapter was created and tracked.
+            ``True`` if the adapter was created and tracked; ``False`` also
+            while an earlier adapter of the peer's transfer url still waits
+            to be removed: it holds the url's transfer-channel client, which
+            its close will drop.
         """
+        if any(
+            url == inst.p2p_advertised_url for _, url in self._pending_removals.values()
+        ):
+            logger.debug(
+                "Not adding peer %s: an adapter for %s is still being removed",
+                inst.instance_id,
+                inst.p2p_advertised_url,
+            )
+            return False
         config = self._peer_config_type()(
             peer_mq_server_url=f"grpc://{inst.ip}:{inst.mq_port}",
             peer_transfer_channel_server_url=inst.p2p_advertised_url,
@@ -860,13 +873,16 @@ class P2PController(DiscoverableModule):
             self._ctx.storage_manager.delete_l2_adapter(adapter.adapter_id)
         except Exception:
             logger.exception("Failed to remove P2P adapter for peer %s", peer_id)
-            self._pending_removals[adapter.adapter_id] = peer_id
+            self._pending_removals[adapter.adapter_id] = (
+                peer_id,
+                adapter.p2p_advertised_url,
+            )
             return
         logger.debug("Removed P2P adapter for peer %s", peer_id)
 
     def _retry_pending_removals(self) -> None:
         """Retry every removal a previous cycle could not complete."""
-        for adapter_id, peer_id in list(self._pending_removals.items()):
+        for adapter_id, (peer_id, _) in list(self._pending_removals.items()):
             try:
                 self._ctx.storage_manager.delete_l2_adapter(adapter_id)
             except Exception as exc:

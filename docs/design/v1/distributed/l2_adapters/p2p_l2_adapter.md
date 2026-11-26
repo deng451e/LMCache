@@ -329,4 +329,5 @@ if any of them fails, it leaves the L1 managers open, because that adapter
 may still access L1 buffers.
 Region access shared per peer, such as a transfer-channel client keyed by the
 peer's URL, must not be re-acquired for that peer while a close-failed
-adapter still holds it.
+adapter still holds it: the P2P controller does not add a peer whose transfer
+URL has a removal pending.

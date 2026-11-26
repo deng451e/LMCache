@@ -591,8 +591,9 @@ def test_gdr_load_mode_rejects_writes_and_other_engines(kwargs: dict) -> None:
 
 def test_reconcile_retries_a_removal_the_storage_manager_refused():
     """A borrowing adapter refuses to close while local readers hold its
-    objects; the controller keeps retrying the removal on later cycles until
-    it succeeds, without re-adding the peer."""
+    objects; the controller retries the removal on later cycles. Until it
+    succeeds the peer is not added again, even if it comes back: the old
+    adapter still holds the peer's transfer-channel client."""
     controller, ctx = _make_controller()
     ctx.storage_manager.add_l2_adapter.return_value = 7
     ctx.storage_manager.delete_l2_adapter.side_effect = [
@@ -607,11 +608,16 @@ def test_reconcile_retries_a_removal_the_storage_manager_refused():
     assert ctx.storage_manager.delete_l2_adapter.call_count == 1
     assert controller.report_status()["p2p_peers"] == []
 
-    controller._apply_state(_P2PState.REGISTERED, {})
-    controller._apply_state(_P2PState.REGISTERED, {})
-    controller._apply_state(_P2PState.REGISTERED, {})
-    assert ctx.storage_manager.delete_l2_adapter.call_count == 3
+    back = {"peerA": _peer("peerA")}
+    controller._apply_state(_P2PState.REGISTERED, back)
+    assert ctx.storage_manager.delete_l2_adapter.call_count == 2
     assert ctx.storage_manager.add_l2_adapter.call_count == 1
+    assert controller.report_status()["p2p_peers"] == []
+
+    controller._apply_state(_P2PState.REGISTERED, back)
+    assert ctx.storage_manager.delete_l2_adapter.call_count == 3
+    assert ctx.storage_manager.add_l2_adapter.call_count == 2
+    assert controller.report_status()["p2p_peers"] == ["peerA"]
 
 
 def test_close_keeps_the_transfer_channel_under_an_unremoved_adapter():
