@@ -123,7 +123,7 @@ def delete_transfer_channel_context() -> None:
 
 
 class TransferChannelStagingRegistration(BufferRegistration):
-    """Registers one NIC staging buffer as a region of the global transfer
+    """Registers one staging buffer as a region of the global transfer
     channel context, so peers' objects can be read straight into its slots."""
 
     def __init__(self) -> None:

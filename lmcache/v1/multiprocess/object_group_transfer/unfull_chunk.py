@@ -238,9 +238,9 @@ def transfer_unfull_chunk(
         direction: H2D (retrieve) or D2H (store).
 
     Raises:
-        ValueError: If a store targets an object a peer owns.
-        NotImplementedError: If a retrieve meets an object a peer owns and
-            the caller collects no peer runs.
+        ValueError: If a store targets an object whose engine defers.
+        NotImplementedError: If a retrieve meets such an object and
+            the caller collects no deferred runs.
 
     Notes:
         Always staged, by the engine ``memory_obj`` selects. An engine that

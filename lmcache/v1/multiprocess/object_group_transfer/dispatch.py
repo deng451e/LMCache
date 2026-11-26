@@ -64,8 +64,8 @@ def transfer_kv_per_object_group(
 
     Raises:
         ValueError: If a None entry is found on retrieve.
-        ValueError: If a store targets an object a peer owns.
-        NotImplementedError: If a retrieve meets an object a peer owns and
+        ValueError: If a store targets an object whose engine defers.
+        NotImplementedError: If a retrieve meets such an object and
             the caller collects no deferred runs
             (:func:`collect_deferred_runs`).
     """

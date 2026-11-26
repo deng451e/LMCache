@@ -5,6 +5,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
+from typing import TYPE_CHECKING, cast
 import threading
 import time
 
@@ -48,6 +49,10 @@ from lmcache.v1.multiprocess.engine_module import (
     ModuleBuildContext,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
 
 logger = init_logger(__name__)
 
@@ -235,8 +240,8 @@ class P2PController(DiscoverableModule):
 
         Raises:
             ValueError: There is not exactly one local DRAM L1, or it exposes
-                no registerable memory buffer; or, in ``gdr`` load mode, the
-                L1 read TTL leaves no time for a read.
+                no registerable memory buffer; or the load mode's adapter
+                cannot work with the L1 read TTL and the load timeout.
         """
         # Peers read the L1 registered with the transfer channel: the one
         # local DRAM L1.
@@ -256,15 +261,13 @@ class P2PController(DiscoverableModule):
             listen_url=self._p2p_config.effective_listen_url,
             advertise_url=self._p2p_config.advertise_url,
         )
-        if self._p2p_config.load_mode == "gdr":
-            read_ttl = l1_manager.config.read_ttl_seconds
-            if read_ttl <= self._p2p_config.load_timeout + 1:
-                delete_transfer_channel_context()
-                raise ValueError(
-                    f"--p2p-load-mode gdr needs --l1-read-ttl-seconds ({read_ttl}) "
-                    "more than 1 s above --p2p-load-timeout "
-                    f"({self._p2p_config.load_timeout}), or no chunk is ever borrowed"
-                )
+        try:
+            self._peer_config_type().check_timeouts(
+                l1_manager.config.read_ttl_seconds, self._p2p_config.load_timeout
+            )
+        except ValueError:
+            delete_transfer_channel_context()
+            raise
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
         timeout = max(1.0, coordinator_config.heartbeat_interval)
         self._http_client = httpx.Client(timeout=timeout)
@@ -795,18 +798,7 @@ class P2PController(DiscoverableModule):
         Returns:
             ``True`` if the adapter was created and tracked.
         """
-        # First Party
-        from lmcache.v1.distributed.l2_adapters.gdr_peer_l2_adapter import (
-            GdrPeerL2AdapterConfig,
-        )
-        from lmcache.v1.distributed.l2_adapters.p2p_l2_adapter import P2PL2AdapterConfig
-
-        config_type = (
-            GdrPeerL2AdapterConfig
-            if self._p2p_config.load_mode == "gdr"
-            else P2PL2AdapterConfig
-        )
-        config = config_type(
+        config = self._peer_config_type()(
             peer_mq_server_url=f"grpc://{inst.ip}:{inst.mq_port}",
             peer_transfer_channel_server_url=inst.p2p_advertised_url,
             lookup_timeout_s=self._p2p_config.lookup_timeout,
@@ -838,6 +830,18 @@ class P2PController(DiscoverableModule):
             inst.p2p_advertised_url,
         )
         return True
+
+    def _peer_config_type(self) -> "type[P2PL2AdapterConfig]":
+        """The adapter config class of the configured load mode."""
+        # First Party
+        from lmcache.v1.distributed.l2_adapters.config import (
+            get_l2_adapter_config_class,
+        )
+
+        return cast(
+            "type[P2PL2AdapterConfig]",
+            get_l2_adapter_config_class(self._p2p_config.adapter_type),
+        )
 
     def _remove_adapter(self, peer_id: str) -> None:
         """Drain and remove the peer L2 adapter for ``peer_id``.

@@ -138,6 +138,21 @@ class GdrPeerL2AdapterConfig(P2PL2AdapterConfig):
     """
 
     @classmethod
+    def check_timeouts(cls, read_ttl_s: float, load_timeout_s: float) -> None:
+        """A lease lasts the read TTL and must leave time for one read.
+
+        Raises:
+            ValueError: If the read TTL is not more than 1 s above the load
+                timeout: no chunk would ever be borrowed.
+        """
+        if read_ttl_s <= load_timeout_s + 1:
+            raise ValueError(
+                f"GPU-direct borrowing needs --l1-read-ttl-seconds ({read_ttl_s}) "
+                f"more than 1 s above --p2p-load-timeout ({load_timeout_s}), or "
+                "no chunk is ever borrowed"
+            )
+
+    @classmethod
     def help(cls) -> str:
         return (
             "GDR peer adapter config fields (same as p2p):\n"

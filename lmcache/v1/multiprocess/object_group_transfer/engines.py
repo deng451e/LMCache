@@ -117,11 +117,13 @@ def stage(
 
     Raises:
         ValueError: If a host-memory object and its region differ in size,
-            or ``engine`` is NIC DMA (a store into an object a peer owns).
+            or ``engine`` does not stage on the stream (see
+            :func:`deferred`), as for a store with such an engine.
     """
     if engine not in _ENGINES:
         raise ValueError(
-            "Objects a peer owns are only retrieved, through the NIC DMA engine"
+            f"The {engine.value} engine does not stage on the stream: its "
+            "objects are only retrieved, as deferred steps"
         )
     _ENGINES[engine].stage(memory_objs, buffers, direction)
 

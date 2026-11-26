@@ -133,7 +133,7 @@ class TransferChannelClient(metaclass=abc.ABCMeta):
             True once the transfer is stopped and no more bytes will move; the
             task id is then forgotten. False while it is still running, or if
             this implementation cannot stop a transfer. A caller that waits
-            for True (GPU-direct borrowing) needs an implementation that can.
+            for True needs an implementation that can.
 
         Raises:
             KeyError: ``task_id`` is unknown or was already reported finished.

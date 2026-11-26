@@ -433,7 +433,7 @@ def _start_cache_server(
                 )
                 mem_cfg.shm_name = ""
 
-    if mp_config.p2p_config.load_mode == "gdr":
+    if mp_config.p2p_config.borrows:
         # Borrowed peer chunks are indexed by a DRAM shadow L1.
         storage_manager_config = with_shadow_l1(
             storage_manager_config, MemorySegment.DRAM

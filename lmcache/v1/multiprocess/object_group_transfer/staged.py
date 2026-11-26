@@ -385,9 +385,9 @@ def run_staged_loop(
 
     Raises:
         ValueError: If a None entry is found on retrieve, or a store targets
-            an object a peer owns.
-        NotImplementedError: If a retrieve meets an object a peer owns and
-            the caller collects no peer runs.
+            an object whose engine defers.
+        NotImplementedError: If a retrieve meets such an object and
+            the caller collects no deferred runs.
     """
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager

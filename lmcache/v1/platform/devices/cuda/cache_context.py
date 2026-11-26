@@ -103,8 +103,7 @@ class _TempGPUBuffer:
     ```
 
     With ``slot_align_bytes`` every object group slot starts on that
-    alignment, so a transfer channel can read a peer's object straight into
-    a slot.
+    alignment, for a registration that needs aligned slots.
     """
 
     def __init__(

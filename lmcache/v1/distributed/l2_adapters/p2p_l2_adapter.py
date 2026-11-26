@@ -164,6 +164,18 @@ class P2PL2AdapterConfig(PeerL2AdapterConfigBase):
         self.write_l1_usage_threshold = write_l1_usage_threshold
 
     @classmethod
+    def check_timeouts(cls, read_ttl_s: float, load_timeout_s: float) -> None:
+        """Check that this adapter type can work with the server's timeouts.
+
+        Args:
+            read_ttl_s: The L1 read-lock TTL.
+            load_timeout_s: The peer load timeout.
+
+        Raises:
+            ValueError: If it cannot; the copying adapter works with any.
+        """
+
+    @classmethod
     def from_dict(cls, d: dict) -> "P2PL2AdapterConfig":
         peer_mq_server_url = d.get("peer_mq_server_url")
         if not isinstance(peer_mq_server_url, str) or not peer_mq_server_url:

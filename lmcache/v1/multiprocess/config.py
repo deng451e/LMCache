@@ -233,6 +233,23 @@ class RuntimePluginConfig:
     """
 
 
+@dataclass(frozen=True)
+class _P2PLoadMode:
+    """What a ``--p2p-load-mode`` value selects."""
+
+    adapter_type: str
+    """Registered L2 adapter type that connects each peer."""
+
+    borrows: bool
+    """Peers' objects stay on the peer and are indexed by a shadow L1."""
+
+
+_P2P_LOAD_MODES = {
+    "l1": _P2PLoadMode("p2p", borrows=False),
+    "gdr": _P2PLoadMode("p2p_gdr", borrows=True),
+}
+
+
 @dataclass
 class P2PConfig:
     """Configuration for peer-to-peer KV transfer.
@@ -297,6 +314,17 @@ class P2PConfig:
                 "P2P write L1 usage threshold must be in (0, 1], got "
                 f"{self.write_l1_usage_threshold}"
             )
+
+    @property
+    def adapter_type(self) -> str:
+        """Registered L2 adapter type the load mode connects each peer with."""
+        return _P2P_LOAD_MODES[self.load_mode].adapter_type
+
+    @property
+    def borrows(self) -> bool:
+        """Whether the load mode leaves peers' objects on the peer, indexed
+        by a shadow L1."""
+        return _P2P_LOAD_MODES[self.load_mode].borrows
 
     @property
     def enabled(self) -> bool:
@@ -829,7 +857,7 @@ def add_p2p_args(
     group.add_argument(
         "--p2p-load-mode",
         type=str,
-        choices=["l1", "gdr"],
+        choices=list(_P2P_LOAD_MODES),
         default="l1",
         help=(
             "l1 (default): copy a peer's objects into the DRAM L1 at lookup. "

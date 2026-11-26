@@ -24,6 +24,13 @@ are indexed by a DRAM shadow L1
 the server adds one (`shadow.dram`) when none is configured. `gdr` excludes
 `--enable-p2p-write`.
 
+The server and the P2P controller have no `gdr` branch. `P2PConfig` maps each
+load mode to a registered adapter type and to whether it borrows
+(`l1` → `p2p`, `gdr` → `p2p_gdr`, borrowing): the server adds the shadow L1
+for a borrowing mode, and the controller builds each peer's adapter from the
+type's config class and asks that class to check the timeouts at startup
+(`check_timeouts`).
+
 ## Classes
 
 `GdrPeerL2Adapter` extends `BorrowingPeerL2AdapterBase`; the class tree is in
