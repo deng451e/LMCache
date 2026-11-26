@@ -880,7 +880,6 @@ class BorrowedMemoryObj(MemoryObj):
         self._lease: Lease | None = None
         self._reader: BorrowedReader | None = None
         self._local_view: torch.Tensor | None = None
-        self._is_local = False
         self._source = ""
 
     @property
@@ -893,7 +892,7 @@ class BorrowedMemoryObj(MemoryObj):
         """Whether the object was bound to a local view of the owner's bytes,
         so a host copy moves them; stays True after :meth:`release` dropped
         the view. False for an object bound to a reader."""
-        return self._is_local
+        return self._lease is not None and self._reader is None
 
     def bind(
         self,
@@ -939,7 +938,6 @@ class BorrowedMemoryObj(MemoryObj):
             )
         self._reader = reader
         self._local_view = local_view
-        self._is_local = local_view is not None
         self.meta.address = address
         self._source = source
         self._lease = lease

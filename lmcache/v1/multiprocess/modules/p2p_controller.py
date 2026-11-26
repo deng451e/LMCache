@@ -54,10 +54,6 @@ logger = init_logger(__name__)
 # Sentinel address for keys that were not found (or fell past the L1 prefix).
 _INVALID_ADDRESS = TransferChannelAddress(offset=-1, size=0)
 
-# Under GPU-direct borrowing, warn when the L1 read TTL leaves a chunk less
-# than this long, beyond the load timeout, to be retrieved.
-_MIN_BORROW_WINDOW_S = 10.0
-
 # Consecutive missed polls a peer may be absent before its adapter is removed.
 _MAX_MISSES = 3
 
@@ -268,13 +264,6 @@ class P2PController(DiscoverableModule):
                     f"--p2p-load-mode gdr needs --l1-read-ttl-seconds ({read_ttl}) "
                     "more than 1 s above --p2p-load-timeout "
                     f"({self._p2p_config.load_timeout}), or no chunk is ever borrowed"
-                )
-            if read_ttl < self._p2p_config.load_timeout + _MIN_BORROW_WINDOW_S:
-                logger.warning(
-                    "--l1-read-ttl-seconds (%s) is close to --p2p-load-timeout "
-                    "(%s): borrowed chunks will often expire before a retrieve",
-                    read_ttl,
-                    self._p2p_config.load_timeout,
                 )
         self._instances_url = coordinator_config.url.rstrip("/") + "/instances"
         timeout = max(1.0, coordinator_config.heartbeat_interval)
