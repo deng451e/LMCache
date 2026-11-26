@@ -18,13 +18,13 @@ from lmcache.v1.memory_management import (
     GDSMemoryObject,
     MemoryObj,
 )
-from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     DeferredRun,
     DeferredTransferEngine,
+    NicDmaEngine,
     defer_run,
 )
-from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
 from lmcache.v1.multiprocess.object_group_transfer.nvme_dma import NvmeDmaEngine
 import lmcache.lmcache_native as lmcache_native
 

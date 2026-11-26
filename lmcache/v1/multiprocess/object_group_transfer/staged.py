@@ -20,14 +20,14 @@ from lmcache.v1.mp_observability.event_bus import (
     get_event_bus,
     is_observability_enabled,
 )
-from lmcache.v1.multiprocess.object_group_transfer.deferred import (
-    DeferredRun,
-    Staging,
-)
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     deferred,
     stage,
+)
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
+    DeferredRun,
+    Staging,
 )
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
     batched_iteration_with_skip,

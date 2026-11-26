@@ -16,7 +16,7 @@ import torch
 from lmcache.v1.mp_observability.event import EventType
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.modules import lmcache_driven_transfer as transfer
-from lmcache.v1.multiprocess.object_group_transfer.deferred import defer_runs
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import defer_runs
 from tests.v1.multiprocess.test_event_ipc_handle_path import (
     _FakeEventBackend,
     _FakeStorageManager,

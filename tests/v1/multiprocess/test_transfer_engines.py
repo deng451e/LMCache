@@ -27,7 +27,7 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     split_into_runs,
     stage,
 )
-from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     DeferredRun,
     collect_deferred_runs,
 )

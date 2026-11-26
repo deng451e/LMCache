@@ -66,11 +66,11 @@ step as a `DeferredRun` into the `collect_deferred_runs(...)` block the
 handler wraps around its transfers. `platform/base` is not involved: the
 context's transfer callback still returns nothing. A caller without such a
 block gets `NotImplementedError` for a peer-owned object, as before.
-The handler knows only the generic interface in
-`object_group_transfer/deferred.py` (`DeferredRun`, `collect_deferred_runs`,
-`DeferredTransferEngine`) and gets its engine from
-`engines.create_deferred_engine()`. Everything NIC-specific is in
-`object_group_transfer/nic_dma.py`:
+The handler knows only the generic interface (`DeferredRun`,
+`collect_deferred_runs`, `DeferredTransferEngine`), which the
+`object_group_transfer` package exports, and gets its engine from
+`create_deferred_engine()`. That interface and everything NIC-specific are
+in `object_group_transfer/nic_dma.py`:
 
 ```
 RETRIEVE handler (affinity worker), inside collect_deferred_runs(deferred_runs):

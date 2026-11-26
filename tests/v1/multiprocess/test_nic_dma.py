@@ -27,7 +27,7 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     unfull_chunk,
 )
-from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     collect_deferred_runs,
 )
 import lmcache.lmcache_native as lmcache_native

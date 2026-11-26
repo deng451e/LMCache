@@ -40,6 +40,9 @@ from lmcache.v1.multiprocess.native_completion import (
     submit_callback_to_stream,
 )
 from lmcache.v1.multiprocess.object_group_transfer import (
+    DeferredRun,
+    collect_deferred_runs,
+    create_deferred_engine,
     downsample_and_stage_block_ids,
     get_unfull_chunk_layout_desc,
     get_unfull_chunk_staging_buffer,
@@ -47,13 +50,6 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_kv_per_object_group,
     transfer_unfull_chunk,
     trim_and_stage_unfull_chunk_block_ids,
-)
-from lmcache.v1.multiprocess.object_group_transfer.deferred import (
-    DeferredRun,
-    collect_deferred_runs,
-)
-from lmcache.v1.multiprocess.object_group_transfer.engines import (
-    create_deferred_engine,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.platform.base.cache_context import BaseCacheContext

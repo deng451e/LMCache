@@ -12,8 +12,7 @@ planning) driven from `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.p
 | `engines.py` | which transfer engine moves an object, the split of a group into same-engine runs, the `DMAEngine` protocol and `stage`, which calls the engine |
 | `gpu_dma.py` | `GpuDmaEngine`: host/GPU copies queued on the stream |
 | `nvme_dma.py` | `NvmeDmaEngine`: GDS slab reads and writes queued on the stream |
-| `deferred.py` | the generic interface for retrieve steps an engine runs outside the stream: `DeferredRun`, `collect_deferred_runs`, the `Staging` view kernels read from, and the `DeferredTransferEngine` protocol the transfer module talks to |
-| `nic_dma.py` | everything NIC-specific: `NicDmaEngine`, the deferred engine that reads peer-owned objects over the transfer channel into a NIC staging buffer without blocking, then queues their kernels |
+| `nic_dma.py` | the generic interface for retrieve steps an engine runs outside the stream (`DeferredRun`, `collect_deferred_runs`, the `Staging` view kernels read from, the `DeferredTransferEngine` protocol the transfer module talks to), and everything NIC-specific: `NicDmaEngine`, which reads peer-owned objects over the transfer channel into a NIC staging buffer without blocking, then queues their kernels |
 | `dispatch.py` | `transfer_kv_per_object_group`: picks each run's copy path |
 | `unfull_chunk.py` | the request's trailing unfull chunk |
 
