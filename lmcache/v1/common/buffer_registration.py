@@ -16,10 +16,13 @@ class BufferRegistration(Protocol):
     """
 
     def staging_alignment(self) -> int:
-        """Bytes the allocation and each of its slots must start and end on.
+        """Slot alignment a context applies when it creates a staging buffer
+        for this registration (``create_staging_buffer``): the buffer and
+        each of its slots start and end on it.
 
         Returns:
-            A power of two; 1 when the resource needs no alignment.
+            A power of two. The default of 1 asks for no such layout; it says
+            nothing about alignment the resource handles itself.
         """
         return 1
 
