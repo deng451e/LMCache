@@ -826,31 +826,8 @@ class PendingRead(Protocol):
         ...
 
 
-class BorrowedReader(Protocol):
-    """Reads borrowed objects' bytes into a local device region.
-
-    A borrower whose owner's memory is not mapped into this process
-    implements it over its transport, whatever that is: RDMA to a peer's
-    DRAM, or a channel to another server's memory.
-    """
-
-    def read_many(
-        self,
-        region_id: int,
-        targets: Sequence[tuple["BorrowedMemoryObj", int]],
-    ) -> PendingRead:
-        """Start one transport read of every target's bytes.
-
-        Args:
-            region_id: Local region registered with the borrower's transport.
-            targets: ``(object, offset)`` pairs: an object this reader bound
-                and the byte offset of its destination within the region.
-
-        Returns:
-            The in-flight read. It fails without reading if any object's
-            lease has already ended.
-        """
-        ...
+# A borrower's read of several objects it bound: (region_id, targets).
+_ReadMany = Callable[[int, Sequence[tuple["BorrowedMemoryObj", int]]], PendingRead]
 
 
 class BorrowedMemoryObj(MemoryObj):
@@ -858,10 +835,11 @@ class BorrowedMemoryObj(MemoryObj):
 
     :class:`ShadowL1MemoryManager` creates it as a placeholder: layout
     metadata, no bytes, no lease. A borrower's load :meth:`bind`\\ s it to a
-    lease and to a :class:`BorrowedReader` that reads the bytes into a
-    registered local device region at retrieve time, several objects in one
-    transfer. The tensor accessors report no local bytes. ``is_valid()`` is
-    False before binding, after :meth:`release`, and once the lease ended.
+    lease and to the borrower's batch read, which :meth:`read_many` uses to
+    read the bytes into a registered local device region at retrieve time,
+    several objects of one source in one transfer. The tensor accessors
+    report no local bytes. ``is_valid()`` is False before binding, after
+    :meth:`release`, and once the lease ended.
     """
 
     def __init__(self, metadata: MemoryObjMetadata) -> None:
@@ -869,25 +847,25 @@ class BorrowedMemoryObj(MemoryObj):
         self.valid = True
         self._lock = threading.Lock()
         self._lease: Lease | None = None
-        self._reader: BorrowedReader | None = None
+        self._read_many: _ReadMany | None = None
         self._source = ""
 
     @property
     def is_bound(self) -> bool:
-        """Whether a borrower bound a lease and a reader to this object."""
+        """Whether a borrower bound a lease and a read to this object."""
         return self._lease is not None
 
     @property
     def is_remote(self) -> bool:
         """Whether the object reads its bytes into a device region; True once
         bound."""
-        return self._reader is not None
+        return self._read_many is not None
 
     def bind(
         self,
         lease: Lease,
         *,
-        reader: BorrowedReader,
+        read_many: "_ReadMany",
         address: int,
         source: str,
     ) -> None:
@@ -895,7 +873,9 @@ class BorrowedMemoryObj(MemoryObj):
 
         Args:
             lease: The owner's reservation.
-            reader: Reads the bytes into a registered device region.
+            read_many: ``(region_id, targets) -> PendingRead``: the
+                borrower's read of several objects it bound from this
+                source, see :meth:`read_many`.
             address: The owner's address of the bytes.
             source: The owner, e.g. its transfer URL. One shadow serves every
                 peer, so ``source`` and ``address`` together tell two views of
@@ -909,7 +889,7 @@ class BorrowedMemoryObj(MemoryObj):
             raise RuntimeError("BorrowedMemoryObj is already bound")
         if address < 0 or not source:
             raise ValueError("borrowed bytes need the owner's address and source")
-        self._reader = reader
+        self._read_many = read_many
         self.meta.address = address
         self._source = source
         self._lease = lease
@@ -922,15 +902,33 @@ class BorrowedMemoryObj(MemoryObj):
         return self._lease
 
     @property
-    def reader(self) -> BorrowedReader:
-        """Return the reader the object is bound to.
+    def source(self) -> str:
+        """The owner the object was bound to, empty before; objects of one
+        source can be read together."""
+        return self._source
+
+    def read_many(
+        self, region_id: int, targets: Sequence[tuple["BorrowedMemoryObj", int]]
+    ) -> PendingRead:
+        """Start one transport read of every target's bytes into a registered
+        local device region.
+
+        Args:
+            region_id: Local region registered with the borrower's transport.
+            targets: ``(object, offset)`` pairs: objects of this object's
+                :attr:`source` and the byte offset of each destination
+                within the region.
+
+        Returns:
+            The in-flight read. It fails without reading if any object's
+            lease has already ended.
 
         Raises:
             RuntimeError: If the object is not bound.
         """
-        if self._reader is None:
+        if self._read_many is None:
             raise RuntimeError("BorrowedMemoryObj is not bound")
-        return self._reader
+        return self._read_many(region_id, targets)
 
     def replace_lease(self, lease: Lease) -> None:
         """Put the object under a newer lease of the same bytes; the caller
@@ -1069,21 +1067,21 @@ class BorrowedMemoryObj(MemoryObj):
 
     @property
     def byte_array(self) -> bytes:
-        """Raise: the bytes are not in local memory; use :attr:`reader`.
+        """Raise: the bytes are not in local memory; use :meth:`read_many`.
 
         Raises:
             RuntimeError: Always.
         """
-        raise RuntimeError("BorrowedMemoryObj has no local bytes; use its reader")
+        raise RuntimeError("BorrowedMemoryObj has no local bytes; use read_many")
 
     @property
     def data_ptr(self) -> int:
-        """Raise: the bytes are not in local memory; use :attr:`reader`.
+        """Raise: the bytes are not in local memory; use :meth:`read_many`.
 
         Raises:
             RuntimeError: Always.
         """
-        raise RuntimeError("BorrowedMemoryObj has no local bytes; use its reader")
+        raise RuntimeError("BorrowedMemoryObj has no local bytes; use read_many")
 
 
 class AddressManager:

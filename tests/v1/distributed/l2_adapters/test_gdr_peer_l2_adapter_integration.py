@@ -253,7 +253,7 @@ def test_gdr_borrow_reads_owner_bytes_straight_into_gpu() -> None:
         # reverse order.
         handles = [cast(BorrowedMemoryObj, results[key][1]) for key in keys]
         batch_slots = [2 * _NUM_KEYS - 1 - i for i in range(_NUM_KEYS)]
-        read = handles[0].reader.read_many(
+        read = handles[0].read_many(
             region_id,
             [(h, slot * _PAGE) for h, slot in zip(handles, batch_slots, strict=True)],
         )

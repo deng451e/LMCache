@@ -124,7 +124,7 @@ def _load(adapter, keys):
 
 
 def _read(obj, region_id: int, offset: int):
-    return obj.reader.read_many(region_id, [(obj, offset)])
+    return obj.read_many(region_id, [(obj, offset)])
 
 
 def _borrow(adapter, req_client):
@@ -214,7 +214,6 @@ def test_objects_of_one_peer_are_read_with_one_submit() -> None:
         ]
         _lookup(adapter, req_client, keys, addresses)
         first, second = _load(adapter, keys).values()
-        assert first.reader is adapter
         tc_client.submit_read.return_value = 7
         tc_client.query_status.return_value = TransferChannelTransferResult(
             finished=True, succeeded_mask=[True, True]

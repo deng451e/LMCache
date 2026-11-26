@@ -120,7 +120,8 @@ finish_write_and_reserve_read ──► resident, read-locked ──► readers
   borrower wants `(segment, SHADOW)` first, so tag affinity binds it there.
 - **`BorrowedMemoryObj`** (`lmcache/v1/memory_management.py`, with the other
   memory objects) is a placeholder until the borrower's load binds it to a
-  lease and to a `BorrowedReader`, so every borrowing adapter shares it. The
+  lease and to the borrower's batch read (`read_many`), so every borrowing
+  adapter shares it. The
   bytes are not addressable here (a peer's DRAM) and are read into a device
   region at retrieve time; the object has no tensor.
   `Lease` and `PendingRead`, defined beside it, are the borrower's contract

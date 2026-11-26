@@ -234,7 +234,7 @@ class BorrowingMockL2Adapter(PeerL2AdapterBase):
 
             cast(BorrowedMemoryObj, obj).bind(
                 (lease_is_valid, end_lease),
-                reader=_DoneReader(),
+                read_many=_DoneReader().read_many,
                 # The owner's slot of the key: two borrows of a key are views
                 # of the same bytes.
                 address=list(self._owner.objects).index(key),

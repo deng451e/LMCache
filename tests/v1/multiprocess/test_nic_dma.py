@@ -75,7 +75,12 @@ def _peer(reader: _Reader, name: str) -> BorrowedMemoryObj:
         dtypes=[torch.uint8],
     )
     obj = BorrowedMemoryObj(meta)
-    obj.bind((lambda: True, lambda: None), reader=reader, address=0, source="p")
+    obj.bind(
+        (lambda: True, lambda: None),
+        read_many=reader.read_many,
+        address=0,
+        source=reader.name,
+    )
     obj.name = name  # type: ignore[attr-defined]
     return obj
 

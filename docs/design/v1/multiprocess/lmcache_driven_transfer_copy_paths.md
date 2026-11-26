@@ -47,7 +47,7 @@ even where the code is short today.
 |---|---|---|---|
 | Host memory (DRAM, DevDAX) | GPU DMA | host/GPU copy on the stream | `direct` when usable, else `kernel` (native plan, or per batch without it) |
 | Storage-backed (`GDSMemoryObject`) | NVMe DMA | file read or write on the stream | `kernel`, per batch |
-| Borrowed, not mapped locally (`BorrowedMemoryObj` bound to a `BorrowedReader`) | NIC DMA | the reader's read into a NIC staging buffer, not waited for; retrieve only | handed off as `OffStreamRun`, `kernel` per batch after the read |
+| Borrowed, not mapped locally (a bound `BorrowedMemoryObj`) | NIC DMA | the reader's read into a NIC staging buffer, not waited for; retrieve only | handed off as `OffStreamRun`, `kernel` per batch after the read |
 
 `split_into_runs` cuts the group's chunks into consecutive runs of one engine
 and each copy path gets its run as a `[start, end)` chunk range over the full

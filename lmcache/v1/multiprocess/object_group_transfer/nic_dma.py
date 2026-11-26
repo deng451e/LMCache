@@ -29,7 +29,6 @@ from lmcache.v1.distributed.transfer_channel import (
 )
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
-    BorrowedReader,
     PendingRead,
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
@@ -282,9 +281,7 @@ class _Retrieve:
         """One read per peer of the wave's objects."""
         buffer = self._staging.buffer
         base = buffer.buffer.data_ptr()
-        per_reader: dict[
-            int, tuple[BorrowedReader, list[tuple[BorrowedMemoryObj, int]]]
-        ] = {}
+        per_source: dict[str, list[tuple[BorrowedMemoryObj, int]]] = {}
         free = iter(slots)
         for run in wave.runs:
             view = _SlotView(buffer, [next(free) for _ in run.memory_objs], run.skipped)
@@ -295,10 +292,11 @@ class _Retrieve:
                     raise ValueError(
                         f"Object of {obj.get_size()} bytes, slot of {target.nbytes}"
                     )
-                entry = per_reader.setdefault(id(obj.reader), (obj.reader, []))
-                entry[1].append((obj, target.data_ptr() - base))
+                per_source.setdefault(obj.source, []).append(
+                    (obj, target.data_ptr() - base)
+                )
         region_id = self._staging.registration.region_id
-        return [reader.read_many(region_id, t) for reader, t in per_reader.values()]
+        return [t[0][0].read_many(region_id, t) for t in per_source.values()]
 
     def _landed(self, wave: _Wave, slots: list[int], reads: list[PendingRead]) -> None:
         if not all(read.succeeded() for read in reads):

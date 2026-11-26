@@ -105,7 +105,7 @@ per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
   take free slots of the NIC staging buffer (`_SlotPool`)
   run.targets(view) → where each object lands; the view presents the run's
       slots as the `Staging` the shared kernels read from
-  one BorrowedReader.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
+  one BorrowedMemoryObj.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
   HostPoller sees the reads finished → on the worker:
       run.launch(view, block ids): block kernels, NIC slots → paged KV,
       then record an event
@@ -137,7 +137,7 @@ Why it is built this way:
   batches) plus two rows for an unfull chunk, whose object can extend past
   one slot. Over a 400 Gb/s link, waves of half the slots ran at 47.9–48.5
   GB/s for 6 MiB and 80 MiB chunks; a one-slot pool ran at 40 GB/s.
-- **One read per peer per wave** (`BorrowedReader.read_many`). Per-object
+- **One read per peer per wave** (`BorrowedMemoryObj.read_many`). Per-object
   submits gave the same bandwidth but 10x the poller CPU and up to 13 ms
   tail delay before the kernels were queued.
 - **The host orders the work; no stream waits on a host-written value.** A

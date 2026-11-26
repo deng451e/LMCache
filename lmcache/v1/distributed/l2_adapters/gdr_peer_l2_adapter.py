@@ -238,7 +238,7 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
         targets: Sequence[tuple[BorrowedMemoryObj, int]],
     ) -> PendingRead:
         """Read borrowed objects of this peer into a registered region with
-        one transfer-channel submit; see :class:`BorrowedReader`.
+        one transfer-channel submit; see :meth:`BorrowedMemoryObj.read_many`.
 
         Args:
             region_id: Local region registered with the transfer channel.
@@ -277,7 +277,7 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
         a read checks the object's current lease."""
         obj.bind(
             lease,
-            reader=self,
+            read_many=self.read_many,
             address=address.offset,
             source=self._config.peer_transfer_channel_server_url,
         )

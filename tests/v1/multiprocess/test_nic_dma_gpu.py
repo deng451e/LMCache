@@ -90,7 +90,12 @@ def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> No
             fmt=MemoryFormat.KV_2LTD,
         )
         obj = BorrowedMemoryObj(meta)
-        obj.bind((lambda: True, lambda: None), reader=reader, address=0, source="p")
+        obj.bind(
+            (lambda: True, lambda: None),
+            read_many=reader.read_many,
+            address=0,
+            source="p",
+        )
         reader.payloads[id(obj)] = payload
         objs.append(obj)
     create = nic_ctx.create_staging_buffer
