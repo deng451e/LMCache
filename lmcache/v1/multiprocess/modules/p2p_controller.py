@@ -886,7 +886,8 @@ class P2PController(DiscoverableModule):
             try:
                 self._ctx.storage_manager.delete_l2_adapter(adapter_id)
             except Exception as exc:
-                logger.warning(
+                # The first refusal was logged; this repeats every cycle.
+                logger.debug(
                     "P2P adapter for peer %s still cannot be removed: %s", peer_id, exc
                 )
                 continue

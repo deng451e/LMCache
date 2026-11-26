@@ -3,7 +3,7 @@
 
 # Standard
 from itertools import accumulate
-from typing import Sequence, cast
+from typing import Sequence
 
 # Third Party
 import torch
@@ -254,7 +254,9 @@ def transfer_unfull_chunk(
         region = get_unfull_chunk_staging_buffer(
             cache_context, object_group_id, staging
         )
-        return [cast(torch.Tensor, region)]
+        if region is None:
+            raise ValueError("The unfull chunk does not fit its staging slots")
+        return [region]
 
     def launch(staging: Staging, block_ids: list[torch.Tensor]) -> None:
         _launch_unfull_chunk_kernels(

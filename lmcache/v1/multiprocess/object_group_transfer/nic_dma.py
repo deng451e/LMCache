@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Protocol, Sequence, runtime_checkable
 import threading
+import time
 import weakref
 
 # Third Party
@@ -278,7 +279,11 @@ class _Retrieve:
         )
 
     def _submit_reads(self, wave: _Wave, slots: list[int]) -> list[PendingRead]:
-        """One read per peer of the wave's objects."""
+        """One read per peer of the wave's objects.
+
+        Objects of one source are read through the first one's ``read_many``:
+        the P2P controller keeps a single adapter per peer transfer url.
+        """
         buffer = self._staging.buffer
         base = buffer.buffer.data_ptr()
         per_source: dict[str, list[tuple[BorrowedMemoryObj, int]]] = {}
@@ -452,6 +457,7 @@ class NicDmaEngine:
         """
         if timeout_s is None:
             timeout_s = self._drain_timeout_s
+        deadline = time.monotonic() + timeout_s
         with self._lock:
             self._released.add(cache_context)
             if not self._created.wait_for(
@@ -465,7 +471,8 @@ class NicDmaEngine:
             self._draining.append(staging)
         with staging.idle:
             drained = staging.idle.wait_for(
-                lambda: staging.active == 0 or self._closed, timeout_s
+                lambda: staging.active == 0 or self._closed,
+                max(0.0, deadline - time.monotonic()),
             )
         if drained:
             with self._lock:

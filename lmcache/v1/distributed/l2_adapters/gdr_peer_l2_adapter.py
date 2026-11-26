@@ -218,7 +218,8 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
         return MemoryTags(MemorySegment.DRAM, MemoryResidency.REMOTE)
 
     def report_status(self) -> dict[str, Any]:
-        """Return peer endpoints and the outstanding borrow count."""
+        """Return the borrowing status plus the adapter type and the peer's
+        transfer url."""
         return {
             **super().report_status(),
             "type": "GdrPeerL2Adapter",
@@ -243,21 +244,31 @@ class GdrPeerL2Adapter(BorrowingPeerL2AdapterBase):
             The read, cancelled past ``load_timeout_s``; a failed read
             without a submit if any object's lease has ended.
         """
-        if not all(obj.is_valid() for obj, _ in targets):
-            return _FailedRead()
-        task_id = self._tc_client.submit_read(
-            [
-                TransferChannelAddress(offset=offset, size=obj.get_size())
-                for obj, offset in targets
-            ],
-            [
-                TransferChannelAddress(offset=obj.meta.address, size=obj.get_size())
-                for obj, _ in targets
-            ],
-            local_region=region_id,
-        )
+        # Counted before the lease check, so close() cannot drop the client
+        # between that check and the submit.
         with self._reads_lock:
             self._reads_in_flight += 1
+        task_id: int | None = None
+        try:
+            if all(obj.is_valid() for obj, _ in targets):
+                task_id = self._tc_client.submit_read(
+                    [
+                        TransferChannelAddress(offset=offset, size=obj.get_size())
+                        for obj, offset in targets
+                    ],
+                    [
+                        TransferChannelAddress(
+                            offset=obj.meta.address, size=obj.get_size()
+                        )
+                        for obj, _ in targets
+                    ],
+                    local_region=region_id,
+                )
+        finally:
+            if task_id is None:
+                self._read_finished()
+        if task_id is None:
+            return _FailedRead()
         return _TransferChannelRead(
             self._tc_client,
             task_id,
