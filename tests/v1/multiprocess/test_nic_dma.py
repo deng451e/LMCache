@@ -27,7 +27,7 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     unfull_chunk,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     collect_peer_runs,
 )
 import lmcache.lmcache_native as lmcache_native
@@ -376,12 +376,13 @@ def test_drain_fails_the_waves_that_have_not_started(h) -> None:
 def test_unfull_chunks_use_the_spare_rows_one_at_a_time(h) -> None:
     """An unfull chunk's object can extend past its slot."""
     buffer = h.cc.get_temp_object_group_buffer(0, 0)
-    runs = [
-        transfer_unfull_chunk(
-            h.cc, [torch.arange(4)] * 2, [0, 0], [0, 0], _peer(h.p, n), 0, buffer, H2D
-        )
-        for n in ("u1", "u2")
-    ]
+    runs: list = []
+    with collect_peer_runs(runs):
+        for n in ("u1", "u2"):
+            ids = [torch.arange(4)] * 2
+            transfer_unfull_chunk(
+                h.cc, ids, [0, 0], [0, 0], _peer(h.p, n), 0, buffer, H2D
+            )
     assert all(run.spans_slots for run in runs) and h.log == []
     h.engine.read(h.cc, runs[:1], lambda ok: ok)
     h.engine.read(h.cc, runs[1:], lambda ok: ok)

@@ -59,7 +59,7 @@ Runs of peer-owned objects are **deferred, not staged**, and read without
 blocking the retrieve. `platform/base` is not involved: the context's
 transfer callback still returns nothing, so the transfer hands the runs to
 the `collect_peer_runs(...)` block the handler wraps around the call
-(`object_group_transfer/nic_staging.py`). A caller without such a block gets
+(`object_group_transfer/nic_dma.py`). A caller without such a block gets
 `NotImplementedError` for a peer-owned object, as before:
 
 ```

@@ -12,8 +12,7 @@ planning) driven from `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.p
 | `engines.py` | which transfer engine moves an object, the split of a group into same-engine runs, the `DMAEngine` protocol and `stage`, which calls the engine |
 | `gpu_dma.py` | `GpuDmaEngine`: host/GPU copies queued on the stream |
 | `nvme_dma.py` | `NvmeDmaEngine`: GDS slab reads and writes queued on the stream |
-| `nic_dma.py` | `NicDmaEngine`: non-blocking transfer-channel reads of peer-owned objects into a NIC staging buffer, then their kernels |
-| `nic_staging.py` | what a transfer hands to the NIC DMA engine: `DeferredNicRun`, `collect_peer_runs`, and the `StagingBuffer` / `StagingBufferFactory` protocols |
+| `nic_dma.py` | everything NIC-specific: `NicDmaEngine` (non-blocking transfer-channel reads of peer-owned objects into a NIC staging buffer, then their kernels), `DeferredNicRun`, `collect_peer_runs`, and the staging protocols |
 | `dispatch.py` | `transfer_kv_per_object_group`: picks each run's copy path |
 | `unfull_chunk.py` | the request's trailing unfull chunk |
 
@@ -128,11 +127,15 @@ flowchart TD
 
 A peer's object (`BorrowedMemoryObj`) has no local bytes; its peer's
 transfer channel reads them into GPU memory, outside the stream. So the
-transfer does not stage it: `transfer_kv_per_object_group` defers a
-`DeferredNicRun` per kernel batch (with its own copy of the block ids) to
-the caller's `collect_peer_runs` block, `transfer_unfull_chunk` returns
-one, and the RETRIEVE handler hands them to `NicDmaEngine.read` after
-queuing everything else:
+transfer does not stage it. The shared code has one hook per retrieve
+step, `engines.deferred(engine, run)`: an engine that stages on the stream
+returns False and the step is staged and launched as usual; the NIC entry
+takes the step as a `DeferredNicRun` (with its own copy of the block ids)
+into the caller's `collect_peer_runs` block. Both the per-batch loop and
+`transfer_unfull_chunk` use it, and their kernels read from a `Staging`
+argument: the cache context, or the view of its slots the NIC DMA engine
+passes later. The RETRIEVE handler hands the collected runs to
+`NicDmaEngine.read` after queuing everything else:
 
 ```
 peer DRAM --read_many--> NIC staging slot --kernel--> paged KV

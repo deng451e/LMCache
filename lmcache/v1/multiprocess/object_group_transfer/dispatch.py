@@ -19,10 +19,6 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     split_into_runs,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
-    DeferredNicRun,
-    defer_peer_runs,
-)
 from lmcache.v1.multiprocess.object_group_transfer.staged import (
     native_plan_available,
     run_object_group_transfer_plan,
@@ -48,9 +44,7 @@ def transfer_kv_per_object_group(
     selects. Runs are issued in chunk order on the context's stream.
 
     Host-memory runs take the direct copy if usable, else the native plan if
-    the extension has it; every other run is staged one batch at a time,
-    except that on retrieve the batches of objects a peer owns are handed to
-    the caller's :func:`collect_peer_runs` block for the NIC DMA engine.
+    the extension has it; every other run is staged one batch at a time.
 
     Args:
         cache_context: Cache context of the KV cache.
@@ -72,9 +66,8 @@ def transfer_kv_per_object_group(
         ValueError: If a None entry is found on retrieve.
         ValueError: If a store targets an object a peer owns.
         NotImplementedError: If a retrieve meets an object a peer owns and
-            the caller collects no peer runs.
+            the caller collects no peer runs (:func:`collect_peer_runs`).
     """
-    deferred: list[DeferredNicRun] = []
     for engine, start, end in split_into_runs(memory_objs):
         chunk_range = (start, end)
         is_host_memory = engine is TransferEngine.GPU_DMA
@@ -107,7 +100,7 @@ def transfer_kv_per_object_group(
                 chunk_range=chunk_range,
             )
         else:
-            deferred += run_staged_loop(
+            run_staged_loop(
                 cache_context,
                 block_ids_gpu,
                 memory_objs,
@@ -118,5 +111,3 @@ def transfer_kv_per_object_group(
                 engine=engine,
                 chunk_range=chunk_range,
             )
-    if deferred:
-        defer_peer_runs(deferred)

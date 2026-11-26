@@ -19,6 +19,10 @@ from lmcache.v1.memory_management import (
     MemoryObj,
 )
 from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
+    DeferredNicRun,
+    defer_run,
+)
 from lmcache.v1.multiprocess.object_group_transfer.nvme_dma import NvmeDmaEngine
 import lmcache.lmcache_native as lmcache_native
 
@@ -33,7 +37,8 @@ class TransferEngine(enum.Enum):
     """Storage-backed object: a file read or write against GPU memory."""
     NIC_DMA = "nic_dma"
     """Borrowed object bound to a reader: its bytes are not mapped locally
-    and are read into GPU memory through the reader, retrieve only. Not staged here: the transfer hands its runs to the NIC DMA engine
+    and are read into GPU memory through the reader, retrieve only. Not
+    staged here: the transfer hands its runs to the NIC DMA engine
     (``nic_dma.py``), which reads them without blocking."""
 
 
@@ -82,6 +87,10 @@ _ENGINES: dict[TransferEngine, DMAEngine] = {
 }
 
 
+# Engines that stage outside the stream, and what takes their runs.
+_DEFERRING = {TransferEngine.NIC_DMA: defer_run}
+
+
 def stage(
     engine: TransferEngine,
     memory_objs: Sequence[MemoryObj],
@@ -108,6 +117,28 @@ def stage(
             "Objects a peer owns are only retrieved, through the NIC DMA engine"
         )
     _ENGINES[engine].stage(memory_objs, buffers, direction)
+
+
+def deferred(engine: TransferEngine, run: DeferredNicRun) -> bool:
+    """Hand a retrieve step to ``engine`` if it stages outside the stream.
+
+    Args:
+        engine: The engine of every object in ``run``.
+        run: The step: its objects and the kernels that follow them.
+
+    Returns:
+        True if the engine took ``run`` and will stage it and launch its
+        kernels later; False for an engine that stages on the stream, where
+        the caller stages and launches now.
+
+    Raises:
+        NotImplementedError: If the engine defers and the caller of the
+            transfer collects no peer runs.
+    """
+    defer = _DEFERRING.get(engine)
+    if defer is not None:
+        defer(run)
+    return defer is not None
 
 
 def split_into_runs(

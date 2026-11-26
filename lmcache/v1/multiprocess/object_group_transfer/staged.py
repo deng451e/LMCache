@@ -4,7 +4,6 @@ as one native plan (host-memory objects only) or one batch at a time."""
 
 # Standard
 from typing import Any, Sequence
-import functools
 
 # Third Party
 import torch
@@ -23,11 +22,12 @@ from lmcache.v1.mp_observability.event_bus import (
 )
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
+    deferred,
     stage,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     DeferredNicRun,
-    StagingBuffer,
+    Staging,
 )
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
     batched_iteration_with_skip,
@@ -251,8 +251,7 @@ def _launch_batch_kernels(
     batch_len: int,
     skip_tokens_in_chunk: int,
     direction: "lmcache_native.TransferDirection",
-    staging: StagingBuffer | None = None,
-    slots: Sequence[int] = (),
+    staging: Staging,
 ) -> None:
     """Launch the block kernel for one staged batch, once per kernel group.
 
@@ -261,12 +260,11 @@ def _launch_batch_kernels(
         block_ids_gpu: Block IDs on the GPU, per kernel group.
         object_group_id: Object group index.
         start_object_idx: Chunk index of the batch's first chunk.
-        batch_len: Chunks in the batch; chunk ``i`` is in staging slot ``i``
-            of the context's buffer, or ``slots[i]`` of ``staging``.
+        batch_len: Chunks in the batch; chunk ``i`` is in staging slot ``i``.
         skip_tokens_in_chunk: Leading tokens of the batch not written.
         direction: H2D (retrieve) or D2H (store).
-        staging: Another staging buffer the batch is in.
-        slots: The batch's slots in ``staging``.
+        staging: Where the batch is staged: the cache context, or the slots
+            an engine that stages outside the stream read it into.
     """
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager
@@ -309,11 +307,7 @@ def _launch_batch_kernels(
             kernel_group_id
         )
         tmp_gpu_buffers_batched = [
-            (
-                cache_context.get_temp_kernel_group_buffer(i, kernel_group_id)
-                if staging is None
-                else staging.get_temp_kernel_group_buffer(slots[i], kernel_group_id)
-            ).data_ptr()
+            staging.get_temp_kernel_group_buffer(i, kernel_group_id).data_ptr()
             for i in range(batch_len)
         ]
         device_ops.multi_layer_block_kv_transfer(
@@ -329,7 +323,7 @@ def _launch_batch_kernels(
         )
 
 
-def _launch_peer_batch(
+def _batch_run(
     cache_context: BaseCacheContext,
     block_ids_gpu: list[torch.Tensor],
     object_group_id: int,
@@ -337,20 +331,30 @@ def _launch_peer_batch(
     batch_len: int,
     skip_tokens_in_chunk: int,
     first: int,
-    staging: StagingBuffer,
-    slots: Sequence[int],
-) -> None:
-    _launch_batch_kernels(
-        cache_context,
-        block_ids_gpu,
-        object_group_id,
-        start_object_idx,
-        batch_len,
-        skip_tokens_in_chunk,
-        lmcache_native.TransferDirection.H2D,
-        staging,
-        [slots[0]] * first + list(slots),
-    )
+    memory_objs: Sequence[MemoryObj],
+) -> DeferredNicRun:
+    """Describe one retrieve batch for an engine that stages outside the
+    stream: its objects (chunks ``first`` to ``batch_len``) and its kernels."""
+
+    def targets(staging: Staging) -> list[torch.Tensor]:
+        return [
+            staging.get_temp_object_group_buffer(chunk_idx, object_group_id)
+            for chunk_idx in range(first, batch_len)
+        ]
+
+    def launch(staging: Staging, block_ids: list[torch.Tensor]) -> None:
+        _launch_batch_kernels(
+            cache_context,
+            block_ids,
+            object_group_id,
+            start_object_idx,
+            batch_len,
+            skip_tokens_in_chunk,
+            lmcache_native.TransferDirection.H2D,
+            staging,
+        )
+
+    return DeferredNicRun(memory_objs, block_ids_gpu, targets, launch, skipped=first)
 
 
 def run_staged_loop(
@@ -364,12 +368,8 @@ def run_staged_loop(
     *,
     engine: TransferEngine,
     chunk_range: tuple[int, int] | None = None,
-) -> list[DeferredNicRun]:
+) -> None:
     """Stage and transfer chunks one batch at a time, with any engine.
-
-    On retrieve, a batch of objects a peer owns is not staged: it is returned
-    as a run for the NIC DMA engine, with its own copy of the block ids (the
-    next transfer restages the buffer they live in).
 
     Args:
         cache_context: Cache context of the KV cache.
@@ -383,19 +383,15 @@ def run_staged_loop(
         engine: The engine of every object in the range.
         chunk_range: ``[start, end)`` chunks to move; None means all.
 
-    Returns:
-        The runs of objects a peer owns, in chunk order.
-
     Raises:
         ValueError: If a None entry is found on retrieve, or a store targets
             an object a peer owns.
+        NotImplementedError: If a retrieve meets an object a peer owns and
+            the caller collects no peer runs.
     """
     lmcache_chunk_size = cache_context.lmcache_tokens_per_chunk
     kv_groups_manager = cache_context.kv_layer_groups_manager
     is_h2d = direction == lmcache_native.TransferDirection.H2D
-    deferred: list[DeferredNicRun] = []
-    deferring = is_h2d and engine is TransferEngine.NIC_DMA
-    peer_block_ids = [ids.clone() for ids in block_ids_gpu] if deferring else []
 
     attn_desc = kv_groups_manager.get_attn_desc()
     num_objects_to_skip = 0
@@ -444,28 +440,19 @@ def run_staged_loop(
             for chunk_idx in range(first, batch_len)
         ]
 
-        if deferring:
-            deferred.append(
-                DeferredNicRun(
-                    staged_objs,
-                    lambda staging, slots: [
-                        staging.get_temp_object_group_buffer(slot, object_group_id)
-                        for slot in slots
-                    ],
-                    # The kernel skips the chunks before ``first``; their
-                    # pointers only fill the list.
-                    functools.partial(
-                        _launch_peer_batch,
-                        cache_context,
-                        peer_block_ids,
-                        object_group_id,
-                        start_object_idx,
-                        batch_len,
-                        skip_tokens_in_chunk,
-                        first,
-                    ),
-                )
-            )
+        if is_h2d and deferred(
+            engine,
+            _batch_run(
+                cache_context,
+                block_ids_gpu,
+                object_group_id,
+                start_object_idx,
+                batch_len,
+                skip_tokens_in_chunk,
+                first,
+                staged_objs,
+            ),
+        ):
             continue
         if is_h2d:
             stage(engine, staged_objs, staged_buffers, direction)
@@ -478,8 +465,8 @@ def run_staged_loop(
             batch_len,
             skip_tokens_in_chunk,
             direction,
+            cache_context,
         )
 
         if not is_h2d:
             stage(engine, staged_objs, staged_buffers, direction)
-    return deferred

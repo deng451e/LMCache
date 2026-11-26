@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 """NIC DMA engine: reads objects a peer owns into GPU memory without blocking.
 
-Transfers return the runs of peer-owned objects (:class:`DeferredNicRun`).
-:meth:`NicDmaEngine.read` reads them in waves into a NIC staging buffer that
-nothing on the stream uses, queues each wave's kernels once its reads landed,
-and frees the slots once those kernels finished. A :class:`HostPoller` checks
+A transfer hands the runs of peer-owned objects (:class:`DeferredNicRun`) to
+the caller's :func:`collect_peer_runs` block: a cache context's transfer
+callback returns nothing. :meth:`NicDmaEngine.read` reads them in waves into
+a NIC staging buffer that nothing on the stream uses, queues each wave's
+kernels once its reads landed, and frees the slots once those kernels
+finished. A :class:`HostPoller` checks
 the reads and events and hands each step to the instance's affinity worker;
 no stream waits on a host-written value. See
 ``docs/design/v1/distributed/l2_adapters/gdr_peer_l2_adapter.md``.
@@ -12,13 +14,20 @@ no stream waits on a host-written value. See
 
 # Standard
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Callable, Sequence
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
+from typing import Callable, Protocol, Sequence, runtime_checkable
 import threading
 import weakref
 
+# Third Party
+import torch
+
 # First Party
 from lmcache import torch_dev
+from lmcache.v1.common.buffer_registration import BufferRegistration
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.transfer_channel import (
     TransferChannelStagingRegistration,
@@ -27,15 +36,11 @@ from lmcache.v1.distributed.transfer_channel import (
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
     BorrowedReader,
+    MemoryObj,
     PendingRead,
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
-    DeferredNicRun,
-    StagingBuffer,
-    StagingBufferFactory,
-)
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.stream import record_completion_event
 
@@ -47,6 +52,202 @@ NIC_STAGING_BYTES = 512 << 20
 # Rows after the slots for an unfull chunk: one row plus at most one lead
 # block per kernel group.
 _SPARE_ROWS = 2
+
+
+class StagingBuffer(Protocol):
+    """Staging slots with a cache context's layout.
+
+    Slot ``i`` holds one chunk: object group ``g`` at
+    ``get_temp_object_group_buffer(i, g)``, kernel group ``k`` (as the block
+    kernel reads it) at ``get_temp_kernel_group_buffer(i, k)``.
+    """
+
+    @property
+    def buffer(self) -> torch.Tensor:
+        """The flat buffer every slot lies in."""
+        ...
+
+    def get_temp_object_group_buffer(
+        self, batch_idx: int, object_group_idx: int
+    ) -> torch.Tensor:
+        """Flat uint8 region of one object group in slot ``batch_idx``."""
+        ...
+
+    def get_temp_kernel_group_buffer(
+        self, batch_idx: int, kernel_group_idx: int
+    ) -> torch.Tensor:
+        """One kernel group in slot ``batch_idx``, shaped for the kernel."""
+        ...
+
+
+class Staging(Protocol):
+    """Where one transfer step is staged, indexed by its chunks: chunk ``i``
+    of the step is in slot ``i``. A cache context is one (its shared
+    buffer); the NIC DMA engine passes a view of the slots a wave got."""
+
+    def get_temp_object_group_buffer(
+        self, batch_idx: int, object_group_idx: int
+    ) -> torch.Tensor:
+        """Flat uint8 region of one object group of chunk ``batch_idx``."""
+        ...
+
+    def get_temp_kernel_group_buffer(
+        self, batch_idx: int, kernel_group_idx: int
+    ) -> torch.Tensor:
+        """One kernel group of chunk ``batch_idx``, shaped for the kernel."""
+        ...
+
+    def get_temp_staging_buffer(self, num_bytes: int) -> torch.Tensor | None:
+        """The first ``num_bytes`` bytes from chunk 0 on, as one flat region;
+        None if they do not fit."""
+        ...
+
+
+@runtime_checkable
+class StagingBufferFactory(Protocol):
+    """A cache context that can allocate staging buffers apart from the one
+    its transfers share. The NIC DMA engine needs one; a context without it
+    cannot retrieve objects a peer owns."""
+
+    def create_staging_buffer(
+        self,
+        num_slots: int,
+        slot_align_bytes: int,
+        registration: BufferRegistration,
+    ) -> StagingBuffer:
+        """Allocate a staging buffer of ``num_slots`` slots with the
+        context's layout.
+
+        The buffer is registered with ``registration`` on the context's
+        stream and deregistered when the context is closed.
+
+        Args:
+            num_slots: Slots in the buffer.
+            slot_align_bytes: Every slot starts on this power of two.
+            registration: Registers the buffer, e.g. with a transfer channel.
+
+        Returns:
+            The buffer.
+
+        Raises:
+            RuntimeError: If the registration fails.
+        """
+        ...
+
+
+@dataclass
+class DeferredNicRun:
+    """Device work that waits for objects a peer owns to be read.
+
+    A transfer hands it over instead of reading inline; the NIC DMA engine
+    reads ``memory_objs`` into staging slots it picks, then queues the
+    kernels.
+
+    Attributes:
+        memory_objs: The objects to read, in chunk order.
+        block_ids: The block ids the kernels use.
+        targets: ``staging -> regions``: where each object lands.
+        launch: ``(staging, block_ids) -> None``: queues the kernels that
+            copy the landed bytes into the paged KV cache.
+        skipped: Chunks of the step before the first object; the kernels
+            skip them, so they get no slot.
+        spans_slots: The object may extend past its slot into the following
+            ones (an unfull chunk with lead blocks), so the run needs the
+            slot at the end of the buffer that has room after it.
+    """
+
+    memory_objs: Sequence[MemoryObj]
+    block_ids: list[torch.Tensor]
+    targets: Callable[[Staging], list[torch.Tensor]]
+    launch: Callable[[Staging, list[torch.Tensor]], None]
+    skipped: int = 0
+    spans_slots: bool = False
+
+
+_peer_run_sink: ContextVar[list[DeferredNicRun] | None] = ContextVar(
+    "lmcache_peer_run_sink", default=None
+)
+
+
+@contextmanager
+def collect_peer_runs(runs: list[DeferredNicRun]) -> Iterator[None]:
+    """Append to ``runs`` the runs that transfers called inside the block,
+    on this thread, defer.
+
+    Args:
+        runs: Receives the runs, in transfer order.
+    """
+    token = _peer_run_sink.set(runs)
+    try:
+        yield
+    finally:
+        _peer_run_sink.reset(token)
+
+
+def defer_peer_runs(runs: Sequence[DeferredNicRun]) -> None:
+    """Hand ``runs`` to the caller's :func:`collect_peer_runs` block.
+
+    Args:
+        runs: The runs of objects a peer owns that a transfer did not read.
+
+    Raises:
+        NotImplementedError: If the caller collects none: it cannot read
+            objects a peer owns.
+    """
+    sink = _peer_run_sink.get()
+    if sink is None:
+        raise NotImplementedError(
+            "Objects a peer owns need the NIC DMA engine: transfer them "
+            "inside collect_peer_runs()"
+        )
+    sink.extend(runs)
+
+
+def defer_run(run: DeferredNicRun) -> None:
+    """Hand one run to the caller's :func:`collect_peer_runs` block, with
+    its own copy of the block ids: the next transfer restages the buffer
+    they live in.
+
+    Args:
+        run: The run a transfer did not read.
+
+    Raises:
+        NotImplementedError: If the caller collects none.
+    """
+    defer_peer_runs([replace(run, block_ids=[ids.clone() for ids in run.block_ids])])
+
+
+class _SlotView:
+    """The slots a run got in a NIC staging buffer, as its :class:`Staging`."""
+
+    def __init__(self, buffer: StagingBuffer, slots: Sequence[int], skipped: int):
+        self._buffer = buffer
+        self._slots = slots
+        self._skipped = skipped
+
+    def get_temp_object_group_buffer(
+        self, batch_idx: int, object_group_idx: int
+    ) -> torch.Tensor:
+        return self._buffer.get_temp_object_group_buffer(
+            self._slot(batch_idx), object_group_idx
+        )
+
+    def get_temp_kernel_group_buffer(
+        self, batch_idx: int, kernel_group_idx: int
+    ) -> torch.Tensor:
+        return self._buffer.get_temp_kernel_group_buffer(
+            self._slot(batch_idx), kernel_group_idx
+        )
+
+    def get_temp_staging_buffer(self, num_bytes: int) -> torch.Tensor | None:
+        flat = self._buffer.buffer
+        start = self.get_temp_object_group_buffer(0, 0).data_ptr() - flat.data_ptr()
+        return flat[start : start + num_bytes]
+
+    def _slot(self, batch_idx: int) -> int:
+        # The kernels skip the chunks before the first object; their
+        # pointers only fill the list.
+        return self._slots[max(0, batch_idx - self._skipped)]
 
 
 def _complete(
@@ -193,10 +394,8 @@ class _Retrieve:
         ] = {}
         free = iter(slots)
         for run in wave.runs:
-            run_slots = [next(free) for _ in run.memory_objs]
-            for obj, target in zip(
-                run.memory_objs, run.targets(buffer, run_slots), strict=True
-            ):
+            view = _SlotView(buffer, [next(free) for _ in run.memory_objs], run.skipped)
+            for obj, target in zip(run.memory_objs, run.targets(view), strict=True):
                 if not isinstance(obj, BorrowedMemoryObj):
                     raise ValueError(f"Not an object a peer owns: {obj!r}")
                 if obj.get_size() != target.nbytes:
@@ -221,8 +420,10 @@ class _Retrieve:
             try:
                 free = iter(slots)
                 for run in wave.runs:
+                    run_slots = [next(free) for _ in run.memory_objs]
                     run.launch(
-                        self._staging.buffer, [next(free) for _ in run.memory_objs]
+                        _SlotView(self._staging.buffer, run_slots, run.skipped),
+                        run.block_ids,
                     )
             except Exception:
                 logger.exception("Cannot queue the kernels of a peer read")

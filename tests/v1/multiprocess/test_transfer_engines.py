@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 # Third Party
 import pytest
+import torch
 
 # First Party
 from lmcache.v1.memory_management import (
@@ -21,11 +22,13 @@ from lmcache.v1.multiprocess.object_group_transfer import (
 )
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
+    deferred,
     select_engine,
     split_into_runs,
     stage,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
+    DeferredNicRun,
     collect_peer_runs,
 )
 import lmcache.lmcache_native as lmcache_native
@@ -72,6 +75,24 @@ def test_storing_into_an_object_a_peer_owns_is_rejected():
         )
 
 
+def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
+    """A caller that collects no peer runs cannot read objects a peer owns,
+    as before the NIC DMA engine. A collected run keeps its own block ids."""
+    run = DeferredNicRun(
+        [_peer()], [torch.arange(2)], lambda staging: [], lambda staging, ids: None
+    )
+    assert not deferred(GPU, run) and not deferred(NVME, run)
+    with pytest.raises(NotImplementedError):
+        deferred(NIC, run)
+    collected: list = []
+    with collect_peer_runs(collected):
+        assert deferred(NIC, run)
+    (taken,) = collected
+    assert taken.memory_objs is run.memory_objs
+    assert taken.block_ids[0] is not run.block_ids[0]
+    assert taken.block_ids[0].tolist() == [0, 1]
+
+
 @pytest.mark.parametrize(
     "pattern, expected",
     [
@@ -95,8 +116,7 @@ def test_chunks_split_into_consecutive_same_engine_runs(pattern, expected):
 
 def _transfer(monkeypatch, pattern: str) -> list[tuple[str, tuple[int, int]]]:
     """Run the dispatcher with the copy paths stubbed and no direct copy;
-    return each run's path and chunk range, in call order. What the staged
-    loop returns for NIC runs must reach the caller's collect_peer_runs."""
+    return each run's path and chunk range, in call order."""
     calls: list[tuple[str, tuple[int, int]]] = []
     monkeypatch.setattr(dispatch, "batch_memcpy_available", lambda: False)
     monkeypatch.setattr(dispatch, "native_plan_available", lambda: True)
@@ -108,43 +128,20 @@ def _transfer(monkeypatch, pattern: str) -> list[tuple[str, tuple[int, int]]]:
     monkeypatch.setattr(
         dispatch,
         "run_staged_loop",
-        lambda *a, **k: (
-            calls.append((k["engine"].value, k["chunk_range"]))
-            or [k["chunk_range"]] * (k["engine"] is NIC)
-        ),
+        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])),
     )
-    collected: list = []
-    with collect_peer_runs(collected):
-        transfer_kv_per_object_group(
-            MagicMock(),
-            block_ids_gpu=[MagicMock()],
-            memory_objs=_objects(pattern),
-            object_group_id=0,
-            batch_size=4,
-            skip_first_n_tokens=0,
-            direction=lmcache_native.TransferDirection.H2D,
-            transfer_key="test",
-            block_ids_host=[[1, 2]],
-        )
-    assert collected == [r for e, r in calls if e == "nic_dma"]
+    transfer_kv_per_object_group(
+        MagicMock(),
+        block_ids_gpu=[MagicMock()],
+        memory_objs=_objects(pattern),
+        object_group_id=0,
+        batch_size=4,
+        skip_first_n_tokens=0,
+        direction=lmcache_native.TransferDirection.H2D,
+        transfer_key="test",
+        block_ids_host=[[1, 2]],
+    )
     return calls
-
-
-def test_peer_runs_nobody_collects_are_refused(monkeypatch):
-    """A caller that does not collect peer runs cannot read objects a peer
-    owns, as before the NIC DMA engine."""
-    monkeypatch.setattr(dispatch, "run_staged_loop", lambda *a, **k: ["run"])
-    with pytest.raises(NotImplementedError):
-        transfer_kv_per_object_group(
-            MagicMock(),
-            block_ids_gpu=[MagicMock()],
-            memory_objs=_objects("p"),
-            object_group_id=0,
-            batch_size=4,
-            skip_first_n_tokens=0,
-            direction=lmcache_native.TransferDirection.H2D,
-            transfer_key="test",
-        )
 
 
 def test_single_engine_group_is_one_transfer_over_every_chunk(monkeypatch):
@@ -173,7 +170,7 @@ def test_host_memory_stages_per_batch_without_the_native_plan(monkeypatch):
     monkeypatch.setattr(
         dispatch,
         "run_staged_loop",
-        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])) or [],
+        lambda *a, **k: calls.append((k["engine"].value, k["chunk_range"])),
     )
     transfer_kv_per_object_group(
         MagicMock(),

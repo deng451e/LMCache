@@ -29,7 +29,7 @@ from lmcache.v1.multiprocess.object_group_transfer import (  # noqa: E402
 from lmcache.v1.multiprocess.object_group_transfer.engines import (  # noqa: E402
     TransferEngine,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (  # noqa: E402
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (  # noqa: E402
     collect_peer_runs,
 )
 from tests.v1.platform.devices.cuda.test_gdr_staging_region import (  # noqa: E402

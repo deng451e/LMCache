@@ -48,9 +48,9 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     trim_and_stage_unfull_chunk_block_ids,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
-from lmcache.v1.multiprocess.object_group_transfer.nic_staging import (
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
     DeferredNicRun,
+    NicDmaEngine,
     collect_peer_runs,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
@@ -1333,7 +1333,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             total_bytes = 0
             num_tokens = 0
-            # Batches of objects a peer owns, returned by the transfers: the
+            # Steps of objects a peer owns, deferred by the transfers: the
             # NIC DMA engine reads them once everything else is queued.
             peer_runs: list[DeferredNicRun] = []
             retrieve_succeeded = True
@@ -1370,20 +1370,20 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         )
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
-                    total_bytes += self._retrieve_unfull_chunk_objects(
-                        cache_context,
-                        key,
-                        unfull_retained_keys,
-                        [
-                            group
-                            for group in range(num_object_groups)
-                            if group not in skipped_groups
-                        ],
-                        unfull_block_ids,
-                        max(0, skip_first_n_tokens - num_chunks * chunk_size),
-                        chunk_size,
-                        peer_runs,
-                    )
+                    with collect_peer_runs(peer_runs):
+                        total_bytes += self._retrieve_unfull_chunk_objects(
+                            cache_context,
+                            key,
+                            unfull_retained_keys,
+                            [
+                                group
+                                for group in range(num_object_groups)
+                                if group not in skipped_groups
+                            ],
+                            unfull_block_ids,
+                            max(0, skip_first_n_tokens - num_chunks * chunk_size),
+                            chunk_size,
+                        )
                     prefetched_keys.extend(unfull_retained_keys)
             except Exception:
                 logger.exception("Cannot retrieve keys due to exception")
@@ -1620,7 +1620,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         block_ids: list[list[int]],
         skip_first_n_tokens: int,
         chunk_size: int,
-        peer_runs: list[DeferredNicRun],
     ) -> int:
         """Copy an unfull chunk's read-locked objects into the GPU blocks.
 
@@ -1637,8 +1636,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             skip_first_n_tokens: Leading tokens of the unfull chunk not to
                 write: the engine's prefix cache holds them in shared blocks.
             chunk_size: Effective logical tokens per registered chunk.
-            peer_runs: Receives the objects a peer owns, which are not
-                queued here but read by the NIC DMA engine.
 
         Returns:
             The bytes copied.
@@ -1669,7 +1666,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         for obj_group_id, memory_obj, object_buffer in zip(
             obj_group_ids, memory_objs, object_buffers, strict=True
         ):
-            peer_run = transfer_unfull_chunk(
+            transfer_unfull_chunk(
                 cache_context,
                 block_ids_gpu,
                 skip_blocks,
@@ -1679,6 +1676,4 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 object_buffer,
                 lmcache_native.TransferDirection.H2D,
             )
-            if peer_run is not None:
-                peer_runs.append(peer_run)
         return sum(memory_obj.get_size() for memory_obj in memory_objs)
