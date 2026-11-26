@@ -62,18 +62,22 @@ The shared transfer code has no NIC branch. For every retrieve step (a
 kernel batch of full chunks, or the unfull chunk) it asks
 `engines.deferred(engine, run)`. An engine that stages on the stream answers
 False and the step is staged and launched as before. The NIC entry takes the
-step as a `DeferredNicRun` into the `collect_peer_runs(...)` block the
+step as a `DeferredRun` into the `collect_deferred_runs(...)` block the
 handler wraps around its transfers. `platform/base` is not involved: the
 context's transfer callback still returns nothing. A caller without such a
 block gets `NotImplementedError` for a peer-owned object, as before.
-Everything NIC-specific is in `object_group_transfer/nic_dma.py`:
+The handler knows only the generic interface in
+`object_group_transfer/deferred.py` (`DeferredRun`, `collect_deferred_runs`,
+`DeferredTransferEngine`) and gets its engine from
+`engines.create_deferred_engine()`. Everything NIC-specific is in
+`object_group_transfer/nic_dma.py`:
 
 ```
-RETRIEVE handler (affinity worker), inside collect_peer_runs(peer_runs):
+RETRIEVE handler (affinity worker), inside collect_deferred_runs(deferred_runs):
   host-memory and storage steps → staged and queued on the stream as usual
-  peer steps → engines.deferred() → DeferredNicRun in peer_runs
+  peer steps → engines.deferred() → DeferredRun in deferred_runs
                (one per kernel batch, one for the unfull chunk; own block ids)
-  NicDmaEngine.read(cache_context, peer_runs, finish) → DeferredResponse
+  NicDmaEngine.read(cache_context, deferred_runs, finish) → DeferredResponse
                                                         worker is free again
 
 per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
@@ -92,7 +96,7 @@ after the last wave's kernels are queued (on the worker):
   → DeferredResponse = (event handle, True)
 
 instance unregistered or reaped:
-  NicDmaEngine.drain(cache_context, load timeout + 1 s)
+  NicDmaEngine.drain(cache_context)  # waits load timeout + 1 s
       new reads of the context fail at once; waves not started are dropped
       waits for the reads in flight, then the context is closed
 ```

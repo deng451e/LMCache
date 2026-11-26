@@ -48,10 +48,12 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     trim_and_stage_unfull_chunk_block_ids,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredNicRun,
-    NicDmaEngine,
-    collect_peer_runs,
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    DeferredRun,
+    collect_deferred_runs,
+)
+from lmcache.v1.multiprocess.object_group_transfer.engines import (
+    create_deferred_engine,
 )
 from lmcache.v1.multiprocess.request_handler import HandlerType, request_handler
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
@@ -239,8 +241,6 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
     """
 
     module_name = "lmcache_driven_transfer"
-    # How long releasing an instance waits for its peer reads to stop.
-    _peer_read_drain_s: float = 31.0
 
     @classmethod
     def create(cls, build_ctx: ModuleBuildContext) -> EngineModule | None:
@@ -252,14 +252,14 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             build_ctx.engine_context,
             fd_socket_path=fd_channel_path(build_ctx.mp_config.port),
         )
-        module._peer_read_drain_s = build_ctx.mp_config.p2p_config.load_timeout + 1
+        module._deferred_engine.configure(build_ctx.mp_config)
         return module
 
     def __init__(self, ctx: MPCacheServerContext, fd_socket_path: str = "") -> None:
         self._ctx = ctx
         self._cache_contexts: dict[int, ContextEntry] = {}
-        # Reads objects a peer owns (GPU-direct borrowing) without blocking.
-        self._nic_dma = NicDmaEngine()
+        # Runs the retrieve steps that transfers defer, without blocking.
+        self._deferred_engine = create_deferred_engine()
         # Guards all reads/writes of _cache_contexts. The reaper mutates it
         # off the MQ main loop, so register/unregister/store/retrieve and
         # report_status all serialize through this lock. Held only for dict
@@ -465,15 +465,14 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
         if not entries:
             return
         for entry in entries:
-            # Peer reads land outside the stream, which close() waits for.
-            if self._nic_dma.drain(entry.cache_context, self._peer_read_drain_s):
+            # Deferred steps run outside the stream, which close() waits for.
+            if self._deferred_engine.drain(entry.cache_context):
                 entry.cache_context.close()
             else:
                 logger.error(
-                    "Peer reads of %s did not stop in %.0f s: its cache context "
-                    "stays open, since they may still write to its slots",
+                    "Deferred transfers of %s did not stop: its cache context "
+                    "stays open, since they may still write to its staging",
                     entry.model_name,
-                    self._peer_read_drain_s,
                 )
             self._ctx.layout_desc_registry.unregister(
                 entry.model_name, entry.world_size
@@ -514,7 +513,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
 
     def close(self) -> None:
         """Release GPU resources owned by this module."""
-        self._nic_dma.close()
+        self._deferred_engine.close()
         # Stop the drain thread before storage_manager.close() so any
         # in-flight completions reach a live storage manager.
         self._device_host_func_dispatcher.stop()
@@ -1165,9 +1164,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             that signals the completion of the retrieve operation, and the
             second element indicates whether the key was successfully retrieved.
             The event handle is empty when no device work was submitted. A
-            retrieve of objects a peer owns returns a ``DeferredResponse``
-            for the same tuple: it completes once their reads landed and
-            their kernels are queued, with False if a read failed (the
+            retrieve whose transfers deferred steps returns a
+            ``DeferredResponse`` for the same tuple: it completes once
+            their kernels are queued, with False if a step failed (the
             engine then recomputes the blocks).
 
         Raises:
@@ -1333,9 +1332,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             )
             total_bytes = 0
             num_tokens = 0
-            # Steps of objects a peer owns, deferred by the transfers: the
-            # NIC DMA engine reads them once everything else is queued.
-            peer_runs: list[DeferredNicRun] = []
+            # Steps the transfers deferred: the deferred engine runs them
+            # once everything else is queued.
+            deferred_runs: list[DeferredRun] = []
             retrieve_succeeded = True
             try:
                 for obj_group_id in range(num_object_groups):
@@ -1357,7 +1356,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     total_bytes += sum(mo.get_size() for mo in window_objs)
                     # None-pad the skipped prefix so block-id slicing is unchanged.
                     memory_objs: list[MemoryObj | None] = [None] * skip + window_objs
-                    with collect_peer_runs(peer_runs):
+                    with collect_deferred_runs(deferred_runs):
                         cache_context.transfer_object_group(
                             block_ids_per_group_gpu,
                             memory_objs,
@@ -1370,7 +1369,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                         )
                     prefetched_keys.extend(in_window_keys)
                 if retrieve_succeeded and unfull_retained_keys:
-                    with collect_peer_runs(peer_runs):
+                    with collect_deferred_runs(deferred_runs):
                         total_bytes += self._retrieve_unfull_chunk_objects(
                             cache_context,
                             key,
@@ -1390,7 +1389,7 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                 retrieve_succeeded = False
 
             # Completes the retrieve; it runs after the last device work is
-            # queued, which for peer_runs is once their reads landed.
+            # queued, which for deferred_runs is once they were staged.
             def finish() -> None:
                 nonlocal num_tokens
                 event_backend.record_event(event, cache_context.stream)
@@ -1424,11 +1423,11 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
                     ),
                 )
 
-            if not (retrieve_succeeded and peer_runs):
+            if not (retrieve_succeeded and deferred_runs):
                 finish()
-        if retrieve_succeeded and peer_runs:
+        if retrieve_succeeded and deferred_runs:
 
-            def finish_peer_reads(succeeded: bool) -> tuple[bytes, bool]:
+            def finish_deferred(succeeded: bool) -> tuple[bytes, bool]:
                 if not succeeded:
                     prefetched_keys.clear()
                 finish()
@@ -1440,7 +1439,9 @@ class LMCacheDrivenTransferModule(DiscoverableModule, InstanceLivenessTarget):
             # response; the annotation stays the wire type.
             return cast(
                 tuple[bytes, bool],
-                self._nic_dma.read(cache_context, peer_runs, finish_peer_reads),
+                self._deferred_engine.read(
+                    cache_context, deferred_runs, finish_deferred
+                ),
             )
         if retrieve_succeeded:
             ed = time.perf_counter()

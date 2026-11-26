@@ -27,8 +27,8 @@ from lmcache.v1.multiprocess.object_group_transfer import (
     transfer_unfull_chunk,
     unfull_chunk,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    collect_peer_runs,
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    collect_deferred_runs,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -177,7 +177,7 @@ def h(monkeypatch):
     def runs(objs, skip=0, block_ids=None):
         ids = block_ids or [torch.arange(4 * len(objs)) for _ in range(2)]
         collected: list = []
-        with collect_peer_runs(collected):
+        with collect_deferred_runs(collected):
             transfer_kv_per_object_group(
                 cc, ids, objs, 0, 2, skip, H2D, transfer_key="t"
             )
@@ -355,7 +355,7 @@ def test_unfull_chunks_use_the_spare_rows_one_at_a_time(h) -> None:
     """An unfull chunk's object can extend past its slot."""
     buffer = h.cc.get_temp_object_group_buffer(0, 0)
     runs: list = []
-    with collect_peer_runs(runs):
+    with collect_deferred_runs(runs):
         for n in ("u1", "u2"):
             ids = [torch.arange(4)] * 2
             transfer_unfull_chunk(

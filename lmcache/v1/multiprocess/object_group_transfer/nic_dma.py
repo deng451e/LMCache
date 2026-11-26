@@ -1,24 +1,19 @@
 # SPDX-License-Identifier: Apache-2.0
 """NIC DMA engine: reads objects a peer owns into GPU memory without blocking.
 
-A transfer hands the runs of peer-owned objects (:class:`DeferredNicRun`) to
-the caller's :func:`collect_peer_runs` block: a cache context's transfer
-callback returns nothing. :meth:`NicDmaEngine.read` reads them in waves into
-a NIC staging buffer that nothing on the stream uses, queues each wave's
-kernels once its reads landed, and frees the slots once those kernels
-finished. A :class:`HostPoller` checks
-the reads and events and hands each step to the instance's affinity worker;
-no stream waits on a host-written value. See
+The deferred transfer engine (``deferred.py``) of objects bound to a reader:
+:meth:`NicDmaEngine.read` reads their runs in waves into a NIC staging
+buffer that nothing on the stream uses, queues each wave's kernels once its
+reads landed, and frees the slots once those kernels finished. A
+:class:`HostPoller` checks the reads and events and hands each step to the
+instance's affinity worker; no stream waits on a host-written value. See
 ``docs/design/v1/distributed/l2_adapters/gdr_peer_l2_adapter.md``.
 """
 
 # Standard
 from collections import deque
-from collections.abc import Iterator
-from contextlib import contextmanager
-from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
-from typing import Callable, Protocol, Sequence, runtime_checkable
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Callable, Protocol, Sequence, runtime_checkable
 import threading
 import weakref
 
@@ -35,13 +30,17 @@ from lmcache.v1.distributed.transfer_channel import (
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
     BorrowedReader,
-    MemoryObj,
     PendingRead,
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
 from lmcache.v1.multiprocess.host_poller import HostPoller
+from lmcache.v1.multiprocess.object_group_transfer.deferred import DeferredRun
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 from lmcache.v1.platform.stream import record_completion_event
+
+if TYPE_CHECKING:
+    # First Party
+    from lmcache.v1.multiprocess.config import MPServerConfig
 
 logger = init_logger(__name__)
 
@@ -79,29 +78,6 @@ class StagingBuffer(Protocol):
         ...
 
 
-class Staging(Protocol):
-    """Where one transfer step is staged, indexed by its chunks: chunk ``i``
-    of the step is in slot ``i``. A cache context is one (its shared
-    buffer); the NIC DMA engine passes a view of the slots a wave got."""
-
-    def get_temp_object_group_buffer(
-        self, batch_idx: int, object_group_idx: int
-    ) -> torch.Tensor:
-        """Flat uint8 region of one object group of chunk ``batch_idx``."""
-        ...
-
-    def get_temp_kernel_group_buffer(
-        self, batch_idx: int, kernel_group_idx: int
-    ) -> torch.Tensor:
-        """One kernel group of chunk ``batch_idx``, shaped for the kernel."""
-        ...
-
-    def get_temp_staging_buffer(self, num_bytes: int) -> torch.Tensor | None:
-        """The first ``num_bytes`` bytes from chunk 0 on, as one flat region;
-        None if they do not fit."""
-        ...
-
-
 @runtime_checkable
 class StagingBufferFactory(Protocol):
     """A cache context that can allocate staging buffers apart from the one
@@ -131,88 +107,6 @@ class StagingBufferFactory(Protocol):
             RuntimeError: If the registration fails.
         """
         ...
-
-
-@dataclass
-class DeferredNicRun:
-    """Device work that waits for objects a peer owns to be read.
-
-    A transfer hands it over instead of reading inline; the NIC DMA engine
-    reads ``memory_objs`` into staging slots it picks, then queues the
-    kernels.
-
-    Attributes:
-        memory_objs: The objects to read, in chunk order.
-        block_ids: The block ids the kernels use.
-        targets: ``staging -> regions``: where each object lands.
-        launch: ``(staging, block_ids) -> None``: queues the kernels that
-            copy the landed bytes into the paged KV cache.
-        skipped: Chunks of the step before the first object; the kernels
-            skip them, so they get no slot.
-        spans_slots: The object may extend past its slot into the following
-            ones (an unfull chunk with lead blocks), so the run needs the
-            slot at the end of the buffer that has room after it.
-    """
-
-    memory_objs: Sequence[MemoryObj]
-    block_ids: list[torch.Tensor]
-    targets: Callable[[Staging], list[torch.Tensor]]
-    launch: Callable[[Staging, list[torch.Tensor]], None]
-    skipped: int = 0
-    spans_slots: bool = False
-
-
-_peer_run_sink: ContextVar[list[DeferredNicRun] | None] = ContextVar(
-    "lmcache_peer_run_sink", default=None
-)
-
-
-@contextmanager
-def collect_peer_runs(runs: list[DeferredNicRun]) -> Iterator[None]:
-    """Append to ``runs`` the runs that transfers called inside the block,
-    on this thread, defer.
-
-    Args:
-        runs: Receives the runs, in transfer order.
-    """
-    token = _peer_run_sink.set(runs)
-    try:
-        yield
-    finally:
-        _peer_run_sink.reset(token)
-
-
-def defer_peer_runs(runs: Sequence[DeferredNicRun]) -> None:
-    """Hand ``runs`` to the caller's :func:`collect_peer_runs` block.
-
-    Args:
-        runs: The runs of objects a peer owns that a transfer did not read.
-
-    Raises:
-        NotImplementedError: If the caller collects none: it cannot read
-            objects a peer owns.
-    """
-    sink = _peer_run_sink.get()
-    if sink is None:
-        raise NotImplementedError(
-            "Objects a peer owns need the NIC DMA engine: transfer them "
-            "inside collect_peer_runs()"
-        )
-    sink.extend(runs)
-
-
-def defer_run(run: DeferredNicRun) -> None:
-    """Hand one run to the caller's :func:`collect_peer_runs` block, with
-    its own copy of the block ids: the next transfer restages the buffer
-    they live in.
-
-    Args:
-        run: The run a transfer did not read.
-
-    Raises:
-        NotImplementedError: If the caller collects none.
-    """
-    defer_peer_runs([replace(run, block_ids=[ids.clone() for ids in run.block_ids])])
 
 
 class _SlotView:
@@ -303,7 +197,7 @@ class _SlotPool:
 class _Wave:
     retrieve: "_Retrieve"
     pool: _SlotPool
-    runs: list[DeferredNicRun] = field(default_factory=list)
+    runs: list[DeferredRun] = field(default_factory=list)
     started: bool = False
 
     @property
@@ -337,7 +231,7 @@ class _Retrieve:
         cache_context: BaseCacheContext,
         staging: _NicStaging,
         poller: HostPoller,
-        runs: Sequence[DeferredNicRun],
+        runs: Sequence[DeferredRun],
         finish: Callable[[bool], object],
     ) -> None:
         self._cache_context = cache_context
@@ -470,6 +364,8 @@ class NicDmaEngine:
 
     def __init__(self, poller: HostPoller | None = None) -> None:
         self._poller = poller
+        # How long drain() waits; configure() sets it from the load timeout.
+        self._drain_timeout_s = 31.0
         self._closed = False
         self._lock = threading.Lock()
         # By id(context); drain() removes a context's entry before the
@@ -481,10 +377,19 @@ class NicDmaEngine:
         # reads did not stop in time stays: it is never freed.
         self._draining: list[_NicStaging] = []
 
+    def configure(self, mp_config: "MPServerConfig") -> None:
+        """Bound :meth:`drain` by the peer load timeout: a read past it is
+        cancelled, so one more second covers the cancel.
+
+        Args:
+            mp_config: The server configuration.
+        """
+        self._drain_timeout_s = mp_config.p2p_config.load_timeout + 1
+
     def read(
         self,
         cache_context: BaseCacheContext,
-        runs: Sequence[DeferredNicRun],
+        runs: Sequence[DeferredRun],
         finish: Callable[[bool], object],
     ) -> DeferredResponse:
         """Read ``runs`` and queue their kernels; return at once. Call on the
@@ -527,7 +432,9 @@ class NicDmaEngine:
             return response
         return _Retrieve(cache_context, staging, poller, runs, finish).response
 
-    def drain(self, cache_context: BaseCacheContext, timeout_s: float) -> bool:
+    def drain(
+        self, cache_context: BaseCacheContext, timeout_s: float | None = None
+    ) -> bool:
         """Wait until every retrieve of ``cache_context`` completed. Call
         before closing the context, and not on its affinity worker: closing
         deregisters the slots reads land in and unmaps the KV cache their
@@ -537,13 +444,15 @@ class NicDmaEngine:
 
         Args:
             cache_context: The context about to be closed.
-            timeout_s: How long to wait.
+            timeout_s: How long to wait; the configured timeout if None.
 
         Returns:
             False if a retrieve is still running after ``timeout_s``: the
             context must then stay open. Its NIC staging buffer is kept
             for good, since a read may still write to it.
         """
+        if timeout_s is None:
+            timeout_s = self._drain_timeout_s
         with self._lock:
             self._released.add(cache_context)
             staging = self._staging.pop(id(cache_context), None)

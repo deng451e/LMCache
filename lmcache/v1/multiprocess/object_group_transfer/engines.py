@@ -18,11 +18,13 @@ from lmcache.v1.memory_management import (
     GDSMemoryObject,
     MemoryObj,
 )
-from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredNicRun,
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    DeferredRun,
+    DeferredTransferEngine,
     defer_run,
 )
+from lmcache.v1.multiprocess.object_group_transfer.gpu_dma import GpuDmaEngine
+from lmcache.v1.multiprocess.object_group_transfer.nic_dma import NicDmaEngine
 from lmcache.v1.multiprocess.object_group_transfer.nvme_dma import NvmeDmaEngine
 import lmcache.lmcache_native as lmcache_native
 
@@ -38,7 +40,7 @@ class TransferEngine(enum.Enum):
     NIC_DMA = "nic_dma"
     """Borrowed object bound to a reader: its bytes are not mapped locally
     and are read into GPU memory through the reader, retrieve only. Not
-    staged here: the transfer hands its runs to the NIC DMA engine
+    staged here: the transfer defers its runs to the NIC DMA engine
     (``nic_dma.py``), which reads them without blocking."""
 
 
@@ -87,8 +89,13 @@ _ENGINES: dict[TransferEngine, DMAEngine] = {
 }
 
 
-# Engines that stage outside the stream, and what takes their runs.
-_DEFERRING = {TransferEngine.NIC_DMA: defer_run}
+# Engines that stage outside the stream: their retrieve steps are deferred.
+_DEFERRING = frozenset({TransferEngine.NIC_DMA})
+
+
+def create_deferred_engine() -> DeferredTransferEngine:
+    """Return a new engine that runs the steps :func:`deferred` hands over."""
+    return NicDmaEngine()
 
 
 def stage(
@@ -119,7 +126,7 @@ def stage(
     _ENGINES[engine].stage(memory_objs, buffers, direction)
 
 
-def deferred(engine: TransferEngine, run: DeferredNicRun) -> bool:
+def deferred(engine: TransferEngine, run: DeferredRun) -> bool:
     """Hand a retrieve step to ``engine`` if it stages outside the stream.
 
     Args:
@@ -133,12 +140,12 @@ def deferred(engine: TransferEngine, run: DeferredNicRun) -> bool:
 
     Raises:
         NotImplementedError: If the engine defers and the caller of the
-            transfer collects no peer runs.
+            transfer collects no deferred runs.
     """
-    defer = _DEFERRING.get(engine)
-    if defer is not None:
-        defer(run)
-    return defer is not None
+    if engine not in _DEFERRING:
+        return False
+    defer_run(run)
+    return True
 
 
 def split_into_runs(

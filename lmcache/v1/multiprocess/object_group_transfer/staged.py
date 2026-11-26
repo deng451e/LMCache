@@ -20,14 +20,14 @@ from lmcache.v1.mp_observability.event_bus import (
     get_event_bus,
     is_observability_enabled,
 )
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    DeferredRun,
+    Staging,
+)
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     TransferEngine,
     deferred,
     stage,
-)
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredNicRun,
-    Staging,
 )
 from lmcache.v1.multiprocess.object_group_transfer.planning import (
     batched_iteration_with_skip,
@@ -332,7 +332,7 @@ def _batch_run(
     skip_tokens_in_chunk: int,
     first: int,
     memory_objs: Sequence[MemoryObj],
-) -> DeferredNicRun:
+) -> DeferredRun:
     """Describe one retrieve batch for an engine that stages outside the
     stream: its objects (chunks ``first`` to ``batch_len``) and its kernels."""
 
@@ -354,7 +354,7 @@ def _batch_run(
             staging,
         )
 
-    return DeferredNicRun(memory_objs, block_ids_gpu, targets, launch, skipped=first)
+    return DeferredRun(memory_objs, block_ids_gpu, targets, launch, skipped=first)
 
 
 def run_staged_loop(

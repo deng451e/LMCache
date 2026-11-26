@@ -27,9 +27,9 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
     split_into_runs,
     stage,
 )
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredNicRun,
-    collect_peer_runs,
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    DeferredRun,
+    collect_deferred_runs,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -78,14 +78,14 @@ def test_storing_into_an_object_a_peer_owns_is_rejected():
 def test_only_the_nic_engine_defers_a_retrieve_step_to_the_collector():
     """A caller that collects no peer runs cannot read objects a peer owns,
     as before the NIC DMA engine. A collected run keeps its own block ids."""
-    run = DeferredNicRun(
+    run = DeferredRun(
         [_peer()], [torch.arange(2)], lambda staging: [], lambda staging, ids: None
     )
     assert not deferred(GPU, run) and not deferred(NVME, run)
     with pytest.raises(NotImplementedError):
         deferred(NIC, run)
     collected: list = []
-    with collect_peer_runs(collected):
+    with collect_deferred_runs(collected):
         assert deferred(NIC, run)
     (taken,) = collected
     assert taken.memory_objs is run.memory_objs

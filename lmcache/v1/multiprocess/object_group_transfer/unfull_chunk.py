@@ -12,14 +12,14 @@ import torch
 from lmcache import device_ops
 from lmcache.v1.distributed.api import MemoryLayoutDesc
 from lmcache.v1.memory_management import MemoryObj
+from lmcache.v1.multiprocess.object_group_transfer.deferred import (
+    DeferredRun,
+    Staging,
+)
 from lmcache.v1.multiprocess.object_group_transfer.engines import (
     deferred,
     select_engine,
     stage,
-)
-from lmcache.v1.multiprocess.object_group_transfer.nic_dma import (
-    DeferredNicRun,
-    Staging,
 )
 from lmcache.v1.platform.base.cache_context import BaseCacheContext
 import lmcache.lmcache_native as lmcache_native
@@ -270,7 +270,7 @@ def transfer_unfull_chunk(
 
     if is_h2d and deferred(
         engine,
-        DeferredNicRun([memory_obj], block_ids_gpu, targets, launch, spans_slots=True),
+        DeferredRun([memory_obj], block_ids_gpu, targets, launch, spans_slots=True),
     ):
         return
     if is_h2d:

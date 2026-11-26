@@ -12,7 +12,8 @@ planning) driven from `lmcache/v1/multiprocess/modules/lmcache_driven_transfer.p
 | `engines.py` | which transfer engine moves an object, the split of a group into same-engine runs, the `DMAEngine` protocol and `stage`, which calls the engine |
 | `gpu_dma.py` | `GpuDmaEngine`: host/GPU copies queued on the stream |
 | `nvme_dma.py` | `NvmeDmaEngine`: GDS slab reads and writes queued on the stream |
-| `nic_dma.py` | everything NIC-specific: `NicDmaEngine` (non-blocking transfer-channel reads of peer-owned objects into a NIC staging buffer, then their kernels), `DeferredNicRun`, `collect_peer_runs`, and the staging protocols |
+| `deferred.py` | the generic interface for retrieve steps an engine runs outside the stream: `DeferredRun`, `collect_deferred_runs`, the `Staging` view kernels read from, and the `DeferredTransferEngine` protocol the transfer module talks to |
+| `nic_dma.py` | everything NIC-specific: `NicDmaEngine`, the deferred engine that reads peer-owned objects over the transfer channel into a NIC staging buffer without blocking, then queues their kernels |
 | `dispatch.py` | `transfer_kv_per_object_group`: picks each run's copy path |
 | `unfull_chunk.py` | the request's trailing unfull chunk |
 
@@ -46,7 +47,7 @@ even where the code is short today.
 |---|---|---|---|
 | Host memory (DRAM, DevDAX, a `BorrowedMemoryObj` bound to a local view) | GPU DMA | host/GPU copy on the stream | `direct` when usable, else `kernel` (native plan, or per batch without it) |
 | Storage-backed (`GDSMemoryObject`) | NVMe DMA | file read or write on the stream | `kernel`, per batch |
-| Borrowed, not mapped locally (`BorrowedMemoryObj` bound to a `BorrowedReader`) | NIC DMA | the reader's read into a NIC staging buffer, not waited for; retrieve only | deferred as `DeferredNicRun`, `kernel` per batch after the read |
+| Borrowed, not mapped locally (`BorrowedMemoryObj` bound to a `BorrowedReader`) | NIC DMA | the reader's read into a NIC staging buffer, not waited for; retrieve only | deferred as `DeferredRun`, `kernel` per batch after the read |
 
 `split_into_runs` cuts the group's chunks into consecutive runs of one engine
 and each copy path gets its run as a `[start, end)` chunk range over the full
@@ -130,8 +131,8 @@ transfer channel reads them into GPU memory, outside the stream. So the
 transfer does not stage it. The shared code has one hook per retrieve
 step, `engines.deferred(engine, run)`: an engine that stages on the stream
 returns False and the step is staged and launched as usual; the NIC entry
-takes the step as a `DeferredNicRun` (with its own copy of the block ids)
-into the caller's `collect_peer_runs` block. Both the per-batch loop and
+takes the step as a `DeferredRun` (with its own copy of the block ids)
+into the caller's `collect_deferred_runs` block. Both the per-batch loop and
 `transfer_unfull_chunk` use it, and their kernels read from a `Staging`
 argument: the cache context, or the view of its slots the NIC DMA engine
 passes later. The RETRIEVE handler hands the collected runs to
