@@ -15,6 +15,14 @@ class BufferRegistration(Protocol):
     stream. Implementations must undo partial registration before raising.
     """
 
+    def staging_alignment(self) -> int:
+        """Bytes the allocation and each of its slots must start and end on.
+
+        Returns:
+            A power of two; 1 when the resource needs no alignment.
+        """
+        return 1
+
     def register(self, buffer: torch.Tensor) -> None:
         """Register the full staging allocation before its first transfer.
 

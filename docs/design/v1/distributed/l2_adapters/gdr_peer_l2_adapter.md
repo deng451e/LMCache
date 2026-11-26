@@ -105,7 +105,8 @@ Why it is built this way:
   only by the kernels queued after them. `create_staging_buffer` (a
   context that has it satisfies the `StagingBufferFactory` protocol; today
   the CUDA context) allocates it on a context's first peer read with the shared buffer's slot layout,
-  aligned to the L1 alignment and registered as one transfer-channel region
+  aligned to the registration's `staging_alignment()` (the L1 alignment) and
+  registered as one transfer-channel region
   (`TransferChannelStagingRegistration`); the context deregisters it at
   `close`. Size: `NIC_STAGING_BYTES` = 512 MiB of slots (at least two kernel
   batches) plus two rows for an unfull chunk, whose object can extend past

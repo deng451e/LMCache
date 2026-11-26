@@ -73,7 +73,7 @@ def test_nic_staging_buffer_is_aligned_registered_and_released_on_close(
     context = _channel(monkeypatch)
     registration = TransferChannelStagingRegistration()
     ctx = _context()
-    staging = ctx.create_staging_buffer(6, _ALIGN, registration)
+    staging = ctx.create_staging_buffer(6, registration)
     assert staging.max_batch_size == 6 and registration.region_id == 1
     (call_,) = context.register_memory_region.call_args_list
     ptr, size, device_index = call_.args
@@ -100,6 +100,6 @@ def test_a_nic_staging_buffer_needs_a_transfer_channel() -> None:
     ctx = _context()
     try:
         with pytest.raises(RuntimeError, match="not initialized"):
-            ctx.create_staging_buffer(2, _ALIGN, TransferChannelStagingRegistration())
+            ctx.create_staging_buffer(2, TransferChannelStagingRegistration())
     finally:
         ctx.close()

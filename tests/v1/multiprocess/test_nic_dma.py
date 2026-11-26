@@ -122,11 +122,12 @@ def h(monkeypatch):
     nic: dict = {}
     channel = MagicMock(align_bytes=64)
     channel.register_memory_region.return_value = 9
-    for module in (transfer_channel, nic_dma):
-        monkeypatch.setattr(module, "get_transfer_channel_context", lambda: channel)
+    monkeypatch.setattr(
+        transfer_channel, "get_transfer_channel_context", lambda: channel
+    )
 
-    def create(num_slots, align, registration):
-        nic["args"] = (num_slots, align)
+    def create(num_slots, registration):
+        nic["args"] = (num_slots, registration.staging_alignment())
         nic["buf"] = _Staging(num_slots)
         registration.register(nic["buf"].buffer)
         return nic["buf"]

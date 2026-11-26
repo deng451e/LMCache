@@ -31,7 +31,6 @@ from lmcache.v1.common.buffer_registration import BufferRegistration
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.distributed.transfer_channel import (
     TransferChannelStagingRegistration,
-    get_transfer_channel_context,
 )
 from lmcache.v1.memory_management import (
     BorrowedMemoryObj,
@@ -112,18 +111,17 @@ class StagingBufferFactory(Protocol):
     def create_staging_buffer(
         self,
         num_slots: int,
-        slot_align_bytes: int,
         registration: BufferRegistration,
     ) -> StagingBuffer:
         """Allocate a staging buffer of ``num_slots`` slots with the
         context's layout.
 
-        The buffer is registered with ``registration`` on the context's
+        Every slot starts on ``registration.staging_alignment()``. The buffer
+        is registered with ``registration`` on the context's
         stream and deregistered when the context is closed.
 
         Args:
             num_slots: Slots in the buffer.
-            slot_align_bytes: Every slot starts on this power of two.
             registration: Registers the buffer, e.g. with a transfer channel.
 
         Returns:
@@ -587,9 +585,7 @@ class NicDmaEngine:
         num_slots = max(2 * cache_context.max_batch_size, NIC_STAGING_BYTES // row)
         registration = TransferChannelStagingRegistration()
         buffer = cache_context.create_staging_buffer(
-            num_slots + _SPARE_ROWS,
-            get_transfer_channel_context().align_bytes,
-            registration,
+            num_slots + _SPARE_ROWS, registration
         )
         logger.info(
             "NIC staging buffer: %d slots, %d MiB on %s",

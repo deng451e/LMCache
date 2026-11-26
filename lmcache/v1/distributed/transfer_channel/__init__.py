@@ -130,6 +130,14 @@ class TransferChannelStagingRegistration(BufferRegistration):
         self._context: TransferChannelContext | None = None
         self.region_id = -1
 
+    def staging_alignment(self) -> int:
+        """The transfer channel context's ``align_bytes``.
+
+        Raises:
+            RuntimeError: If there is no transfer channel context.
+        """
+        return get_transfer_channel_context().align_bytes
+
     def register(self, buffer: torch.Tensor) -> None:
         """Register ``buffer``; :attr:`region_id` is then its region.
 

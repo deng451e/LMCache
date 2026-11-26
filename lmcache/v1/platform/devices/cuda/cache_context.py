@@ -527,18 +527,17 @@ class GPUCacheContext(BaseCacheContext):
     def create_staging_buffer(
         self,
         num_slots: int,
-        slot_align_bytes: int,
         registration: BufferRegistration,
     ) -> _TempGPUBuffer:
         """Allocate a staging buffer of ``num_slots`` slots with this
         context's layout, apart from the one its transfers share.
 
-        The buffer is registered with ``registration`` on the context's
+        Every slot starts on ``registration.staging_alignment()``. The buffer
+        is registered with ``registration`` on the context's
         stream and deregistered by :meth:`close`.
 
         Args:
             num_slots: Slots in the buffer.
-            slot_align_bytes: Every slot starts on this power of two.
             registration: Registers the buffer, e.g. with a transfer channel.
 
         Returns:
@@ -552,7 +551,7 @@ class GPUCacheContext(BaseCacheContext):
             lmcache_tokens_per_chunk=self.lmcache_tokens_per_chunk,
             device=self.device_,
             max_batch_size=num_slots,
-            slot_align_bytes=slot_align_bytes,
+            slot_align_bytes=registration.staging_alignment(),
         )
         with torch_dev.stream(self.cuda_stream_):
             registration.register(staging.buffer)
