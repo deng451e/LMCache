@@ -481,6 +481,21 @@ class MPCacheServerContext:
         """Hash algorithm used for token hashing."""
         return self._hash_algorithm
 
+    def validate_chunk_size(self, chunk_size: int) -> None:
+        """Validate an effective registration chunk size.
+
+        Args:
+            chunk_size: Effective logical tokens per registered chunk.
+
+        Raises:
+            ValueError: If the size is below the server chunk size.
+        """
+        if chunk_size < self._chunk_size:
+            raise ValueError(
+                f"chunk_size must be at least the current server chunk size "
+                f"{self._chunk_size}, got {chunk_size}"
+            )
+
     def negotiate_chunk_size(self, required_alignment: int) -> int:
         """Negotiate the server chunk size against model geometry.
 
@@ -666,7 +681,10 @@ class MPCacheServerContext:
         )
 
     def resolve_unfull_chunk_obj_keys(
-        self, key: IPCCacheServerKey, object_group_ids: list[int]
+        self,
+        key: IPCCacheServerKey,
+        object_group_ids: list[int],
+        chunk_size: int,
     ) -> list[ObjectKey]:
         """Resolve the object key of the unfull chunk that ends ``key``'s range.
 
@@ -674,9 +692,11 @@ class MPCacheServerContext:
             key: IPC cache key whose ``end`` is not chunk-aligned (see
                 :meth:`IPCCacheServerKey.has_unfull_chunk`).
             object_group_ids: Object group ids to produce keys for.
+            chunk_size: Effective full chunk size of the registered context.
 
         Returns:
-            One object key per entry of ``object_group_ids``, in order.
+            One object key per entry of ``object_group_ids``, in order. Each
+            key is tagged with the registration's effective full chunk size.
 
         Raises:
             ValueError: If ``key.worker_id`` is ``None`` or ``key.end`` is
@@ -699,6 +719,7 @@ class MPCacheServerContext:
                 self.layout_desc_registry.find_shard_replication_desc(
                     key.model_name, key.world_size
                 ),
+                chunk_size,
             )
         ]
 

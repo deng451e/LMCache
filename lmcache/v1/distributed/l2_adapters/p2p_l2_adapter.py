@@ -42,7 +42,6 @@ import time
 
 # First Party
 from lmcache.lmcache_native import Bitmap, PeriodicEventNotifier
-from lmcache.v1.client.transport.errors import REQUEST_FAILURES
 from lmcache.v1.common.logging import init_logger
 from lmcache.v1.common.transfer_channel.api import TransferChannelAddress
 from lmcache.v1.distributed.api import (
@@ -67,6 +66,7 @@ from lmcache.v1.distributed.transfer_channel import (
 )
 from lmcache.v1.memory_management import BorrowedMemoryObj, Lease, MemoryObj
 from lmcache.v1.platform import HAS_EVENTFD, create_event_notifier
+from lmcache.v1.transport.errors import REQUEST_FAILURES
 from lmcache.v1.transport.futures import MessagingFuture
 from lmcache.v1.transport.grpc.endpoint import parse_grpc_target
 
