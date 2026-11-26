@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""HostPoller: non-blocking checks on one thread, callbacks on the affinity
+"""CompletionPoller: non-blocking checks on one thread, callbacks on the affinity
 worker that asked."""
 
 # Standard
@@ -8,10 +8,10 @@ import time
 
 # First Party
 from lmcache.v1.multiprocess.affinity_pool import AffinityThreadPool
-from lmcache.v1.multiprocess.host_poller import HostPoller
+from lmcache.v1.multiprocess.completion_poller import CompletionPoller
 
 
-def _watch(poller: HostPoller, check) -> tuple[list, threading.Event]:
+def _watch(poller: CompletionPoller, check) -> tuple[list, threading.Event]:
     calls: list = []
     done = threading.Event()
 
@@ -26,7 +26,7 @@ def _watch(poller: HostPoller, check) -> tuple[list, threading.Event]:
 
 
 def test_ready_runs_once_on_the_worker_that_watched() -> None:
-    poller = HostPoller()
+    poller = CompletionPoller()
     pool = AffinityThreadPool(1, thread_name_prefix="w")
     ready = threading.Event()
 
@@ -46,7 +46,7 @@ def test_ready_runs_once_on_the_worker_that_watched() -> None:
 
 
 def test_a_raising_check_and_stop_abandon_jobs() -> None:
-    poller = HostPoller()
+    poller = CompletionPoller()
 
     def broken() -> bool:
         raise RuntimeError("query failed")

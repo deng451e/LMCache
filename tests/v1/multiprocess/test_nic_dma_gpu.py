@@ -19,7 +19,7 @@ from lmcache.v1.memory_management import (  # noqa: E402
     MemoryFormat,
     MemoryObjMetadata,
 )
-from lmcache.v1.multiprocess.host_poller import HostPoller  # noqa: E402
+from lmcache.v1.multiprocess.completion_poller import CompletionPoller  # noqa: E402
 from lmcache.v1.multiprocess.object_group_transfer import (  # noqa: E402
     downsample_and_stage_block_ids,
     nic_dma,
@@ -114,7 +114,7 @@ def test_peer_reads_and_staged_copies_fill_the_kv_cache_alike(monkeypatch) -> No
             buffer.copy_(src) for src, buffer in zip(srcs, buffers, strict=True)
         ],
     )
-    engine = nic_dma.NicDmaEngine(30, HostPoller())
+    engine = nic_dma.NicDmaEngine(30, CompletionPoller())
     try:
         with torch.cuda.stream(nic_ctx.stream):
             ids = downsample_and_stage_block_ids(nic_ctx, [list(_BLOCK_IDS)] * 2)

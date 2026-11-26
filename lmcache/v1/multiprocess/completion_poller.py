@@ -34,7 +34,7 @@ class _Job:
             callback()
 
 
-class HostPoller:
+class CompletionPoller:
     """Watches host-side completions on one thread named ``name``."""
 
     def __init__(self, name: str = "lmcache-host-poller") -> None:

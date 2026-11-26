@@ -5,7 +5,7 @@ The off-stream engine (``off_stream.py``) of objects bound to a reader:
 :meth:`NicDmaEngine.read` reads their runs in waves into a NIC staging
 buffer that nothing on the stream uses, queues each wave's kernels once its
 reads landed, and frees the slots once those kernels finished. A
-:class:`HostPoller` checks the reads and events and hands each step to the
+:class:`CompletionPoller` checks the reads and events and hands each step to the
 instance's affinity worker; no stream waits on a host-written value. See
 ``docs/design/v1/distributed/l2_adapters/gdr_peer_l2_adapter.md``.
 """
@@ -32,7 +32,7 @@ from lmcache.v1.memory_management import (
     PendingRead,
 )
 from lmcache.v1.multiprocess.affinity_pool import DeferredResponse
-from lmcache.v1.multiprocess.host_poller import HostPoller
+from lmcache.v1.multiprocess.completion_poller import CompletionPoller
 from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
     OffStreamRun,
     Staging,
@@ -230,7 +230,7 @@ class _Retrieve:
         self,
         cache_context: BaseCacheContext,
         staging: _NicStaging,
-        poller: HostPoller,
+        poller: CompletionPoller,
         runs: Sequence[OffStreamRun],
         finish: Callable[[bool], object],
     ) -> None:
@@ -364,7 +364,7 @@ class NicDmaEngine:
     """
 
     def __init__(
-        self, drain_timeout_s: float, poller: HostPoller | None = None
+        self, drain_timeout_s: float, poller: CompletionPoller | None = None
     ) -> None:
         self._drain_timeout_s = drain_timeout_s
         self._poller = poller
@@ -409,7 +409,7 @@ class NicDmaEngine:
         """
         with self._lock:
             if self._poller is None:
-                self._poller = HostPoller("lmcache-nic-dma")
+                self._poller = CompletionPoller("lmcache-nic-dma")
             poller = self._poller
             # Under the lock, so that drain() either counts this retrieve or
             # makes it fail.

@@ -3,7 +3,7 @@
 `lmcache/v1/distributed/l2_adapters/gdr_peer_l2_adapter.py`,
 `BorrowingPeerL2AdapterBase` in `lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`,
 `NicDmaEngine` in `lmcache/v1/multiprocess/object_group_transfer/nic_dma.py`,
-`HostPoller` in `lmcache/v1/multiprocess/host_poller.py`
+`CompletionPoller` in `lmcache/v1/multiprocess/completion_poller.py`
 
 The copying P2P adapter ([`p2p_l2_adapter.md`](p2p_l2_adapter.md)) pulls a
 peer's object into the local DRAM L1 at lookup, then copies it to the GPU at
@@ -106,10 +106,10 @@ per wave (≤ half the NIC staging slots), FIFO across the context's retrieves:
   run.targets(view) → where each object lands; the view presents the run's
       slots as the `Staging` the shared kernels read from
   one BorrowedMemoryObj.read_many per peer: owner DRAM ─RDMA─► NIC slots   one NIXL submit
-  HostPoller sees the reads finished → on the worker:
+  CompletionPoller sees the reads finished → on the worker:
       run.launch(view, block ids): block kernels, NIC slots → paged KV,
       then record an event
-  HostPoller sees the event complete  → on the worker: slots free again
+  CompletionPoller sees the event complete  → on the worker: slots free again
 
 after the last wave's kernels are queued (on the worker):
   finish(True): record the completion event, queue finish_read_by_owner,
