@@ -30,6 +30,7 @@ from lmcache.v1.multiprocess.object_group_transfer.engines import (
 from lmcache.v1.multiprocess.object_group_transfer.off_stream import (
     OffStreamRun,
     collect_off_stream_runs,
+    hand_off_run,
 )
 import lmcache.lmcache_native as lmcache_native
 
@@ -95,6 +96,49 @@ def test_only_the_nic_engine_hands_a_retrieve_step_to_the_collector():
     with collect_off_stream_runs(collected):
         assert staged_off_stream(NIC, make_run)
     assert [taken.memory_objs for taken in collected] == [run.memory_objs]
+
+
+def _handed_off(block_ids: list[torch.Tensor]) -> OffStreamRun:
+    return OffStreamRun(
+        [_peer()], block_ids, lambda staging: [], lambda staging, ids: None
+    )
+
+
+def test_runs_of_one_staging_share_one_copy_of_the_block_ids():
+    """The batches of a transfer pass the same staged block ids: they are
+    copied once, and restaging the buffer afterwards does not reach the copy."""
+    buffer = torch.arange(8)
+    staged_ids = [buffer[:4], buffer[4:]]
+    collected: list[OffStreamRun] = []
+    with collect_off_stream_runs(collected):
+        hand_off_run(_handed_off(staged_ids))
+        hand_off_run(_handed_off(staged_ids))
+        buffer.fill_(-1)
+    first, second = collected
+    assert first.block_ids is second.block_ids
+    assert first.block_ids is not staged_ids
+    assert [ids.tolist() for ids in first.block_ids] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_a_restaged_buffer_gets_its_own_copy_of_the_block_ids():
+    """A later transfer restages the buffer and passes new views of it: its
+    runs get the new ids and the earlier runs keep theirs. A new collect
+    block starts without a copy, even for the same staged list."""
+    buffer = torch.arange(4)
+    first_staging = [buffer[:]]
+    collected: list[OffStreamRun] = []
+    with collect_off_stream_runs(collected):
+        hand_off_run(_handed_off(first_staging))
+        buffer.add_(10)
+        hand_off_run(_handed_off([buffer[:]]))
+    with collect_off_stream_runs(collected):
+        buffer.add_(10)
+        hand_off_run(_handed_off(first_staging))
+    assert [run.block_ids[0].tolist() for run in collected] == [
+        [0, 1, 2, 3],
+        [10, 11, 12, 13],
+        [20, 21, 22, 23],
+    ]
 
 
 @pytest.mark.parametrize(

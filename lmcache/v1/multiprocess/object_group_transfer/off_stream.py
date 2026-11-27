@@ -83,6 +83,13 @@ _run_sink: ContextVar[list[OffStreamRun] | None] = ContextVar(
 )
 
 
+# The block ids last handed off in the current collect block and the copy made
+# of them. Holding the staged list keeps its identity from being reused.
+_block_id_copy: ContextVar[tuple[list[torch.Tensor], list[torch.Tensor]] | None] = (
+    ContextVar("lmcache_block_id_copy", default=None)
+)
+
+
 @contextmanager
 def collect_off_stream_runs(runs: list[OffStreamRun]) -> Iterator[None]:
     """Append to ``runs`` the runs that transfers called inside the block,
@@ -92,16 +99,22 @@ def collect_off_stream_runs(runs: list[OffStreamRun]) -> Iterator[None]:
         runs: Receives the runs, in transfer order.
     """
     token = _run_sink.set(runs)
+    copy_token = _block_id_copy.set(None)
     try:
         yield
     finally:
+        _block_id_copy.reset(copy_token)
         _run_sink.reset(token)
 
 
 def hand_off_run(run: OffStreamRun) -> None:
     """Hand one run to the caller's :func:`collect_off_stream_runs` block, with
-    its own copy of the block ids: the next transfer restages the buffer
-    they live in.
+    a copy of the block ids: the next transfer restages the buffer they live
+    in.
+
+    Consecutive runs that pass the same ``block_ids`` list (the batches of
+    one staging) share one copy, so a transfer must not reuse a staged list
+    after restaging the buffer; the engine must not change the copy.
 
     Args:
         run: The run a transfer did not stage.
@@ -116,7 +129,11 @@ def hand_off_run(run: OffStreamRun) -> None:
             "This transfer has off-stream steps: call it inside "
             "collect_off_stream_runs()"
         )
-    sink.append(replace(run, block_ids=[ids.clone() for ids in run.block_ids]))
+    copied = _block_id_copy.get()
+    if copied is None or copied[0] is not run.block_ids:
+        copied = (run.block_ids, [ids.clone() for ids in run.block_ids])
+        _block_id_copy.set(copied)
+    sink.append(replace(run, block_ids=copied[1]))
 
 
 class OffStreamEngine(Protocol):
