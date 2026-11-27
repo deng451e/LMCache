@@ -54,6 +54,24 @@ class _FakeFuture:
         fn(self)
 
 
+class _PendingFuture:
+    """A MessagingFuture stand-in the test completes by hand."""
+
+    def __init__(self) -> None:
+        self._callbacks: list = []
+
+    def result(self, timeout=None):
+        return None
+
+    def add_done_callback(self, fn) -> None:
+        self._callbacks.append(fn)
+
+    def complete(self) -> None:
+        callbacks, self._callbacks = self._callbacks, []
+        for fn in callbacks:
+            fn(self)
+
+
 @contextmanager
 def _adapter(
     load_timeout_s: float = 10.0,
@@ -164,6 +182,93 @@ def test_hits_become_remote_handles_until_released() -> None:
         _wait_unlocks(req_client, 1)
         req_client.p2p_unlock_objects.assert_called_once_with([keys[0]])
         assert not obj.is_valid()
+        assert adapter.get_local_borrow_count() == 0
+
+
+def _borrow_many(adapter, req_client, count: int):
+    """Look up and borrow ``count`` keys; return the keys and their handles."""
+    keys = [_key(i) for i in range(count)]
+    hits = [TransferChannelAddress(offset=i * PAGE, size=PAGE) for i in range(count)]
+    _lookup(adapter, req_client, keys, hits)
+    objects = _load(adapter, keys)
+    return keys, [objects[key] for key in keys]
+
+
+def _unlocked_batches(req_client) -> list[list[ObjectKey]]:
+    return [call.args[0] for call in req_client.p2p_unlock_objects.call_args_list]
+
+
+def test_leases_ending_during_an_unlock_share_the_next_rpc() -> None:
+    """The first ended lease is unlocked at once; the ones that end while
+    that RPC is in flight are unlocked together when it is answered."""
+    with _adapter() as (adapter, req_client, _tc_ctx, _tc_client):
+        keys, objs = _borrow_many(adapter, req_client, 4)
+        first, second = _PendingFuture(), _PendingFuture()
+        req_client.p2p_unlock_objects.side_effect = [first, second]
+        for obj in objs:
+            obj.release()
+        assert _unlocked_batches(req_client) == [[keys[0]]]
+        first.complete()
+        assert _unlocked_batches(req_client) == [[keys[0]], keys[1:]]
+        # Nothing ended during the second RPC: its answer sends nothing more,
+        # and the next lease to end is unlocked at once again.
+        second.complete()
+        assert req_client.p2p_unlock_objects.call_count == 2
+        assert adapter.get_local_borrow_count() == 0
+        req_client.p2p_unlock_objects.side_effect = None
+        _, obj = _borrow(adapter, req_client)
+        obj.release()
+        assert _unlocked_batches(req_client)[2:] == [[keys[0]]]
+
+
+def test_close_sends_the_unlocks_still_queued() -> None:
+    """An unlock queued behind an in-flight RPC is not lost when the adapter
+    closes before that RPC is answered."""
+    with _adapter() as (adapter, req_client, _tc_ctx, _tc_client):
+        keys, objs = _borrow_many(adapter, req_client, 2)
+        first = _PendingFuture()
+        req_client.p2p_unlock_objects.side_effect = [first, _FakeFuture(None)]
+        for obj in objs:
+            obj.release()
+        adapter.close()
+        assert _unlocked_batches(req_client) == [[keys[0]], [keys[1]]]
+        # The late answer finds a closed adapter and sends nothing.
+        first.complete()
+        assert req_client.p2p_unlock_objects.call_count == 2
+
+
+def test_an_unanswered_unlock_does_not_hold_later_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unlock RPC that is never answered delays the queue only for the RPC
+    timeout: the next lease to end after it sends the queue itself."""
+    with _adapter() as (adapter, req_client, _tc_ctx, _tc_client):
+        keys, objs = _borrow_many(adapter, req_client, 3)
+        req_client.p2p_unlock_objects.side_effect = [
+            _PendingFuture(),
+            _FakeFuture(None),
+        ]
+        objs[0].release()
+        objs[1].release()
+        assert _unlocked_batches(req_client) == [[keys[0]]]
+        now = time.monotonic()
+        monkeypatch.setattr(time, "monotonic", lambda: now + 3.5)
+        objs[2].release()
+        assert _unlocked_batches(req_client) == [[keys[0]], keys[1:]]
+
+
+def test_a_failed_unlock_send_does_not_stop_later_unlocks() -> None:
+    """A send that raises is left to the owner's TTL and does not reach the
+    thread that freed the object; the next lease is unlocked as usual."""
+    with _adapter() as (adapter, req_client, _tc_ctx, _tc_client):
+        keys, objs = _borrow_many(adapter, req_client, 2)
+        req_client.p2p_unlock_objects.side_effect = [
+            RuntimeError("channel closed"),
+            _FakeFuture(None),
+        ]
+        objs[0].release()
+        objs[1].release()
+        assert _unlocked_batches(req_client) == [[keys[0]], [keys[1]]]
         assert adapter.get_local_borrow_count() == 0
 
 

@@ -37,6 +37,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from typing import Any, Iterable, cast
 import functools
+import itertools
 import threading
 import time
 
@@ -664,7 +665,10 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
     Thread model: lookups, loads and ``submit_unlock`` run on the prefetch
     thread, which ``delete_l2_adapter`` drains before ``close``. A lease ends
     on whichever thread frees its object, under the L1 manager's lock, so
-    ending it only fires the unlock RPC without waiting for the answer.
+    ending it only queues the unlock and never waits for the owner. Queued
+    unlocks are sent one RPC at a time: the first goes out at once, and the
+    leases that end while it is in flight share the next RPC, sent from the
+    answer's callback on the RPC client's thread.
     """
 
     def __init__(
@@ -689,6 +693,12 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
         # Leases not yet ended; guarded by the lock.
         self._leases: set[_Lease] = set()
         self._borrow_lock = threading.Lock()
+        # Ended leases whose unlock is not sent yet, with their expiry. One
+        # unlock RPC is in flight at a time and the leases that end meanwhile
+        # go out together in the next one. Guarded by the lock.
+        self._pending_unlocks: list[tuple[ObjectKey, float]] = []
+        self._unlock_in_flight = False
+        self._unlock_sent_at = 0.0
         self._load_results: dict[L2TaskId, Bitmap] = {}
         self._next_load_task = 0
         super().__init__(config)
@@ -802,7 +812,7 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
         """
 
     def _drain_borrows_for_close(self) -> None:
-        """Return every unborrowed reservation to the owner.
+        """Return every unborrowed reservation and queued unlock to the owner.
 
         A subclass calls it before releasing the peer's region. It waits for
         the owner's answer, since the RPC client closes next. Expired leases
@@ -816,10 +826,16 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
                 raise RuntimeError(
                     f"Cannot close {type(self).__name__} with live borrowed objects"
                 )
+            ended, self._pending_unlocks = self._pending_unlocks, []
         keys = _unexpired(
-            (key, expires)
-            for key, held in self._reservations.items()
-            for _, expires in held
+            itertools.chain(
+                ended,
+                (
+                    (key, expires)
+                    for key, held in self._reservations.items()
+                    for _, expires in held
+                ),
+            )
         )
         self._reservations.clear()
         if keys:
@@ -866,17 +882,51 @@ class BorrowingPeerL2AdapterBase(PeerL2AdapterBase):
         return not lease.ended and self._lease_open(lease.expires)
 
     def _end_lease(self, lease: _Lease) -> None:
-        # Runs under the L1 manager's lock: flag, then fire the unlock without
-        # waiting. Idempotent.
+        # Runs under the L1 manager's lock: flag and queue the unlock, and
+        # send the queue unless an unlock RPC is already in flight, never
+        # waiting for the answer. Idempotent.
         with self._borrow_lock:
             if lease.ended:
                 return
             lease.ended = True
             self._leases.discard(lease)
-        if not self._closed:
-            PeerL2AdapterBase.submit_unlock(
-                self, _unexpired([(lease.key, lease.expires)])
-            )
+            self._pending_unlocks.append((lease.key, lease.expires))
+            now = time.monotonic()
+            # An RPC stuck behind an unready channel must not hold the queue
+            # for good: after the RPC timeout this lease sends past it.
+            if (
+                self._unlock_in_flight
+                and now - self._unlock_sent_at < _LOOKUP_RPC_TIMEOUT_S
+            ):
+                return
+            self._unlock_in_flight = True
+            self._unlock_sent_at = now
+        self._send_pending_unlocks()
+
+    def _send_pending_unlocks(self) -> None:
+        """Send the queued unlocks in one RPC and chain the next send to it.
+
+        Call with ``_unlock_in_flight`` set and without ``_borrow_lock``. The
+        answer's callback calls it again, so leases that ended during the RPC
+        go out next; with nothing queued the in-flight flag is cleared. An
+        expired lease is dropped, and a failed send is left to the owner's
+        TTL.
+        """
+        with self._borrow_lock:
+            queued, self._pending_unlocks = self._pending_unlocks, []
+            keys = [] if self._closed else _unexpired(queued)
+            if not keys:
+                self._unlock_in_flight = False
+                return
+            self._unlock_sent_at = time.monotonic()
+        try:
+            future = self._req_client.p2p_unlock_objects(keys)
+        except Exception:
+            logger.exception("Peer unlock failed; the owner's TTL reclaims it")
+            with self._borrow_lock:
+                self._unlock_in_flight = False
+            return
+        future.add_done_callback(lambda _future: self._send_pending_unlocks())
 
 
 class P2PL2Adapter(PeerL2AdapterBase):
