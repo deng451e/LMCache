@@ -83,7 +83,7 @@ def t(monkeypatch: pytest.MonkeyPatch):
         transfer_object_group=lambda *a, **k: [hand_off_run(run) for run in returned],
     )
     entry = transfer.ContextEntry(
-        cast(Any, cache_context), "model", 1, event_backend=cast(Any, backend)
+        cast(Any, cache_context), "model", 1, 256, event_backend=cast(Any, backend)
     )
     monkeypatch.setattr(module, "get_and_touch_context_entry", lambda iid: entry)
     key = SimpleNamespace(

@@ -21,7 +21,6 @@ from lmcache.v1.distributed import transfer_channel  # noqa: E402
 from lmcache.v1.distributed.transfer_channel import (  # noqa: E402
     TransferChannelStagingRegistration,
 )
-from lmcache.v1.multiprocess.object_group_transfer import nic_dma  # noqa: E402
 from lmcache.v1.platform.devices.cuda.cache_context import (  # noqa: E402
     GPUCacheContext,
 )
@@ -50,8 +49,9 @@ def _channel(monkeypatch) -> MagicMock:
     """Install a fake global transfer channel context."""
     context = MagicMock(align_bytes=_ALIGN)
     context.register_memory_region.return_value = 1
-    for module in (transfer_channel, nic_dma):
-        monkeypatch.setattr(module, "get_transfer_channel_context", lambda: context)
+    monkeypatch.setattr(
+        transfer_channel, "get_transfer_channel_context", lambda: context
+    )
     return context
 
 

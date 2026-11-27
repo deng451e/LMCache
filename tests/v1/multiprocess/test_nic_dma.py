@@ -137,8 +137,13 @@ def h(monkeypatch):
         registration.register(nic["buf"].buffer)
         return nic["buf"]
 
+    class _Context(MagicMock):
+        # A real attribute: the engine's runtime check for a staging-buffer
+        # factory does not see a mock's auto-created children on Python 3.12+.
+        create_staging_buffer = MagicMock(side_effect=create)
+
     shared = _Staging(2)
-    cc = MagicMock(
+    cc = _Context(
         max_batch_size=2,
         lmcache_tokens_per_chunk=16,
         device=torch.device("cpu"),
@@ -152,7 +157,6 @@ def h(monkeypatch):
     )
     cc.get_temp_object_group_buffer.side_effect = shared.get_temp_object_group_buffer
     cc.get_temp_kernel_group_buffer.side_effect = shared.get_temp_kernel_group_buffer
-    cc.create_staging_buffer.side_effect = create
     cc.calculate_num_blocks.side_effect = lambda tokens, kg: tokens // 4
 
     def kernel(paged, ptrs, block_ids, *args) -> None:
