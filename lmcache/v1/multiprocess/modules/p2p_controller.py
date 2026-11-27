@@ -455,7 +455,9 @@ class P2PController(DiscoverableModule):
         """
         if not keys:
             return
-        self._ctx.storage_manager.finish_read_prefetched(keys)
+        self._ctx.storage_manager.finish_read_prefetched(
+            keys, l1_owners=self._served_l1_owners(keys)
+        )
 
     @request_handler(HandlerType.BLOCKING)
     def p2p_reserve_write(
@@ -545,6 +547,30 @@ class P2PController(DiscoverableModule):
     # Internal helpers
     # -----------------------------------------------------------------
 
+    def _served_l1_owners(self, keys: list[ObjectKey]) -> dict[ObjectKey, int] | None:
+        """Name the L1 that holds the read locks peers took on ``keys``.
+
+        Peers are served from the local DRAM L1 only, so on a node with
+        several L1s (a borrower's shadow L1, for one) their reads and unlocks
+        go to it directly instead of probing every L1, which could also
+        release a lock the same key holds in another L1.
+
+        Args:
+            keys: Keys a peer lookup locked.
+
+        Returns:
+            The local DRAM L1's id per key; None on a single-L1 node, where
+            the storage manager needs no owners.
+
+        Raises:
+            ValueError: A multi-L1 node has not exactly one local DRAM L1.
+        """
+        storage_manager = self._ctx.storage_manager
+        if not storage_manager.is_multi_l1:
+            return None
+        owner = storage_manager.get_l1_manager_by_tags(_P2P_L1_TAGS).l1_manager_id
+        return dict.fromkeys(keys, owner)
+
     def _p2p_write_l1(self) -> L1ManagerInterface:
         """Return the L1 that peers write into.
 
@@ -612,7 +638,9 @@ class P2PController(DiscoverableModule):
         if not found_keys:
             return addresses
 
-        good_keys, good_objs = self._ctx.storage_manager.unsafe_read(found_keys)
+        good_keys, good_objs = self._ctx.storage_manager.unsafe_read(
+            found_keys, l1_owners=self._served_l1_owners(found_keys)
+        )
         obj_by_key = dict(zip(good_keys, good_objs, strict=True))
 
         positions: dict[ObjectKey, list[int]] = {}

@@ -89,6 +89,7 @@ def _make_controller() -> tuple[P2PController, MagicMock]:
     ctx.storage_manager.get_l1_manager_by_tags.return_value.config.read_ttl_seconds = (
         _READ_TTL
     )
+    ctx.storage_manager.is_multi_l1 = False
     controller = P2PController(
         ctx,
         P2PConfig(),
@@ -232,7 +233,9 @@ def test_query_lookup_results_builds_addresses_for_sparse_hits():
     ctx.storage_manager.unsafe_read.return_value = ([keys[0], keys[2]], [obj0, obj2])
 
     addresses = controller.p2p_query_lookup_results(task_id)
-    ctx.storage_manager.unsafe_read.assert_called_once_with([keys[0], keys[2]])
+    ctx.storage_manager.unsafe_read.assert_called_once_with(
+        [keys[0], keys[2]], l1_owners=None
+    )
     assert addresses == [
         TransferChannelAddress(offset=100, size=10),
         TransferChannelAddress(offset=-1, size=0),
@@ -265,7 +268,9 @@ def test_query_lookup_results_multi_group_addresses_in_request_order():
     ctx.storage_manager.unsafe_read.return_value = ([keys[2], keys[1]], [obj2, obj1])
 
     addresses = controller.p2p_query_lookup_results(task_id)
-    ctx.storage_manager.unsafe_read.assert_called_once_with([keys[2], keys[1]])
+    ctx.storage_manager.unsafe_read.assert_called_once_with(
+        [keys[2], keys[1]], l1_owners=None
+    )
     assert addresses == [
         TransferChannelAddress(offset=-1, size=0),
         TransferChannelAddress(offset=100, size=10),
@@ -390,7 +395,34 @@ def test_unlock_objects_calls_finish_read_prefetched():
     controller, ctx = _make_controller()
     keys = [_make_key(0), _make_key(1)]
     controller.p2p_unlock_objects(keys)
-    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(keys)
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(
+        keys, l1_owners=None
+    )
+
+
+def test_peer_reads_and_unlocks_name_the_local_dram_l1_on_a_multi_l1_node():
+    """With several L1s (a shadow L1 next to the DRAM one) the lookup's read
+    and the unlock go to the local DRAM L1 by id instead of probing every L1."""
+    controller, ctx = _make_controller()
+    ctx.storage_manager.is_multi_l1 = True
+    ctx.storage_manager.get_l1_manager_by_tags.return_value.l1_manager_id = 4
+    keys = [_make_key(0), _make_key(1)]
+    ctx.storage_manager.submit_prefetch_task.return_value = MagicMock(
+        total_requested_keys=2
+    )
+    task_id = controller.p2p_lookup_and_lock(keys, {0: _make_layout_desc()})
+    ctx.storage_manager.query_prefetch_status.return_value = _result([Bitmap(2, 2)])
+    obj = MagicMock(shm_offset=64, shm_byte_length=32)
+    ctx.storage_manager.unsafe_read.return_value = (keys, [obj, obj])
+    addresses = controller.p2p_query_lookup_results(task_id)
+    assert addresses is not None and all(a.is_valid() for a in addresses)
+    owners = {keys[0]: 4, keys[1]: 4}
+    ctx.storage_manager.unsafe_read.assert_called_once_with(keys, l1_owners=owners)
+
+    controller.p2p_unlock_objects(keys)
+    ctx.storage_manager.finish_read_prefetched.assert_called_once_with(
+        keys, l1_owners=owners
+    )
 
 
 def test_unlock_objects_empty_is_noop():
