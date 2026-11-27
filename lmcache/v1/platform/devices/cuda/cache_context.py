@@ -175,6 +175,19 @@ class _TempGPUBuffer:
             dtype = group.dtype
             self._shape_cache_kernel_group[kernel_group_idx] = (shape, dtype)
 
+        # The view of a slot never changes, so each is built once here: a
+        # transfer asks for them per chunk on its hot path.
+        self._kernel_group_views: dict[tuple[int, int], torch.Tensor] = {}
+        for key2, (start, size) in self._offset_map_kernel_group_only.items():
+            shape, dtype = self._shape_cache_kernel_group[key2[1]]
+            self._kernel_group_views[key2] = (
+                self._temp_buffer[start : start + size].view(dtype).view(shape)
+            )
+        self._object_group_views: dict[tuple[int, int], torch.Tensor] = {
+            key3: self._temp_buffer[start : start + size]
+            for key3, (start, size) in self._offset_map_object_group_only.items()
+        }
+
     # Public APIs
     @property
     def max_batch_size(self) -> int:
@@ -198,20 +211,19 @@ class _TempGPUBuffer:
             kernel_group_idx: Index of the kernel group.
 
         Returns:
-            The temp GPU buffer for the given batch index and kernel group index.
+            The temp GPU buffer for the given batch index and kernel group
+            index. Every call returns the same tensor object for a slot, so
+            do not change its shape or dtype in place.
 
         Raises:
             ValueError: If the batch_idx or kernel_group_idx is out of range.
         """
-        key = (batch_idx, kernel_group_idx)
-        if key not in self._offset_map_kernel_group_only:
+        view = self._kernel_group_views.get((batch_idx, kernel_group_idx))
+        if view is None:
             raise ValueError(
                 f"Invalid batch_idx {batch_idx} or kernel_group_idx {kernel_group_idx}"
             )
-
-        offset, size = self._offset_map_kernel_group_only[key]
-        shape, dtype = self._shape_cache_kernel_group[kernel_group_idx]
-        return self._temp_buffer[offset : offset + size].view(dtype).view(shape)
+        return view
 
     def get_temp_object_group_buffer(
         self, batch_idx: int, object_group_idx: int
@@ -225,16 +237,19 @@ class _TempGPUBuffer:
             object_group_idx: Index of the object group.
 
         Returns:
-            The temp GPU buffer for the given batch index and object group index.
+            The temp GPU buffer for the given batch index and object group
+            index. Every call returns the same tensor object for a slot, so
+            do not change its shape or dtype in place.
+
+        Raises:
+            ValueError: If the batch_idx or object_group_idx is out of range.
         """
-        key = (batch_idx, object_group_idx)
-        if key not in self._offset_map_object_group_only:
+        view = self._object_group_views.get((batch_idx, object_group_idx))
+        if view is None:
             raise ValueError(
                 f"Invalid batch_idx {batch_idx} or object_group_idx {object_group_idx}"
             )
-
-        offset, size = self._offset_map_object_group_only[key]
-        return self._temp_buffer[offset : offset + size]
+        return view
 
     def get_kernel_group_shape_dtype(
         self,

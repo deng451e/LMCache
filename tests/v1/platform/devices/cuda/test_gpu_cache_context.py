@@ -462,6 +462,29 @@ class TestGPUCacheContextBuffers:
         assert tensor.dtype == torch.uint8
         assert tensor.dim() == 1
 
+    def test_temp_buffer_views_are_built_once_per_slot(self) -> None:
+        """A slot's view is the same tensor on every call, each slot has its
+        own memory, and an unknown slot is rejected."""
+        ctx = _make_context(_MULTI_GROUP)
+        manager = ctx.kv_layer_groups_manager
+        for getter, count in (
+            (ctx.get_temp_kernel_group_buffer, manager.num_kernel_groups),
+            (ctx.get_temp_object_group_buffer, manager.num_object_groups),
+        ):
+            views = [
+                getter(slot, group)
+                for slot in range(ctx.max_batch_size)
+                for group in range(count)
+            ]
+            assert len({view.data_ptr() for view in views}) == len(views)
+            for slot in range(ctx.max_batch_size):
+                for group in range(count):
+                    assert getter(slot, group) is views[slot * count + group]
+            with pytest.raises(ValueError, match="Invalid batch_idx"):
+                getter(ctx.max_batch_size, 0)
+            with pytest.raises(ValueError, match="Invalid batch_idx"):
+                getter(0, count)
+
     def test_get_kernel_group_shape_dtype(self) -> None:
         ctx = _make_context(_SINGLE_GROUP)
         manager = ctx.kv_layer_groups_manager
