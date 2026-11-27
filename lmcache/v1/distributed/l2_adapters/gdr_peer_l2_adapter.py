@@ -150,19 +150,6 @@ class GdrPeerL2AdapterConfig(P2PL2AdapterConfig):
                 "no chunk is ever borrowed"
             )
 
-    @classmethod
-    def help(cls) -> str:
-        return (
-            "GDR peer adapter config fields (same as p2p):\n"
-            "- peer_mq_server_url (str): peer request server URL (required)\n"
-            "- peer_transfer_channel_server_url (str): the peer's transfer channel "
-            "server url (required)\n"
-            "- lookup_timeout_s (float): lookup result deadline in seconds "
-            "(optional, default 10)\n"
-            "- load_timeout_s (float): seconds before a retrieve-time read into "
-            "GPU memory is cancelled and fails (optional, default 10)"
-        )
-
     def get_wanted_l1_memory_tags(self) -> tuple[MemoryTags, ...]:
         """Return ``(DRAM, SHADOW)``: borrowed objects go into the shadow L1."""
         return (MemoryTags(MemorySegment.DRAM, MemoryResidency.SHADOW),)
